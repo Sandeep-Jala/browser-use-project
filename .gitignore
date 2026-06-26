@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local environment variables / secrets (real secrets stay local; the sample is committed)
+.env
+!.env.example
+
+# Failure screenshots captured by browser/error_capture.py
+errors/
+
+# Per-run telemetry artifacts (network/console JSON + HTML reports)
+artifacts/
+
+# Local run logs
+run.log
+nohup.out
+
+# Recorded action traces for replay
+recordings/
