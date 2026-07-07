@@ -3,7 +3,9 @@
 browser-use's `rerun_history` replays at the ORIGINAL pace (it re-waits the agent's recorded
 delays, including its LLM thinking time). This instead extracts just the essential actions and
 a STABLE selector for each interacted element from a saved recording, so the flow can be
-re-run fast over Playwright with auto-wait — no LLM, no recorded delays, `wait` steps dropped.
+re-run fast over Playwright with auto-wait — no LLM, no recorded LLM-thinking delays. The
+agent's deliberate `wait` steps ARE kept (capped): they are load-bearing on this slow React
+app, and a short settle is added after each interaction so replay doesn't outrun the UI.
 
 Selector strategy (durability > brevity): prefer a stable attribute the app is unlikely to
 re-generate (id that doesn't look auto-numbered, then aria-label / name / title / placeholder),
@@ -12,14 +14,37 @@ and fall back to the recorded positional `x_path` only as a last resort.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 from playwright.async_api import Page
 
-# ids ending in 3+ digits look auto-generated (e.g. "SearchBox129") — don't anchor on them.
+logger = logging.getLogger("framework.script")
+
+# ids with a 3+ digit run look auto-generated (e.g. "SearchBox129") — don't anchor on them.
 _DYNAMIC_ID = re.compile(r"\d{3,}")
+# Framework-generated id families whose FULL id regenerates per render (a mount-order counter
+# changes every time), so they are never a durable anchor even without a 3-digit run:
+#   react-select-6-input / react-select-9-option-0   (react-select — the marquee offender here)
+#   :r3: / :ra:                                       (React useId / Radix / MUI)
+#   mui-42 / headlessui-menu-3                        (MUI / Headless UI)
+_FRAMEWORK_ID = re.compile(
+    r"^(react-select-\d+|:r[0-9a-z]+:|mui-\d+|headlessui-[\w-]*\d+|radix-[\w:-]+)",
+    re.IGNORECASE,
+)
+# A react-select descendant id carries a STABLE suffix ("option-0", "listbox") we can anchor on
+# independently of the volatile instance counter.
+_REACT_SELECT_PART = re.compile(r"^react-select-\d+-(?P<part>option-\d+|listbox|placeholder)$")
+# Playwright ARIA roles we can target with get_by_role. Recorded elements carry either an explicit
+# `role` attribute or a tag we can map to an implicit role.
+_TAG_ROLE = {"a": "link", "button": "button"}
+
+
+def _is_dynamic_id(idv: str) -> bool:
+    """True if an id is auto-generated and unsafe to anchor on across re-renders."""
+    return bool(_DYNAMIC_ID.search(idv) or _FRAMEWORK_ID.match(idv))
 
 
 def _esc(value: str) -> str:
@@ -30,37 +55,109 @@ def _attr_sel(name: str, value: str) -> str:
     return f'css=[{name}="{_esc(value)}"]'
 
 
-def _selector(element: dict[str, Any]) -> str | None:
-    """Best stable Playwright selector for a recorded element, falling back to its xpath.
+def _role_of(attrs: dict[str, Any], tag: str) -> str | None:
+    """Explicit ARIA role, else the implicit role of a tag we know how to target."""
+    role = (attrs.get("role") or "").strip().lower()
+    # Only roles that pair well with an accessible name via get_by_role.
+    if role in {"link", "button", "menuitem", "tab", "checkbox", "radio", "option"}:
+        return role
+    return _TAG_ROLE.get(tag)
 
-    Priority (most → least durable on a re-rendering app): a non-auto-numbered id, then a
-    distinguishing attribute, then href (for links), then the element's visible text /
-    accessibility name, and only as a last resort the positional xpath.
+
+def _selectors(element: dict[str, Any]) -> list[str]:
+    """Ranked list of Playwright selectors for a recorded element (most → least durable).
+
+    Replay tries these in order and uses the first that resolves UNIQUELY, so a fragile primary
+    anchor (a framework id, a moved node) degrades to a stabler fallback instead of stopping the
+    run or clicking the wrong element. Order:
+      1. get_by_role(role, name)  — semantic + unique, the most durable web locator
+      2. a non-auto-generated id
+      3. react-select option suffix ([id$="-option-0"]) — instance-counter-independent
+      4. a distinguishing attribute (data-testid / name / aria-label / title / placeholder)
+      5. href (links)
+      6. exact accessible-name text
+      7. the positional xpath (last resort)
     """
     attrs = element.get("attributes") or {}
     tag = (element.get("node_name") or "").lower()
-    idv = attrs.get("id")
-    if idv and not _DYNAMIC_ID.search(idv):
-        return _attr_sel("id", idv)
-    for key in ("aria-label", "name", "title", "placeholder", "data-testid"):
-        if attrs.get(key):
-            return _attr_sel(key, attrs[key])
-    if attrs.get("href"):
-        return f'css={tag or "*"}[href="{_esc(attrs["href"])}"]'
     ax_name = (element.get("ax_name") or "").strip()
+    cands: list[str] = []
+
+    # 1. Role + accessible name — Playwright's most durable, unambiguous locator.
+    role = _role_of(attrs, tag)
+    if role and ax_name:
+        cands.append(f'role={role}[name="{_esc(ax_name)}"]')
+
+    idv = attrs.get("id")
+    if idv:
+        # 2. A genuinely stable id.
+        if not _is_dynamic_id(idv):
+            cands.append(_attr_sel("id", idv))
+        # 3. react-select option/listbox: volatile counter, stable suffix; one menu open at a
+        #    time so an ends-with match is unambiguous.
+        m = _REACT_SELECT_PART.match(idv)
+        if m:
+            cands.append(f'css=[id$="-{m.group("part")}"]')
+
+    # 4. Distinguishing attributes.
+    for key in ("data-testid", "name", "aria-label", "title", "placeholder"):
+        if attrs.get(key):
+            cands.append(_attr_sel(key, attrs[key]))
+    # 5. href for links.
+    if attrs.get("href"):
+        cands.append(f'css={tag or "*"}[href="{_esc(attrs["href"])}"]')
+    # 6. Exact accessible-name text.
     if ax_name:
-        return f'text="{_esc(ax_name)}"'  # exact visible-text / accessible-name match
+        cands.append(f'text="{_esc(ax_name)}"')
+    # 7. Positional xpath — last resort.
     xpath = element.get("x_path")
     if xpath:
-        return "xpath=/" + xpath.lstrip("/")
-    return None
+        cands.append("xpath=/" + xpath.lstrip("/"))
+
+    seen: set[str] = set()
+    return [c for c in cands if not (c in seen or seen.add(c))]
+
+
+def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
+    """Append a step, collapsing the agent's slow-app retries against the last real step.
+
+    The app re-renders slowly, so during authoring the agent often clicks the same control
+    several times before it registers (e.g. "+ Invoice" clicked twice). Fast replay doesn't
+    need those retries — the first click already takes effect and NAVIGATES, so a second click
+    on the same target then finds nothing and eats the full locator timeout. We therefore drop
+    a click that repeats the last interaction's selector, and for a repeated fill on the same
+    field we keep only the latest value (the last write wins). We compare against the last
+    *non-wait* step so a retry separated by a recorded wait is still collapsed.
+    """
+    if step.get("action") in ("click", "fill"):
+        prev_idx = next(
+            (j for j in range(len(steps) - 1, -1, -1) if steps[j].get("action") != "wait"),
+            None,
+        )
+        prev = steps[prev_idx] if prev_idx is not None else None
+        if (
+            prev is not None
+            and prev.get("action") == step["action"]
+            and prev.get("selectors") == step.get("selectors")
+        ):
+            if step["action"] == "fill":
+                steps[prev_idx] = step  # same field typed again → keep the final value
+            # repeated click → drop it (the first already fired)
+            return
+    steps.append(step)
 
 
 def compile_recording(recording_path: str | Path) -> list[dict[str, Any]]:
     """Turn a saved agent history JSON into an ordered list of {action, ...} steps."""
     data = json.loads(Path(recording_path).read_text())
     steps: list[dict[str, Any]] = []
-    for item in data.get("history", []):
+    history = data.get("history", [])
+    # Assert a known starting page: the agent's flow began on this URL, so replay must too.
+    # Without it, replay silently depends on wherever the browser happened to be left.
+    start_url = ((history[0].get("state") or {}).get("url") if history else None)
+    if start_url and start_url.startswith("http"):
+        steps.append({"action": "goto", "url": start_url})
+    for item in history:
         actions = (item.get("model_output") or {}).get("action") or []
         elements = (item.get("state") or {}).get("interacted_element") or []
         for i, action in enumerate(actions):
@@ -70,49 +167,126 @@ def compile_recording(recording_path: str | Path) -> list[dict[str, Any]]:
             params = action[name] or {}
             element = elements[i] if i < len(elements) else None
             if name == "navigate" and params.get("url"):
-                steps.append({"action": "goto", "url": params["url"]})
+                _push_step(steps, {"action": "goto", "url": params["url"]})
             elif name == "click" and element:
-                sel = _selector(element)
-                if sel:
-                    steps.append({"action": "click", "selector": sel})
+                sels = _selectors(element)
+                if sels:
+                    _push_step(steps, {"action": "click", "selectors": sels})
             elif name == "input" and element:
-                sel = _selector(element)
-                if sel:
-                    steps.append({"action": "fill", "selector": sel,
-                                  "value": params.get("text", ""), "clear": params.get("clear", True)})
+                sels = _selectors(element)
+                if sels:
+                    _push_step(steps, {"action": "fill", "selectors": sels,
+                                       "value": params.get("text", ""), "clear": params.get("clear", True)})
             elif name == "send_keys" and params.get("keys"):
-                steps.append({"action": "press", "keys": params["keys"]})
-            # `wait` and `done` are intentionally dropped — Playwright auto-waits on locators.
+                _push_step(steps, {"action": "press", "keys": params["keys"]})
+            elif name == "wait":
+                # Keep the agent's deliberate pauses (capped). They are load-bearing on this
+                # slow React app: they let the invoice form and its react-select menus finish
+                # rendering before the next click. Dropping them makes fast replay outrun the UI
+                # (menu not open yet → click times out; Save fires before state commits → no POST).
+                secs = params.get("seconds")
+                if isinstance(secs, (int, float)) and secs > 0:
+                    _push_step(steps, {"action": "wait", "seconds": min(float(secs), 3.0)})
+            # `done` is intentionally dropped — Playwright auto-waits on locators.
     return steps
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace so a crash never leaves a half-written file."""
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def save_steps(recording_path: str | Path, steps_path: str | Path) -> list[dict[str, Any]]:
-    """Compile `recording_path` and write the step list to `steps_path`."""
+    """Compile `recording_path` and write the step list to `steps_path` atomically."""
     steps = compile_recording(recording_path)
-    steps_path = Path(steps_path)
-    steps_path.parent.mkdir(parents=True, exist_ok=True)
-    steps_path.write_text(json.dumps(steps, indent=2))
+    _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 
 
+# After an interaction, give the slow React app a beat to open a menu / commit react-select
+# state / re-render before the next locator query, so replay doesn't outrun the UI.
+_SETTLE_MS = 400
+# Budget for probing a non-final candidate selector: it should fail fast so a stale anchor falls
+# through to the durable fallback instead of eating the whole timeout.
+_PROBE_MS = 2500
+
+
+def _step_selectors(step: dict[str, Any]) -> list[str]:
+    """Candidate selectors for a step (supports the legacy single-`selector` form too)."""
+    sels = step.get("selectors")
+    if sels:
+        return list(sels)
+    one = step.get("selector")
+    return [one] if one else []
+
+
+async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int):
+    """Return a locator for the first candidate that resolves to EXACTLY ONE visible element.
+
+    Refusing to act on an ambiguous match is what prevents "clicks somewhere else": rather than
+    silently taking `.first`, we require a unique hit. Non-final candidates get a short probe
+    budget; the last candidate gets the full timeout and, only then, a logged `.first` concession.
+    """
+    sels = _step_selectors(step)
+    if not sels:
+        raise RuntimeError("step has no selector")
+    errors: list[str] = []
+    for i, sel in enumerate(sels):
+        last = i == len(sels) - 1
+        budget = timeout_ms if last else _PROBE_MS
+        loc = page.locator(sel)
+        try:
+            await loc.first.wait_for(state="visible", timeout=budget)
+        except Exception as exc:  # noqa: BLE001 - try the next candidate
+            errors.append(f"{sel} -> not visible")
+            continue
+        count = await loc.count()
+        if count == 1:
+            return loc.first, sel
+        if last:
+            # Exhausted durable candidates; act on the first visible match but record it.
+            logger.warning("ambiguous selector %r matched %d nodes; using .first", sel, count)
+            return loc.first, sel
+        errors.append(f"{sel} -> {count} matches (ambiguous)")
+    raise RuntimeError("no unique candidate matched: " + " | ".join(errors))
+
+
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
-    """Execute compiled steps over a Playwright page. Returns {executed, failed_at, error}."""
+    """Execute compiled steps over a Playwright page. Returns {executed, failed_at, error, log}.
+
+    `log` records which concrete selector resolved for each interaction, so a healer/validator can
+    see exactly how each step was located (and which candidate won).
+    """
     executed = 0
+    log: list[dict[str, Any]] = []
     for idx, step in enumerate(steps):
         try:
             action = step["action"]
             if action == "goto":
                 await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
             elif action == "click":
-                await page.locator(step["selector"]).first.click(timeout=timeout_ms)
+                loc, sel = await _resolve(page, step, timeout_ms)
+                await loc.click(timeout=timeout_ms)
+                log.append({"step": idx, "action": action, "used": sel})
+                await page.wait_for_timeout(_SETTLE_MS)
             elif action == "fill":
-                loc = page.locator(step["selector"]).first
+                loc, sel = await _resolve(page, step, timeout_ms)
                 if step.get("clear", True):
                     await loc.fill("", timeout=timeout_ms)
                 await loc.fill(step.get("value", ""), timeout=timeout_ms)
+                log.append({"step": idx, "action": action, "used": sel})
+                await page.wait_for_timeout(_SETTLE_MS)
             elif action == "press":
                 await page.keyboard.press(step["keys"])
+            elif action == "wait":
+                await page.wait_for_timeout(int(step.get("seconds", 0) * 1000))
             executed += 1
         except Exception as exc:  # noqa: BLE001 - report where the script broke (app changed?)
-            return {"executed": executed, "failed_at": idx, "error": f"{type(exc).__name__}: {exc}"}
-    return {"executed": executed, "failed_at": None, "error": None}
+            return {"executed": executed, "failed_at": idx,
+                    "error": f"{type(exc).__name__}: {exc}", "log": log}
+    return {"executed": executed, "failed_at": None, "error": None, "log": log}

@@ -334,6 +334,9 @@ def _render_html(result: "RunResult") -> str:
                  " Agent Final Findings</div>"
                  f"<div class='result-box'>{findings}</div></div>")
 
+    # ---- Ground-truth network check (did the record actually get saved?) ----
+    p.append(_render_ground_truth(result.ground_truth))
+
     # ---- Judge verdict (browser-use's built-in judge) ----
     p.append(_render_judgement(result.judgement, result.is_successful))
 
@@ -374,6 +377,43 @@ def _render_html(result: "RunResult") -> str:
         "</script>"
     )
     p.append("</body></html>")
+    return "".join(p)
+
+
+def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
+    """Render the network ground-truth check: was the record actually saved?
+
+    This is the objective counterweight to the agent's self-report and the LLM judge (both of
+    which can be fooled). When a create-write was expected but never hit the network, it flags
+    that the reported success was overridden to failure.
+    """
+    if not ground_truth:
+        return ""
+    marker = ground_truth.get("marker")
+    seen = ground_truth.get("create_write_seen")
+    overrode = ground_truth.get("overrode_success")
+    if seen:
+        icon, color, label, badge = "check", "var(--success)", "SAVED", "background:var(--success);color:#fff"
+    else:
+        icon, color, label, badge = "close", "var(--error)", "NO WRITE", "background:var(--error);color:#fff"
+
+    p: list[str] = []
+    p.append("<div class='section'><div class='section-title'>"
+             "<span class='material-icons' style='color:var(--primary)'>lan</span>"
+             " Ground Truth (network)</div><div class='obs-list'><div class='obs-row'>")
+    p.append(
+        "<div class='obs-head'>"
+        f"<span class='material-icons' style='color:{color}'>{icon}</span>"
+        f"<span class='obs-title'>Create-write to <code>{_esc(marker)}</code> seen in network</span>"
+        f"<span class='badge' style='{badge}'>{label}</span></div>"
+    )
+    if overrode:
+        p.append("<div class='obs-reason'><em>Note:</em> the run reported success but no matching "
+                 "create-write was sent — nothing was actually saved. <em>Reported success was "
+                 "overridden to FAIL.</em></div>")
+    elif not seen:
+        p.append("<div class='obs-reason'>No matching create-write was sent during this run.</div>")
+    p.append("</div></div></div>")
     return "".join(p)
 
 

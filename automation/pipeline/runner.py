@@ -35,6 +35,22 @@ logger = logging.getLogger("framework.runner")
 CollectorFactory = Callable[[BrowserContext, Path], Collector]
 
 
+def _create_write_seen(requests: list[dict[str, Any]], marker: str) -> bool:
+    """True if the network log contains a successful create-write for this task.
+
+    A non-idempotent write (POST/PUT/PATCH) to a URL containing `marker` that returned 2xx/3xx
+    is the ground truth that the record was actually saved — the same check the replay path uses.
+    It is what distinguishes a real success from an agent that *claims* success but never fired
+    the create request.
+    """
+    return any(
+        r.get("method") in ("POST", "PUT", "PATCH")
+        and marker.lower() in str(r.get("url", "")).lower()
+        and 200 <= (r.get("status") or 0) < 400
+        for r in requests
+    )
+
+
 @dataclass
 class RunResult:
     """Structured outcome of a single task run, distilled from agent.history."""
@@ -67,6 +83,10 @@ class RunResult:
     judgement: dict[str, Any] | None = None
     # LLM token usage + cost for the run (browser-use UsageSummary as a dict), or None.
     usage: dict[str, Any] | None = None
+    # Network ground-truth check: {"marker": str, "create_write_seen": bool}, or None if no
+    # marker was configured for this task. When present and create_write_seen is False, the
+    # run's self-reported success was overridden to False (nothing was actually saved).
+    ground_truth: dict[str, Any] | None = None
 
     def summary(self) -> str:
         status = "✅" if self.is_successful else ("⚠️" if self.is_done else "❌")
@@ -114,7 +134,8 @@ class Runner:
         return run_id, run_dir
 
     async def run(
-        self, task: str, max_steps: int = 25, record_path: Path | None = None
+        self, task: str, max_steps: int = 25, record_path: Path | None = None,
+        success_marker: str | None = None,
     ) -> RunResult:
         """Run a single task and return a structured result.
 
@@ -125,6 +146,11 @@ class Runner:
 
         If `record_path` is given, the agent's action history is saved there so the run can
         later be replayed deterministically without the LLM (see `replay`).
+
+        If `success_marker` is given, success is cross-checked against the network log: the agent
+        (and the LLM judge) can *claim* success without the record ever being saved, so a run that
+        reports success but never fired a create-write to `success_marker` is downgraded to
+        failure. This is the same ground-truth check the replay path uses.
         """
         run_id, run_dir = self._new_run_dir()
         logger.info("▶ run %s: %s", run_id, task)
@@ -165,6 +191,7 @@ class Runner:
             llm=self.llm,
             browser_session=session,
             use_vision=self.config.use_vision,
+            vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
             extend_system_message=self.extend_system_message,
             # browser-use's built-in end-of-run judge (use_judge defaults True); run it on our
@@ -283,6 +310,27 @@ class Runner:
             judgement=judgement,
             usage=usage,
         )
+
+        # Ground-truth gate: the agent + LLM judge can report success without the record ever
+        # being saved. If a marker is configured and no matching create-write hit the network,
+        # override the self-reported success to failure so the report reflects reality.
+        if success_marker:
+            requests = collector_results.get("network", {}).get("requests", []) or []
+            create_write_seen = _create_write_seen(requests, success_marker)
+            overridden = bool(not create_write_seen and result.is_successful)
+            result.ground_truth = {
+                "marker": success_marker,
+                "create_write_seen": create_write_seen,
+                "overrode_success": overridden,
+            }
+            if overridden:
+                logger.info(
+                    "◀ ground-truth override %s: reported success but no create-write to '%s' "
+                    "seen in network → marking failed", run_id, success_marker,
+                )
+                result.is_successful = False
+                result.has_errors = True
+
         logger.info("◀ done %s: %s", run_id, result.summary())
         return result
 
@@ -338,12 +386,7 @@ class Runner:
                 logger.debug("playwright close error: %s", exc)
 
         requests = collector_results.get("network", {}).get("requests", []) or []
-        saved = any(
-            r.get("method") in ("POST", "PUT", "PATCH")
-            and success_marker in str(r.get("url", ""))
-            and 200 <= (r.get("status") or 0) < 400
-            for r in requests
-        )
+        saved = _create_write_seen(requests, success_marker)
         duration = (datetime.now() - started).total_seconds()
         final = f"Script ran {outcome['executed']}/{len(steps)} steps in {duration:.1f}s"
         if outcome["failed_at"] is not None:
@@ -358,6 +401,7 @@ class Runner:
             errors=[outcome["error"]] if outcome["error"] else [],
             collector_results=collector_results, artifacts=artifacts,
             screenshots=[], steps=[], judgement=None, usage=None,
+            ground_truth={"marker": success_marker, "create_write_seen": saved},
         )
         logger.info("◀ SCRIPT done %s: success=%s executed=%s/%s %.1fs",
                     run_id, saved, outcome["executed"], len(steps), duration)

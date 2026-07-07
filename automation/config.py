@@ -20,20 +20,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # --- LLM providers ---
-# We develop against OpenRouter (OpenAI-compatible) to avoid Groq's free-tier daily
-# token cap, but Groq is the intended FINAL provider. Switch with LLM_PROVIDER in .env;
-# each provider's model is a single swap point below.
-#
-# ONE model everywhere: Llama 4 Maverick drives the agent loop, the prompt expander, AND the
-# QA judge. Maverick (128 experts) grounds this app far better than Scout did, and the same
-# id is available on both OpenRouter and Groq, so dev mirrors the Groq production target.
+# Azure OpenAI (gpt-4.1-mini) is the active provider. Its /openai/v1 endpoint is
+# OpenAI-compatible, so browser-use's ChatOpenAI drives it with just a custom base_url.
+# ONE model everywhere: gpt-4.1-mini runs the agent loop, the prompt expander, AND the
+# QA judge, so behaviour stays consistent. Groq remains available as an alternate
+# (LLM_PROVIDER=groq in .env).
+DEFAULT_AZURE_MODEL = "gpt-4.1-mini"
+AZURE_BASE_URL = "https://actingoffice-foundry.openai.azure.com/openai/v1"
 DEFAULT_GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
-DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-4-maverick"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Prompt-expander / QA-judge model: same Maverick (always via OpenRouter, independent of
-# LLM_PROVIDER). One model for everything keeps behaviour consistent and avoids an Anthropic
-# dependency.
-DEFAULT_EXPANDER_MODEL = "meta-llama/llama-4-maverick"
+# Prompt-expander / QA-judge model: same Azure deployment, independent of LLM_PROVIDER.
+DEFAULT_EXPANDER_MODEL = DEFAULT_AZURE_MODEL
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -70,14 +66,17 @@ class Config:
     errors_dir: Path
 
     # --- Framework / agent ---
-    # Active LLM provider: "openrouter" (dev) | "groq" (final).
+    # Active LLM provider: "azure" (default) | "groq".
     llm_provider: str
+    azure_api_key: str | None
+    azure_model: str
+    azure_base_url: str
     groq_api_key: str | None
     groq_model: str
-    openrouter_api_key: str | None
-    openrouter_model: str
-    openrouter_base_url: str
     use_vision: bool
+    # Image detail sent to the model each step: "high" | "low" | "auto". "high" gives the model
+    # a sharper screenshot so it can actually read the page before acting (costs more tokens).
+    vision_detail_level: str
     artifacts_dir: Path
     # Cap on how many past steps the agent keeps in context (None = unlimited). Cuts per-step
     # tokens (the resent history grows each step). browser-use requires None or > 5.
@@ -101,13 +100,14 @@ class Config:
             headless=not headful,
             cdp_port=int(os.getenv("CDP_PORT", "9222")),
             errors_dir=Path(os.getenv("ERRORS_DIR", "errors")),
-            llm_provider=os.getenv("LLM_PROVIDER", "openrouter"),
+            llm_provider=os.getenv("LLM_PROVIDER", "azure"),
+            azure_api_key=os.getenv("AZURE_OPENAI_KEY"),
+            azure_model=os.getenv("AZURE_OPENAI_MODEL", DEFAULT_AZURE_MODEL),
+            azure_base_url=os.getenv("AZURE_OPENAI_ENDPOINT", AZURE_BASE_URL),
             groq_api_key=os.getenv("GROQ_API_KEY"),
             groq_model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
-            openrouter_api_key=os.getenv("OPEN_ROUTER_KEY"),
-            openrouter_model=os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
-            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
             use_vision=_env_bool("USE_VISION", default=True),
+            vision_detail_level=os.getenv("VISION_DETAIL_LEVEL", "auto").strip().lower(),
             artifacts_dir=Path(os.getenv("ARTIFACTS_DIR", "artifacts")),
             max_history_items=_env_history_items("MAX_HISTORY_ITEMS"),
             expand_prompt=_env_bool("EXPAND_PROMPT", default=True),
@@ -128,4 +128,4 @@ class Config:
         """The model id for the currently selected provider (for logging)."""
         if self.llm_provider.lower() == "groq":
             return self.groq_model
-        return self.openrouter_model
+        return self.azure_model

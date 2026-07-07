@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ def has_script(tid: str) -> bool:
 
 
 def update_manifest(tid: str, prompt: str, **fields: Any) -> None:
-    """Record/refresh this task's entry in recordings/manifest.json."""
+    """Record/refresh this task's entry in recordings/manifest.json (atomic write)."""
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     data: dict[str, Any] = {}
     if MANIFEST_PATH.exists():
@@ -52,4 +53,7 @@ def update_manifest(tid: str, prompt: str, **fields: Any) -> None:
     entry.update(fields)
     entry["updated"] = datetime.now().isoformat(timespec="seconds")
     data[tid] = entry
-    MANIFEST_PATH.write_text(json.dumps(data, indent=2))
+    # Atomic: write to a temp file then rename so a crash never leaves a half-written manifest.
+    tmp = MANIFEST_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, MANIFEST_PATH)

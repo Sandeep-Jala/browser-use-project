@@ -20,7 +20,7 @@ pipeline/report.py compile the RunResult into report.html + report.json
 automation/
   __main__.py          # entry point: login -> Runner -> report (python -m automation)
   config.py            # Config.from_env(): all settings in one place
-  llm.py               # build the browser-use chat model (OpenRouter dev / Groq final)
+  llm.py               # build the browser-use chat model (Azure OpenAI default / Groq)
   browser/
     login.py           # Playwright login, hands off via CDP
     error_capture.py   # failure screenshots
@@ -54,7 +54,7 @@ Copy the sample env file and fill in your values (`.env.example` documents every
 cp .env.example .env
 ```
 
-Minimum required: `LOGIN_URL`, `LOGIN_EMAIL`, `LOGIN_PASSWORD`, and `OPEN_ROUTER_KEY`.
+Minimum required: `LOGIN_URL`, `LOGIN_EMAIL`, `LOGIN_PASSWORD`, and `AZURE_OPENAI_KEY`.
 `.env` is gitignored; never commit it.
 
 ## Run

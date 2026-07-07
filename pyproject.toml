@@ -5,7 +5,7 @@ description = "Browser-use agent framework: authenticated login, task runs, tele
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "browser-use>=0.13.1",
+    "browser-use==0.13.3",
     "groq>=1.0.0",
     "playwright>=1.60.0",
     "python-dotenv>=1.2.2",
