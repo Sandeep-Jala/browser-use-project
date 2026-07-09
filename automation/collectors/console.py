@@ -76,7 +76,7 @@ class ConsoleCollector(Collector):
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("console handler error: %s", exc)
+            logger.exception("console handler error: %s", exc)
 
     def _on_page_error(self, error: Error) -> None:
         if not self._active:
@@ -100,7 +100,7 @@ class ConsoleCollector(Collector):
                 }
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("pageerror handler error: %s", exc)
+            logger.exception("pageerror handler error: %s", exc)
 
     # ---------------- results ----------------
 

@@ -34,8 +34,23 @@ def steps_path(tid: str) -> Path:
     return RECORDINGS_DIR / f"{tid}.steps.json"
 
 
+def template_path(tid: str) -> Path:
+    """Parameterized form of the golden script: {{param}} tokens + a defaults dictionary."""
+    return RECORDINGS_DIR / f"{tid}.template.json"
+
+
 def has_script(tid: str) -> bool:
     return steps_path(tid).exists()
+
+
+def load_manifest() -> dict[str, Any]:
+    """Read recordings/manifest.json; {} if it is missing or corrupt."""
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        return json.loads(MANIFEST_PATH.read_text())
+    except Exception:  # noqa: BLE001 - a corrupt manifest just means no recorded tasks
+        return {}
 
 
 def update_manifest(tid: str, prompt: str, **fields: Any) -> None:

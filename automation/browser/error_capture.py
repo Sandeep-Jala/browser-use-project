@@ -6,11 +6,13 @@ to the configured errors directory (gitignored).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import Page
 
+logger = logging.getLogger("framework.error_capture")
 
 async def save_login_error_screenshot(
     page: Page,
@@ -31,5 +33,5 @@ async def save_login_error_screenshot(
         print(f"[!] Saved failure screenshot: {out_path}")
         return out_path
     except Exception as exc:  # noqa: BLE001 - best-effort, must not raise
-        print(f"[!] Failed to capture error screenshot ({name}): {exc}")
+        logger.exception("Failed to capture error screenshot (%s)", name)
         return None

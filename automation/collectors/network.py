@@ -84,7 +84,7 @@ class NetworkCollector(Collector):
         try:
             record["request_headers"] = dict(request.headers)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("request headers error: %s", exc)
+            logger.exception("request headers error: %s", exc)
 
     def _on_response(self, response: Response) -> None:
         if not self._active:
@@ -104,10 +104,10 @@ class NetworkCollector(Collector):
             try:
                 record["response_headers"] = dict(response.headers)
             except Exception as exc:  # noqa: BLE001
-                logger.debug("response headers error: %s", exc)
+                logger.exception("response headers error: %s", exc)
             self._finish(request, record)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("response handler error: %s", exc)
+            logger.exception("response handler error: %s", exc)
 
     def _on_request_finished(self, request: Request) -> None:
         if not self._active:
@@ -129,7 +129,7 @@ class NetworkCollector(Collector):
             )
             self._finish(request, record)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("requestfailed handler error: %s", exc)
+            logger.exception("requestfailed handler error: %s", exc)
 
     # ---------------- results ----------------
 

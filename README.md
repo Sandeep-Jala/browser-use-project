@@ -60,33 +60,44 @@ Minimum required: `LOGIN_URL`, `LOGIN_EMAIL`, `LOGIN_PASSWORD`, and `AZURE_OPENA
 ## Run
 
 ```bash
-# Run the agent on the default task, then write a report
+# Replay-first by default: replay the task's recorded script if one exists (fast, no LLM),
+# else run the agent once and record + compile a script for next time
 uv run python -m automation
 
-# AUTO (recommended): replay the task's recorded script if one exists (fast, no LLM),
-# else run the agent once and record + compile a script for next time
-AUTO=1 uv run python -m automation
+# Pick the task
+TASK=purchase uv run python -m automation
 
-# Pick the task; force re-authoring an already-recorded task
-TASK=purchase AUTO=1 uv run python -m automation
-FRESH=1 TASK=purchase AUTO=1 uv run python -m automation
+# Force re-authoring an already-recorded task
+TASK=purchase uv run python -m automation --fresh
+
+# Force a plain agent run that ignores recordings (no replay, nothing recorded)
+uv run python -m automation --no-auto
 ```
 
-| Env var | Effect |
+| Flag / Env var | Effect |
 |---------|--------|
-| `TASK` | which task to run: `invoice` (default) or `purchase` |
-| `AUTO=1` | replay the recorded script if present, else author + record one |
-| `FRESH=1` | force re-authoring even if a script already exists |
+| `TASK` / `--task` | which task to run: `invoice` (default) or `purchase` |
+| `--no-auto` | force a plain agent run, ignoring recordings (replay is on by default) |
+| `--fresh` | force re-authoring even if a script already exists |
 
 ### Outputs
 
 - `artifacts/<run_id>/` — `network.json`, `console.json`, `report.html`, `report.json`
-- `recordings/<task_id>.steps.json` — the compiled fast-replay script (created on first AUTO author)
-- `recordings/manifest.json` — `task_id -> prompt` map
+- `recordings/<task_id>.steps.json` — the compiled fast-replay script (created the first time a task is authored)
+- `recordings/<task_id>.template.json` — the script with its values lifted into a `{{param}}`
+  dictionary (`customer`, `qty`, `unit_price`, ...), created alongside each golden script
+- `recordings/manifest.json` — `task_id -> prompt` map (+ each task's `params` dictionary)
 
 ### How record / replay works
 
-The first AUTO run of a task has the agent (LLM) perform it and saves the trace, then compiles
-it into a stable-selector script. Subsequent AUTO runs of the **same prompt** detect that script
+The first run of a task has the agent (LLM) perform it and saves the trace, then compiles
+it into a stable-selector script. Subsequent runs of the **same prompt** detect that script
 by a hash of the prompt and replay it over Playwright — no LLM, in seconds, at zero token cost.
-Editing the prompt text changes its hash, so it will re-author.
+(This is the default; `--no-auto` opts out of it for a one-off plain agent run.)
+
+Editing only the prompt's **values** (customer, qty, unit price, ...) does not re-author either:
+each committed script is parameterized into a template whose values live in a named dictionary
+(`recordings/<task_id>.template.json`). A changed prompt is matched against recorded templates
+(one small LLM call), the new values are read into the dictionary, the tokens are swapped in,
+and the instantiated script is replay-validated before being committed as a golden script of
+its own. Structural edits (different tab, extra fields) fall back to full agent re-authoring.

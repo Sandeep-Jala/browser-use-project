@@ -35,20 +35,27 @@ logger = logging.getLogger("framework.runner")
 CollectorFactory = Callable[[BrowserContext, Path], Collector]
 
 
-def _create_write_seen(requests: list[dict[str, Any]], marker: str) -> bool:
-    """True if the network log contains a successful create-write for this task.
+def _first_create_write(requests: list[dict[str, Any]], marker: str) -> dict[str, Any] | None:
+    """The first successful create-write for this task in the network log, or None.
 
     A non-idempotent write (POST/PUT/PATCH) to a URL containing `marker` that returned 2xx/3xx
     is the ground truth that the record was actually saved — the same check the replay path uses.
     It is what distinguishes a real success from an agent that *claims* success but never fired
-    the create request.
+    the create request. The record carries the agent `step` it fired on, which lets the caller
+    truncate a recording at the save.
     """
-    return any(
-        r.get("method") in ("POST", "PUT", "PATCH")
-        and marker.lower() in str(r.get("url", "")).lower()
-        and 200 <= (r.get("status") or 0) < 400
-        for r in requests
-    )
+    for r in requests:
+        if (
+            r.get("method") in ("POST", "PUT", "PATCH")
+            and marker.lower() in str(r.get("url", "")).lower()
+            and 200 <= (r.get("status") or 0) < 400
+        ):
+            return r
+    return None
+
+
+def _create_write_seen(requests: list[dict[str, Any]], marker: str) -> bool:
+    return _first_create_write(requests, marker) is not None
 
 
 @dataclass
@@ -166,7 +173,7 @@ class Runner:
             try:
                 (run_dir / "expanded_task.txt").write_text(expanded_task, encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
-                logger.debug("could not save expanded_task.txt: %s", exc)
+                logger.exception("could not save expanded_task.txt: %s", exc)
 
         session = await attach_session(self.cdp_url, self.config)
         # Connect CDP now (idempotent with agent.run) so the browser is live before we
@@ -193,6 +200,15 @@ class Runner:
             use_vision=self.config.use_vision,
             vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
+            # ONE action per LLM step (default 5). This app re-renders after every input AND
+            # after every click, so any action queued behind another acts on a stale page.
+            # 2 was tried with a text rule forbidding a click as the second action, but the
+            # model still queued input+click (run 20260708_153223 step 12: typed "bike" into
+            # the Item react-select and clicked option-1 in the same step — the click index
+            # came from the pre-typing DOM, so it hit a stale option and the item never truly
+            # registered: Account/VAT were not auto-filled). Structural enforcement is the
+            # only thing that reliably prevents it; every click now sees a fresh DOM.
+            max_actions_per_step=1,
             extend_system_message=self.extend_system_message,
             # browser-use's built-in end-of-run judge (use_judge defaults True); run it on our
             # model. We read its verdict below instead of running a second judge of our own.
@@ -218,7 +234,7 @@ class Runner:
                 try:
                     await collector.stop()
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("collector %s stop error: %s", collector.name, exc)
+                    logger.exception("collector %s stop error: %s", collector.name, exc)
 
             for collector in collectors:
                 collector_results[collector.name] = collector.results()
@@ -230,12 +246,12 @@ class Runner:
                 # connect_over_cdp: closes our Playwright connection only, not the browser.
                 await pw_browser.close()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("playwright connection close error: %s", exc)
+                logger.exception("playwright connection close error: %s", exc)
 
             try:
                 await session.stop()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("session.stop() during cleanup: %s", exc)
+                logger.exception("session.stop() during cleanup: %s", exc)
 
         # Save the action trace for later deterministic replay (no LLM) if requested.
         if record_path is not None:
@@ -253,7 +269,7 @@ class Runner:
         try:
             screenshots = history.screenshots(return_none_if_not_screenshot=True)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("could not read screenshots from history: %s", exc)
+            logger.exception("could not read screenshots from history: %s", exc)
 
         # Per-step progress timeline from the agent's own reasoning (no extra LLM call): each
         # step's goal + its evaluation of the prior step, so the report shows what the agent
@@ -272,7 +288,7 @@ class Runner:
                     }
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("could not build step timeline from history: %s", exc)
+            logger.exception("could not build step timeline from history: %s", exc)
 
         # LLM token usage + cost for the run (browser-use computes this into history.usage).
         usage: dict[str, Any] | None = None
@@ -281,7 +297,7 @@ class Runner:
             if raw_usage is not None:
                 usage = raw_usage.model_dump() if hasattr(raw_usage, "model_dump") else dict(raw_usage)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("could not read token usage from history: %s", exc)
+            logger.exception("could not read token usage from history: %s", exc)
 
         # browser-use's built-in judge runs at the end of the agent loop (use_judge) and
         # attaches its verdict to the last done action result. Read it instead of running a
@@ -316,11 +332,15 @@ class Runner:
         # override the self-reported success to failure so the report reflects reality.
         if success_marker:
             requests = collector_results.get("network", {}).get("requests", []) or []
-            create_write_seen = _create_write_seen(requests, success_marker)
+            write = _first_create_write(requests, success_marker)
+            create_write_seen = write is not None
             overridden = bool(not create_write_seen and result.is_successful)
             result.ground_truth = {
                 "marker": success_marker,
                 "create_write_seen": create_write_seen,
+                # Agent step the commit fired on — lets run_task truncate a rescued
+                # recording at the save, cutting any post-save flailing.
+                "write_step": write.get("step") if write else None,
                 "overrode_success": overridden,
             }
             if overridden:
@@ -350,7 +370,14 @@ class Runner:
         steps = _json.loads(Path(steps_path).read_text())
 
         pw_browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
-        page = next((ctx.pages[0] for ctx in pw_browser.contexts if ctx.pages), None)
+        
+        pages = [p for ctx in pw_browser.contexts for p in ctx.pages]
+        page = None
+        if pages:
+            real_pages = [p for p in pages if p.url != "about:blank"]
+            page = real_pages[0] if real_pages else pages[0]
+            if len(pages) > 1:
+                logger.warning("Multiple pages found (%d). Selected page URL: %s", len(pages), page.url)
         collectors: list[Collector] = []
         for context in pw_browser.contexts:
             for factory in self.collector_factories:
@@ -374,7 +401,7 @@ class Runner:
                 try:
                     await collector.stop()
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("collector %s stop error: %s", collector.name, exc)
+                    logger.exception("collector %s stop error: %s", collector.name, exc)
             for collector in collectors:
                 collector_results[collector.name] = collector.results()
                 path = collector.write()
@@ -383,7 +410,7 @@ class Runner:
             try:
                 await pw_browser.close()
             except Exception as exc:  # noqa: BLE001
-                logger.debug("playwright close error: %s", exc)
+                logger.exception("playwright close error: %s", exc)
 
         requests = collector_results.get("network", {}).get("requests", []) or []
         saved = _create_write_seen(requests, success_marker)
@@ -422,5 +449,5 @@ class Runner:
                             "reached_captcha": getattr(j, "reached_captcha", None),
                         }
         except Exception as exc:  # noqa: BLE001 - reading the judge verdict must not crash the run
-            logger.debug("could not read built-in judge verdict: %s", exc)
+            logger.exception("could not read built-in judge verdict: %s", exc)
         return None

@@ -8,6 +8,7 @@ dependencies = [
     "browser-use==0.13.3",
     "groq>=1.0.0",
     "playwright>=1.60.0",
+    "psutil>=7.2.2",
     "python-dotenv>=1.2.2",
 ]
 

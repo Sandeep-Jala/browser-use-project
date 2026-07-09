@@ -60,7 +60,7 @@ class Collector(ABC):
         try:
             self._attach_page(page)
         except Exception as exc:  # noqa: BLE001 - a bad page must not break the run
-            logger.debug("%s: failed to attach to page: %s", self.name, exc)
+            logger.exception("%s: failed to attach to page: %s", self.name, exc)
 
     @abstractmethod
     def _attach_page(self, page: Page) -> None:
@@ -78,5 +78,5 @@ class Collector(ABC):
             out_path.write_text(json.dumps(self.results(), indent=2, default=str))
             return out_path
         except Exception as exc:  # noqa: BLE001 - persistence must not crash the run
-            logger.warning("collector %s failed to write results: %s", self.name, exc)
+            logger.exception("collector %s failed to write results: %s", self.name, exc)
             return None

@@ -20,31 +20,58 @@ logger = logging.getLogger("framework.prompts")
 # --- Agent system rules (sent to the agent every step; deliberately short) -------------------
 APP_SYSTEM_RULES = """\
 You are testing the Acting Office web app (a slow Fluent UI / React app that re-renders often).
+Ground every step in the CURRENT screenshot, not in your plan or memory: before acting, and \
+when evaluating the previous step, state what the page ACTUALLY shows. Never mark a step \
+successful because you intended it — only because the screenshot/page state proves it (the \
+form is open, the field shows the value, the option is selected). If the screenshot \
+contradicts what you expected, trust the screenshot and adapt.
 Verb rules (follow these precisely):
-- "select X"   -> choose X by CLICKING the option; for a dropdown you may type to filter first, \
-then click. Do NOT type into a plain text/number field you were not told to.
+- "select X"   -> choose X by CLICKING the option. In a dropdown, when the task names a \
+specific value, ALWAYS type that value into the field to filter FIRST, then click the \
+matching option — never pick an option by its position or by sight, even if you can already \
+see it (typed values are required for the run to be recorded correctly). Do NOT type into a \
+plain text/number field you were not told to.
 - "set X to Y" -> INPUT_TEXT: type Y into the named field (clear first if prefilled).
 - "click X"    -> a direct mouse click (button, link, or menu item). Do NOT type.
 Rules:
 - Do exactly what the task says: enter only the values it gives, in the fields it names. Never \
 invent a value or fill a field the task did not mention.
-- Dropdowns are react-select: click the field, type the value to filter, then CLICK the matching \
-option once it appears. To press a key (ArrowDown/Enter/Tab) use send_keys, never input_text — \
-those keys are actions, not characters. If your filter shows no match, clear it and pick from the \
-options listed. If the task gives no specific value (e.g. "select an item from the dropdown"), \
-pick the FIRST real option — never type a made-up placeholder.
+- Dropdowns are react-select: click the field, type the value to filter, WAIT for the list to \
+re-filter, then CLICK the option whose LABEL matches your value — each of those is its OWN step. \
+After clicking, VERIFY the field now displays the chosen value; if it does not, the click did not \
+register — reopen the field and pick again. To press a key (ArrowDown/Enter/Tab) use send_keys, \
+never input_text — those keys are actions, not characters. If your filter shows no match, clear \
+it and pick from the options listed. If the task gives no specific value (e.g. "select an item \
+from the dropdown"), pick the FIRST real option — never type a made-up placeholder.
 - In a search box (not a dropdown), press Enter after typing to submit; in a dropdown, choose by \
 clicking the option, not Enter. Never click the small x / clear icon inside a field.
-- For number and price fields, clear the field fully before typing, then check it shows the \
-value you intended. A money/Amount field that shows a "£" prefix (e.g. £0.00, as on Receipts and \
+- For number and price fields, ALWAYS clear and type the task's value yourself — even if the \
+field already shows that value (e.g. a unit price auto-filled by the chosen item); typed \
+values are required for the run to be recorded correctly. Clear the field fully before \
+typing, then check it shows the value you intended. A money/Amount field that shows a "£" prefix (e.g. £0.00, as on Receipts and \
 Payments) needs the pound sign: type the amount WITH it (e.g. "£1000") — a plain number may not \
 register.
 - Add a new row or line only if the task has more than one entry. Set values in the existing \
 row's fields; do not use "+" / "Add" buttons to pick a value.
-- To open a new-record form, click the exact add button ("+ Invoice", "+ Item", ...) — not a \
-table row, a column header (e.g. "Invoice no."), or nearby controls (Import / Scan). Then VERIFY \
-a blank form actually opened before filling anything; if it did not, your click missed — click \
-the add button again.
+- To open a new-record form, first WAIT until the list page has finished loading (no "Please \
+Wait" spinner), then click the exact add button ("+ Invoice" has id=btnInvoice, "+ Item", ...) \
+— not a table row, a column header (e.g. "Invoice no."), or nearby controls (Import / Scan). \
+The form can take a few seconds to render: WAIT and re-read the page before concluding the \
+click missed, and only then click the add button again. If the URL suddenly shows /books \
+without /clients/<id>, your click hit a stale element and threw you back to the client list — \
+re-select the client; do NOT keep clicking where the button used to be.
+- NEVER start filling fields until the create form is ACTUALLY open: the form's own field \
+labels (User, Remarks, Amount, ...) must be visible on the page. If you still see the LIST \
+page — a Search box, From/To date filters, sortable column headers (User | Date | \
+Description ...), or "No data available in table" — your add-button click did NOT open the \
+form: click the exact add button again. List column headers look clickable but only sort the \
+list (ids like header####-cName are headers) — they are NEVER form fields; do not click them \
+to select a value.
+- If a value you typed does not appear in the field, you typed into the WRONG element (the \
+action can report success against a non-input node while nothing shows). Do NOT retry the \
+same element. First confirm the form is really open (see above); then find the field by its \
+LABEL, click it, and type again. If typing fails twice on the same field, stop and re-open \
+the form instead of trying a third time.
 - The app is slow: after navigating or saving, re-read the page once it has settled before \
 deciding it worked.
 - If you cannot find a menu item, scroll or expand sections before concluding it is missing.
@@ -58,9 +85,21 @@ does not exist on this page, so do not keep clicking or probing for it. Re-navig
 module picker → Bookkeeping → search and select the client → continue from there.
 - Before saving, check the form matches the task (right values, right fields, no extra rows or \
 changes) and fix any mismatch first.
+- ONE action per step, always. Never plan typing and clicking together: type the filter, then \
+click the matching option in the NEXT step, after the re-filtered list is visible — a click \
+planned against the pre-typing page lands on the WRONG option (observed: the Item option \
+clicked after typing "bike" was positional and the item never registered). In particular, \
+click plain "Save" ALONE as its own step — it sits right next to "Save & New".
 - A greyed-out / disabled Save or Create button means a REQUIRED field is missing or invalid — \
 clicking it does nothing and the record is NOT saved. Disabled Save is NEVER a sign of success: \
-find the empty/invalid field (e.g. an amount that did not register), fix it, then save.
+find the empty/invalid field (e.g. an amount that did not register), fix it, then save. If \
+saving is blocked because a REQUIRED dropdown the task never mentioned is empty (e.g. Account \
+or VAT on an invoice line, which the chosen Item normally auto-fills), FIRST re-check the Item \
+field: Account AND VAT both empty usually means your item click never registered — re-select \
+the item properly (click the field, type its name, wait, click the matching option) and the \
+app will fill them. Only if the Item field DOES show the chosen item is this the ONE case \
+where you fill an unmentioned field yourself: set Account to the FIRST option and VAT to \
+"No VAT", then save.
 - Saving can be TWO steps: after you click Save on the form, a confirmation/allocation dialog \
 (e.g. "Allocated amount of CRN-xxxx") may pop up with its OWN Save button — click Save in THAT \
 dialog too; the record is NOT committed until you do. Use plain Save both times; click "Save & \
@@ -104,7 +143,11 @@ QUICK NAVIGATION GUIDE (task phrase → exact UI path)
                                    (button aria-label="menus" or id="btn-menus-callout") to
                                    open the module picker popup, then click "Bookkeeping"
 "search and select <client>"     → type name in search box (top-right of client list), press
-                                   Enter (send_keys) to run the search, then click the row
+                                   Enter (send_keys) to run the search, then click the client's
+                                   business NAME text in the result row — the name itself is
+                                   the link that opens the client workspace
+                                   (/books/clients/<id>/dashboard); clicking elsewhere in the
+                                   row does NOT navigate
 "go to inputs section"           → click "Inputs" in left-nav (expands sub-items)
 "select sales"                   → click "Sales" under Inputs
 "select purchases"               → click "Purchases" under Inputs
@@ -140,7 +183,8 @@ Dashboard | Inputs ▾ | Banking | VAT returns | Reports | Budget manager | Sett
 INPUTS > SALES  — tab bar: Invoices | Credit notes | Estimates | Receipts | Customers | Items
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-INVOICES tab — add button "+ Invoice"
+INVOICES tab — add button "+ Invoice" (id=btnInvoice; wait for the invoice list to finish
+  loading before clicking it, and wait again for the form to render after)
   Customer        react-select  placeholder "Contact name"
   Invoice no.     auto-filled (INV-xxxx) — leave unless task says to change
   P.O. reference  text
@@ -156,6 +200,14 @@ INVOICES tab — add button "+ Invoice"
     VAT               react-select  label "VAT"        placeholder "Select"  ← 2nd Select in row
                       options: No VAT, 20% Standard, 5% Standard, etc.
     Net amount        read-only
+  NOTE: selecting an Item normally auto-fills Account, VAT (and often description/unit price)
+  from the item's defaults. After selecting, VERIFY the Item field shows the chosen item AND
+  Account/VAT are filled. If the Item field is empty or Account AND VAT both still show
+  "Select", the option click did NOT register — re-select the item (click the field, type its
+  name, wait for the filtered list, click the option with the matching LABEL) before touching
+  any other field. Only if the item IS shown but a field stayed empty, set it yourself
+  (Account: first option, VAT: No VAT) BEFORE clicking Save; then type the task's own
+  description/qty/price over any auto-filled values.
   "+ Service"  adds another line-item row — do NOT use it to pick a value
   Note         text (bottom)
   Buttons: Save | Save & New | Cancel
@@ -257,13 +309,25 @@ EXPENSE CLAIMS tab — add button "+ Expense"
   Buttons: Save | Cancel
 
 MILEAGE CLAIMS tab — add button "+ Mileage"   ← tab label is "Mileage claims" (tasks say "Mileages Section")
+  The "+ Mileage" button is the BLUE button directly above the list, LEFT of the Search box.
+  Do NOT click the section title/breadcrumb ("Mileages") or the list column headers
+  (Expense no. | User | Date | Description | Claimed | Due balance | Status) — headers only
+  sort the empty list; nothing opens. After clicking "+ Mileage", CONFIRM the form's fields
+  (User, Remarks, ...) are visible before filling; if the Search box / "No data available in
+  table" is still showing, the form did NOT open — click "+ Mileage" again.
   User            react-select (director dropdown)
   Remarks         text
-  Engine type     react-select (Petrol / Diesel / Electric)
+  Engine type     react-select — options are GROUPED under fuel headings (PETROL / DIESEL /
+                  ELECTRIC). The heading itself is NOT clickable and typing "Petrol" filters
+                  to 0 results — do NOT type: open the dropdown and click the FIRST option
+                  listed UNDER the PETROL heading (e.g. "Up to 1400cc").
   Description     text
   Mileage         numeric
-  Rate            react-select (45p / 25p / etc.)
-  Buttons: Save | Cancel
+  Rate            react-select (45p / 25p / ...) — options appear only AFTER Engine type is
+                  set: ALWAYS select Engine type first. Then open Rate and click the option
+                  matching the task's rate (e.g. "45p") — never settle for the first option
+                  when the task names a specific rate.
+  Buttons: Save | Cancel — on Save a warning dialog may appear; click "Save anyway" to commit.
 
 REIMBURSEMENTS tab — add button "+ Reimbursement"
   Reimbursed To   react-select (user)
@@ -369,6 +433,67 @@ UI RULES (apply everywhere)
 """
 
 
+# --- Template prompts (parameterized replay, see pipeline/adapt.py) --------------------------
+PARAMETERIZE_SYSTEM_PROMPT = """\
+You annotate a recorded browser-automation script so it can be replayed later with different \
+values. You get the TASK PROMPT the script was recorded from, and a JSON list of the script's \
+inputs of two kinds:
+  * typed inputs:   {"step": <index>, "value": "<typed text>", "field": "<selector hint>"}
+  * dropdown picks: {"step": <index>, "value": null, "field": "dropdown option picked without \
+typing — infer its label from the task prompt"}
+
+Assign each input a short snake_case parameter name describing the ROLE that value plays in \
+the task (e.g. client, customer, supplier, item, product_description, qty, unit_price, \
+amount, invoice_ref, remarks, bill_no, date). For dropdown picks, also supply the VALUE: the \
+option label the task prompt says was selected there (e.g. the prompt says "select a customer \
+Star" and the script's only untyped dropdown pick is the customer field -> value "Star", \
+copied VERBATIM from the prompt). If the prompt does not name the picked option, OMIT that \
+entry.
+
+Output ONLY strict JSON — no prose, no markdown fences:
+  {"bindings": [{"step": <index>, "param": "<name>"},
+                {"step": <index>, "param": "<name>", "value": "<label>"}, ...]}
+("value" is present ONLY for dropdown picks.)
+
+Rules:
+- Include EVERY typed input exactly once, identified by its exact "step" index.
+- Two entries share a param name ONLY if they must always hold the same value (the same thing \
+typed twice). Fields whose values merely coincide right now (e.g. a qty of 5 and a rate of 5) \
+get DIFFERENT names.
+- Names are lowercase snake_case and describe the field's role, not its current value.\
+"""
+
+
+TEMPLATE_MATCH_SYSTEM_PROMPT = """\
+You match a NEW browser-automation task against recorded TASK TEMPLATES and read the new \
+parameter values out of it. Each template is given as: its id in [brackets], its parameter \
+dictionary (param name -> the value used when it was recorded), and the prompt it was \
+recorded from.
+
+A template matches only if the new task is the SAME PROCEDURE: identical navigation (same \
+module, sections, tabs), the same record type, and the same fields filled the same way — \
+differing ONLY in the parameter values. Any structural difference (different section or tab, \
+a field present in one but not the other, extra or missing actions, a different record type) \
+means NO match. When in doubt, return null; a wrong match wastes a full run.
+
+Output ONLY strict JSON — no prose, no markdown fences:
+  {"match_id": "<id of the matched template>",
+   "values": {"<param>": "<that parameter's value in the NEW task>", ...}}
+or, if no template qualifies:
+  {"match_id": null, "values": {}}
+
+Value rules:
+- "values" must contain EVERY parameter of the matched template. If the new task keeps a \
+value unchanged, repeat the recorded value.
+- Copy each value VERBATIM from the new task's text — no rewording, renumbering, or \
+normalization; these strings are typed into the app exactly as given.
+- The params dict lists EVERYTHING the template can change. If the new task differs from the \
+template's prompt in a value that has NO corresponding parameter (e.g. it names a different \
+customer but the template has no customer param), return null — replaying would silently \
+keep the old value and save a wrong record.\
+"""
+
+
 # --- Expander meta-prompt + logic ------------------------------------------------------------
 EXPANSION_SYSTEM_PROMPT = """\
 You rewrite a browser-automation task into a precise, step-by-step instruction list for an \
@@ -417,9 +542,10 @@ them:
    (a) click the field to open the list;
    (b) input_text with ONLY the search value (e.g. "Service") — NEVER include key names like \
 ArrowDown or Enter in the typed text; the input action types characters only;
-   (c) click the matching option that appears in the dropdown list — this is a REQUIRED step, \
-always write it; phrase it as "click the option [value] from the dropdown list".
-   Then verify the chosen value is now shown in the field.
+   (c) after the list has re-filtered, click the option whose LABEL matches — this is a \
+REQUIRED step of its own, never merged with the typing; phrase it as "wait for the list to \
+update, then click the option [value] from the dropdown list".
+   Then verify the chosen value is now shown in the field (re-select if it is not).
    If the dropdown's options DEPEND on an earlier field (e.g. "Invoice ref" lists only the \
 chosen customer's invoices), add a step to wait for the list to populate after opening it before \
 typing. If the search value shows no match, clear it and pick from the options actually listed; \
@@ -430,13 +556,21 @@ If the task named no specific option (case 1b), skip step (b) and click the firs
 it (or wait briefly) and retry" and "if a click does nothing, fall back to keyboard \
 navigation with send_keys (Tab to move focus, ArrowDown to choose, Enter to confirm)". \
 Prefer keyboard fallbacks whenever a direct click might fail.
-7. After EVERY step that navigates (module switch, client select, left-nav click, tab click), \
-add a VERIFY step naming the expected URL fragment from the map's URL LANDMARKS (e.g. "verify \
-the URL contains /clients/<id>/inputs/sales"), plus a recovery clause: "if the URL does not \
-match, you are on the wrong page — do NOT search for the target there; re-navigate (module \
-picker → Bookkeeping → search and select the client) and continue". Do NOT invent verification \
-the task did not ask for -- in particular, NEVER require a "success message" / toast after \
-saving; this app often shows none.
+7. After a step that clicks a TAB or an ADD button ("+ Invoice", "+ Expense", ...), insert a \
+"wait 2 seconds" step before anything else — this app renders slowly and the next element \
+often does not exist yet. For an ADD button, make the step AFTER the wait conditional: \
+"confirm the form's fields (e.g. [first field label]) are now visible; if the page still \
+shows the list (Search box, column headers, 'No data available in table'), the click missed — \
+click the [add button] again and wait 2 seconds". Only then continue filling fields. Do NOT write separate "verify the URL" steps: the agent sees the \
+current URL in its state on every step and has NO tool for checking it, so a verify-only step \
+is wasted (or worse, triggers a failing JavaScript call). Instead, where it helps, append a \
+short parenthetical to the NEXT action step, e.g. "click Sales under Inputs (the URL should \
+now contain /clients/<id>/dashboard; if it shows /books without /clients/<id> you fell out of \
+the client workspace — re-navigate: module picker → Bookkeeping → search and select the \
+client)". Never refer to other steps by their number (no "repeat steps 1-6" — the agent \
+cannot resolve step numbers); spell out the recovery actions instead. Do NOT invent \
+verification the task did not ask for -- in particular, NEVER require a "success message" / \
+toast after saving; this app often shows none.
 8. The SECOND-TO-LAST step confirms the TASK'S OWN goal was reached, matching what the task \
 asked for -- not a fixed template: for a create/save task, the new record appears (in the list \
 or as a new reference number) or the form closes; for a navigation task, the target \
