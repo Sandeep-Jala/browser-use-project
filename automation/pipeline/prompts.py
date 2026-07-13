@@ -1,12 +1,15 @@
 """All the prompt text for the framework, in one place.
 
-Three prompts, each used by a different part of the pipeline:
-  * APP_SYSTEM_RULES      -> appended to the agent's system prompt every step (kept lean).
-  * APP_MAP               -> the app's navigation structure, given to the expander.
-  * EXPANSION_SYSTEM_PROMPT-> the meta-prompt that rewrites a terse task into concrete steps.
+Two prompts drive the run, each used by a different part of the pipeline:
+  * SPEED_OPTIMIZATION_PROMPT -> appended to the agent's system prompt every step.
+  * EXPAND_SYSTEM_PROMPT      -> the meta-prompt that rewrites a terse task into concrete steps.
+
+These prompts are app-agnostic: they teach the agent/expander GENERAL browser-automation
+tactics (react-select handling, scrolling, escape hatches, verification) rather than a
+hardcoded map of one site, so no per-app navigation map is needed.
 
 `expand_task()` (the only logic here) runs the expander: one LLM call that turns a high-level
-task into an explicit step list, using APP_MAP so it references the app's real menus/paths.
+task into an explicit, numbered execution plan.
 """
 from __future__ import annotations
 
@@ -17,419 +20,321 @@ from browser_use.llm.messages import SystemMessage, UserMessage
 logger = logging.getLogger("framework.prompts")
 
 
-# --- Agent system rules (sent to the agent every step; deliberately short) -------------------
-APP_SYSTEM_RULES = """\
-You are testing the Acting Office web app (a slow Fluent UI / React app that re-renders often).
-Ground every step in the CURRENT screenshot, not in your plan or memory: before acting, and \
-when evaluating the previous step, state what the page ACTUALLY shows. Never mark a step \
-successful because you intended it — only because the screenshot/page state proves it (the \
-form is open, the field shows the value, the option is selected). If the screenshot \
-contradicts what you expected, trust the screenshot and adapt.
-Verb rules (follow these precisely):
-- "select X"   -> choose X by CLICKING the option. In a dropdown, when the task names a \
-specific value, ALWAYS type that value into the field to filter FIRST, then click the \
-matching option — never pick an option by its position or by sight, even if you can already \
-see it (typed values are required for the run to be recorded correctly). Do NOT type into a \
-plain text/number field you were not told to.
-- "set X to Y" -> INPUT_TEXT: type Y into the named field (clear first if prefilled).
-- "click X"    -> a direct mouse click (button, link, or menu item). Do NOT type.
-Rules:
-- Do exactly what the task says: enter only the values it gives, in the fields it names. Never \
-invent a value or fill a field the task did not mention.
-- Dropdowns are react-select: click the field, type the value to filter, WAIT for the list to \
-re-filter, then CLICK the option whose LABEL matches your value — each of those is its OWN step. \
-After clicking, VERIFY the field now displays the chosen value; if it does not, the click did not \
-register — reopen the field and pick again. To press a key (ArrowDown/Enter/Tab) use send_keys, \
-never input_text — those keys are actions, not characters. If your filter shows no match, clear \
-it and pick from the options listed. If the task gives no specific value (e.g. "select an item \
-from the dropdown"), pick the FIRST real option — never type a made-up placeholder.
-- In a search box (not a dropdown), press Enter after typing to submit; in a dropdown, choose by \
-clicking the option, not Enter. Never click the small x / clear icon inside a field.
-- For number and price fields, ALWAYS clear and type the task's value yourself — even if the \
-field already shows that value (e.g. a unit price auto-filled by the chosen item); typed \
-values are required for the run to be recorded correctly. Clear the field fully before \
-typing, then check it shows the value you intended. A money/Amount field that shows a "£" prefix (e.g. £0.00, as on Receipts and \
-Payments) needs the pound sign: type the amount WITH it (e.g. "£1000") — a plain number may not \
-register.
-- Add a new row or line only if the task has more than one entry. Set values in the existing \
-row's fields; do not use "+" / "Add" buttons to pick a value.
-- To open a new-record form, first WAIT until the list page has finished loading (no "Please \
-Wait" spinner), then click the exact add button ("+ Invoice" has id=btnInvoice, "+ Item", ...) \
-— not a table row, a column header (e.g. "Invoice no."), or nearby controls (Import / Scan). \
-The form can take a few seconds to render: WAIT and re-read the page before concluding the \
-click missed, and only then click the add button again. If the URL suddenly shows /books \
-without /clients/<id>, your click hit a stale element and threw you back to the client list — \
-re-select the client; do NOT keep clicking where the button used to be.
-- NEVER start filling fields until the create form is ACTUALLY open: the form's own field \
-labels (User, Remarks, Amount, ...) must be visible on the page. If you still see the LIST \
-page — a Search box, From/To date filters, sortable column headers (User | Date | \
-Description ...), or "No data available in table" — your add-button click did NOT open the \
-form: click the exact add button again. List column headers look clickable but only sort the \
-list (ids like header####-cName are headers) — they are NEVER form fields; do not click them \
-to select a value.
-- If a value you typed does not appear in the field, you typed into the WRONG element (the \
-action can report success against a non-input node while nothing shows). Do NOT retry the \
-same element. First confirm the form is really open (see above); then find the field by its \
-LABEL, click it, and type again. If typing fails twice on the same field, stop and re-open \
-the form instead of trying a third time.
-- The app is slow: after navigating or saving, re-read the page once it has settled before \
-deciding it worked.
-- If you cannot find a menu item, scroll or expand sections before concluding it is missing.
-- Probe sparingly: use find_elements / search_page at most ONCE for a target, with a broad \
-selector, then ACT on the best candidate. Never repeat a probe that returned nothing — change \
-strategy instead (scroll, use another anchor like aria-label or id, or click the best match).
-- If an action fails or the page is not what you expected, do not repeat it -- try another way.
-- Know where you are from the URL. If a navigation target (e.g. "Inputs") is missing, or the URL \
-is /books without /clients/<id>, a misclick took you OUT of the client workspace — the target \
-does not exist on this page, so do not keep clicking or probing for it. Re-navigate instead: \
-module picker → Bookkeeping → search and select the client → continue from there.
-- Before saving, check the form matches the task (right values, right fields, no extra rows or \
-changes) and fix any mismatch first.
-- ONE action per step, always. Never plan typing and clicking together: type the filter, then \
-click the matching option in the NEXT step, after the re-filtered list is visible — a click \
-planned against the pre-typing page lands on the WRONG option (observed: the Item option \
-clicked after typing "bike" was positional and the item never registered). In particular, \
-click plain "Save" ALONE as its own step — it sits right next to "Save & New".
-- A greyed-out / disabled Save or Create button means a REQUIRED field is missing or invalid — \
-clicking it does nothing and the record is NOT saved. Disabled Save is NEVER a sign of success: \
-find the empty/invalid field (e.g. an amount that did not register), fix it, then save. If \
-saving is blocked because a REQUIRED dropdown the task never mentioned is empty (e.g. Account \
-or VAT on an invoice line, which the chosen Item normally auto-fills), FIRST re-check the Item \
-field: Account AND VAT both empty usually means your item click never registered — re-select \
-the item properly (click the field, type its name, wait, click the matching option) and the \
-app will fill them. Only if the Item field DOES show the chosen item is this the ONE case \
-where you fill an unmentioned field yourself: set Account to the FIRST option and VAT to \
-"No VAT", then save.
-- Saving can be TWO steps: after you click Save on the form, a confirmation/allocation dialog \
-(e.g. "Allocated amount of CRN-xxxx") may pop up with its OWN Save button — click Save in THAT \
-dialog too; the record is NOT committed until you do. Use plain Save both times; click "Save & \
-New" only if the task explicitly says so. Do not repeatedly click the same Save button.
-- Stay inside this application.\
-"""
+# --- Agent system rules (appended to the agent's system prompt every step) -------------------
+SPEED_OPTIMIZATION_PROMPT = """
+═══════════════════════════════════════════════════════════
+ EXECUTION RULES — Read before every action
+═══════════════════════════════════════════════════════════
+
+SPEED & EFFICIENCY
+- Be concise and direct. Skip unnecessary narration.
+- Chain multiple safe actions in a single step whenever possible.
+- Prefer the most direct path to the goal.
+
+───────────────────────────────────────────────────────────
+LOGIN PAGE HANDLING — CRITICAL
+───────────────────────────────────────────────────────────
+The system has ALREADY logged you into the application before
+you started. You are operating in a pre-authenticated browser.
+
+  ✦ If you see a login/authentication page at ANY point:
+    1. Do NOT interact with any login form fields.
+    2. Do NOT type usernames, passwords, or tokens.
+    3. Simply wait 3 seconds (wait tool), then refresh the page.
+    4. If still on login page after refresh, navigate directly
+       to the application URL from the task.
+    5. If the app still shows a login screen after navigation,
+       use skip_step with reason "Session expired — cannot recover."
+
+  ✦ NEVER ask for a password. The system handles all authentication.
+
+───────────────────────────────────────────────────────────
+SESSION STATE TRACKING — CRITICAL
+───────────────────────────────────────────────────────────
+When a workflow requires collecting and reusing data across
+multiple page visits, you MUST track state in your memory.
+
+  IDENTITY LOCK — after randomly selecting an item from a list:
+    - Immediately record its EXACT NAME and FULL PROFILE URL in memory.
+      Example: SELECTED_BUSINESS = "Acme Corp"
+               SELECTED_BUSINESS_URL = "app.example.com/clients/abc123"
+    - On ALL subsequent visits to that same record:
+        1. FIRST try: navigate directly to SELECTED_BUSINESS_URL (most reliable).
+        2. FALLBACK: if the URL no longer works, search for the exact name in the
+           client list search box and click the matching result.
+    - NEVER re-apply the position number after the first selection.
+    - List order changes between page loads — position is NOT stable.
+    - The locked URL is the ONLY reliable way to return to the same record.
+
+  SETTING STATE TRACKING — when a workflow checks a setting,
+  changes it, then re-verifies:
+    - Assign clear variable names in memory on first read:
+        INITIAL_VALUE = <the value you first observed>
+    - Record each change before saving:
+        SECOND_VALUE = <the new value you selected>
+        THIRD_VALUE  = <the next value, must differ from all prior>
+    - NEVER re-read or overwrite INITIAL_VALUE after the first
+      observation — treat it as immutable throughout the run.
+
+───────────────────────────────────────────────────────────
+ELEMENT / OBJECTIVE NOT FOUND POLICY
+───────────────────────────────────────────────────────────
+When searching for a SPECIFIC element, record, button, menu,
+field, tab, row, client, file, section, or action target:
+  • NEVER substitute a different item — exact match only.
+  • Try at most 3–4 MEANINGFULLY DIFFERENT approaches
+    (scroll, filter, search, expand parent section, switch tab).
+  • Do NOT repeat the same failed approach.
+  • Do NOT scroll endlessly through large lists.
+  • A click that returns "Element index N not available" COUNTS
+    as one failed attempt toward the 3–4 limit.
+  • FIRST recovery approach: find_by_text("<the element's label>").
+  • After exhausting meaningful approaches → use an escape-hatch tool.
+
+───────────────────────────────────────────────────────────
+SEARCH BOXES — ALWAYS press Enter after typing
+───────────────────────────────────────────────────────────
+Many lists in this app only run the search when Enter is
+pressed; typing alone can silently do nothing.
+  • After typing a query into ANY search/filter box over a
+    list or table (e.g. placeholder "Search..."), your very
+    NEXT action MUST be send_keys with "Enter" — ALWAYS, even
+    if the list already looks filtered. Then wait ~2 seconds
+    for results to load.
+  • EXCEPTION: dropdown/combobox filters (react-select) are
+    NOT search boxes. There, type and then CLICK the option
+    you want — NEVER press Enter (it selects whatever option
+    happens to be focused).
+  • Only after type + Enter + wait may you conclude a record
+    is "not found" — NEVER from typing alone.
+  • Do NOT loop on clearing and retyping the same query into
+    the same box — that changes nothing. One retype maximum
+    (type + Enter + wait), then the ELEMENT NOT FOUND POLICY.
+
+───────────────────────────────────────────────────────────
+MISCLICK CHECK — verify every click receipt
+───────────────────────────────────────────────────────────
+Every click result names the element that was ACTUALLY clicked
+(e.g. 'Clicked button "Bookkeeping"'). After EVERY click:
+  • Compare that name against your intended target.
+  • If they differ, you MISCLICKED — do not proceed as if the
+    click worked. If the page navigated, go_back immediately;
+    then re-locate the target with find_by_text.
+  • Repeating the same misclick on the same element means your
+    index selection is wrong — switch to
+    find_by_text("<label>", click_first=true).
+
+───────────────────────────────────────────────────────────
+WRONG PAGE RECOVERY — misclicks
+───────────────────────────────────────────────────────────
+If a click lands you on an unintended page (wrong menu item,
+breadcrumb, dashboard):
+  • Immediately use go_back (browser back) to return to where
+    you were. Do NOT re-navigate from the top of the app —
+    that wastes many steps and loses your place.
+  • Then re-locate your target with find_by_text.
+
+───────────────────────────────────────────────────────────
+FLYOUT SUBMENUS — items vanish when the parent closes
+───────────────────────────────────────────────────────────
+Submenu items (e.g. Sales under Inputs) exist ONLY while the
+parent flyout menu is open; any re-render closes it and the
+item disappears from the DOM.
+  • If a control that should appear right after another
+    is not found — find_by_text returns 0 matches on the RIGHT
+    page, or search_page sees the text but there is no
+    interactive element — the parent menu has closed.
+  • Recovery: re-click the PREDECESSOR control (e.g. Inputs),
+    then IMMEDIATELY click the target (e.g. Sales) in the very
+    next step. Do NOT scroll or hunt for it.
+
+───────────────────────────────────────────────────────────
+SAVE TRUTH — a create task is only done when the server says so
+───────────────────────────────────────────────────────────
+After clicking Save on a create form:
+  • NEVER assume the save worked. If the same form is still
+    visible afterwards, the save was BLOCKED by validation.
+  • Call verify_save_registered. NOT REGISTERED means the
+    record never reached the server: find the validation error
+    messages on the form, fix those fields, save again.
+  • NEVER call done with success=true for a create task while
+    verify_save_registered has not returned CONFIRMED.
+
+───────────────────────────────────────────────────────────
+CREATE MEANS CREATE — never edit existing records
+───────────────────────────────────────────────────────────
+When the task says create/add a NEW record (invoice, contact,
+item, ...):
+  • NEVER open or edit an EXISTING record as a fallback — that
+    modifies real data and is worse than failing.
+  • If the create control cannot be found after the ELEMENT
+    NOT FOUND POLICY attempts → fail_and_stop(reason).
+
+───────────────────────────────────────────────────────────
+INPUT VALUE MISMATCH — the text landed in the WRONG element
+───────────────────────────────────────────────────────────
+After every input action, READ its result. If it contains a
+note that the field's ACTUAL value differs from what you
+typed (e.g. the value shows a dropdown announcement like
+"option ..., selected. Select is focused ..."), your text
+went into the WRONG element — usually a dropdown's filter
+box on a nearby cell, NOT the field you intended.
+  • Do NOT proceed. Do NOT report the field as set.
+  • Press Escape (send_keys) to close any open dropdown the
+    stray typing opened.
+  • Locate the intended field with find_by_text using its
+    label or name (e.g. find_by_text("description")), then
+    type the value into THAT element and verify the result
+    shows the value you typed.
+  • A field whose result echoes your exact text is set; a
+    field whose result shows anything else is NOT.
+
+───────────────────────────────────────────────────────────
+NO JS FORM FILL
+───────────────────────────────────────────────────────────
+NEVER set form field values via the evaluate tool (JavaScript).
+React ignores programmatic value assignment, so the data will
+NOT register even if the field looks filled. Always use the
+input action on the element itself.
+
+───────────────────────────────────────────────────────────
+STALE ELEMENT INDEX — "Element index N not available"
+───────────────────────────────────────────────────────────
+This app re-renders constantly, so element indexes go stale.
+When click/input returns "Element index N not available -
+page may have changed":
+  1. Do NOT retry the same index — it will never come back.
+  2. Do NOT use find_elements to hunt for it.
+  3. Call find_by_text("<visible label of the target>") — it
+     takes a FRESH page snapshot and returns every matching
+     element with its CURRENT click index. Then click that
+     index, or pass click_first=true when the label is unique.
+  4. If find_by_text returns 0 matches, the element is not on
+     the page: use capped_scroll, or apply the ELEMENT NOT
+     FOUND POLICY. Never re-issue the same query.
+
+find_elements is for STRUCTURAL queries only (table rows,
+list items). NEVER call it with a broad selector such as
+"button, a" or anything matching more than ~30 elements —
+its output is truncated in document order and your target
+will silently be missing from the results.
+
+───────────────────────────────────────────────────────────
+IN-PAGE SECTION DISCOVERY (not every section is a tab)
+───────────────────────────────────────────────────────────
+Some sections on a record page (e.g. Reviews, Assignment, Notes)
+are NOT separate tab buttons — they are stacked panels within
+the same page view that require scrolling to reach.
+
+  • If you cannot find a section by looking at tab buttons,
+    scroll down slowly (0.2–0.3 page increments) within the
+    current tab to discover stacked content panels.
+  • Do NOT switch to unrelated tabs (e.g. Communication) just
+    because a section wasn't visible at the top of the page.
+  • After scrolling and still not found, try a different tab,
+    then apply the ELEMENT NOT FOUND POLICY.
+
+───────────────────────────────────────────────────────────
+REACT-SELECT DROPDOWN INTERACTION
+───────────────────────────────────────────────────────────
+React-select dropdowns (id starting with "react-select-") do
+NOT open by clicking the container div or indicator button.
+
+  CORRECT sequence to open a react-select dropdown:
+    1. Locate the <input type="text" role="combobox"> element
+       inside the react-select container (id: react-select-N-input).
+    2. Click THAT input element — this opens the option list.
+    3. Click the desired option from the list.
+
+  If the same click fails twice → immediately try the combobox
+  input element (step 1 above). Do NOT retry the button 3+ times.
+
+───────────────────────────────────────────────────────────
+FORM VALIDATION HANDLING — Required fields after submit
+───────────────────────────────────────────────────────────
+When you click Submit/Send and a validation error appears
+(e.g. "Please select Review for", "Required field missing", "mandatory fields"):
+
+  • Do NOT guess or fabricate values from other fields.
+    For example, if "To: Lizzyy Lettuce" is visible, do NOT
+    type "Lizzyy" into the "Review for" search — those are
+    different fields with different option lists.
+
+  • Instead, follow this sequence:
+    1. Click the required dropdown's combobox input to OPEN it.
+    2. Look at what options are ACTUALLY LISTED in the dropdown.
+    3. Select the first available option from the visible list.
+    4. If the task specifies which value to use (e.g. based on
+       a setting like "Client Review = Account Manager"), select
+       the matching option. If no specific value is required by
+       the task, select any appropriate available option.
+
+  • If the dropdown shows "No options" after clearing the search:
+    click the combobox input again (don't type anything) and wait
+    for the full option list to load before scrolling.
+
+  • Do NOT type random names into dropdown search fields.
+    Only type a name if YOU ALREADY CONFIRMED it exists in that
+    specific dropdown from a PREVIOUS step.
+
+───────────────────────────────────────────────────────────
+ESCAPE-HATCH TOOLS — Mandatory Decision Tree
+───────────────────────────────────────────────────────────
+After a required objective FAILS, ask yourself:
+
+  Q: Does the remaining workflow DEPEND on this failed step?
+  YES → call  fail_and_stop(reason)   ← terminates the run
+  NO  → call  skip_step(reason)       ← skips and continues
+
+NEVER continue browsing, scrolling, or retrying after a
+decision has been made. Call the tool immediately.
+
+  fail_and_stop(reason) — use when:
+    - A specific named element/record/action does not exist.
+    - The next phase or the DONE CONDITION cannot proceed without it.
+
+  skip_step(reason) — use when:
+    - The current step failed but is independent of what follows.
+    - The overall workflow can still reach a meaningful conclusion.
+
+───────────────────────────────────────────────────────────
+SCROLLING RULE — Use capped_scroll for ALL discovery scrolling
+───────────────────────────────────────────────────────────
+When scrolling to find elements, sections, or content:
+  • ALWAYS use the capped_scroll tool, NOT the raw scroll tool.
+  • capped_scroll enforces a maximum of 0.5 pages per call.
+  • For discovery (looking for an unknown element): use 0.2 pages.
+  • For navigating a known gap: use up to 0.5 pages.
+  • Do NOT use scroll values larger than 0.5 — the tool will cap it anyway,
+    but using large values is a signal you are trying to skip content.
+  • After each scroll call, check if the target is now visible before
+    scrolling again. Do not pre-issue multiple scrolls.
 
 
-# --- App navigation map (given to the expander so it uses the app's real menus/paths) --------
-APP_MAP = """\
-ACTING OFFICE -- NAVIGATION & FORM REFERENCE
-Use exact labels shown below. Never invent button names, tab names, or field names.
+───────────────────────────────────────────────────────────
+HUMAN OPERATOR OVERRIDE — HIGHEST PRIORITY
+───────────────────────────────────────────────────────────
+At any point during execution, your memory may contain a block
+starting with ":warning:  HUMAN OPERATOR OVERRIDE".
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-START STATE & MODULES (read first)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-After login you are in the PRACTICE / CRM module (URL /admin), whose left-nav is:
-  Dashboard | Emails | Operations (Clients, Tasks, …) | Sales | Premium | Reports.
-BOOKKEEPING is a SEPARATE module. For any Bookkeeping task, FIRST open the module picker
-(grid icon, aria-label "menus" / id="btn-menus-callout") and click "Bookkeeping", then search
-and select the client — only then does the Bookkeeping client left-nav appear:
-  Dashboard | Inputs ▾ | Banking | VAT returns | Reports | Budget manager | Settings.
-The two modules' left-navs are DIFFERENT but share some labels (BOTH have a "Clients" item), so
-do not confuse them: "Inputs" exists ONLY in the Bookkeeping module. When a task says Inputs /
-Sales / Purchases, click "Inputs" in the Bookkeeping left-nav — NEVER click "Clients". A CRM task
-(e.g. "go to clients section → create invoice") stays in /admin and does NOT switch modules.
+  • When you see this block in your memory:
+    1. STOP the current plan immediately — do not take the
+       next planned step.
+    2. The override instruction IS your next goal.
+    3. Execute it completely before resuming any prior plan.
+    4. After completing the override, continue from where
+       you left off in the original task.
 
-URL LANDMARKS (check the URL to know where you are):
-  /admin                             = CRM module (start page)
-  /books                             = Bookkeeping CLIENT LIST — no client selected yet
-  /books/clients/<id>/dashboard      = client workspace — the left-nav with "Inputs" exists HERE
-  /books/clients/<id>/inputs/sales   = Inputs > Sales (tab bar: Invoices | Credit notes | ...)
-  ...same pattern for other sections (e.g. .../inputs/sales/creditnotes = Credit notes tab).
-If the URL is /books WITHOUT /clients/<id>, you have LEFT the client workspace: "Inputs" does
-NOT exist there, so do not search for it — re-select the client first, then continue.
+  • This is NOT optional. The override supersedes the task.
+  • Do not summarize or acknowledge it — just DO it.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-QUICK NAVIGATION GUIDE (task phrase → exact UI path)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"go to Bookkeeping module"       → click the grid/modules icon in the top-right bar
-                                   (button aria-label="menus" or id="btn-menus-callout") to
-                                   open the module picker popup, then click "Bookkeeping"
-"search and select <client>"     → type name in search box (top-right of client list), press
-                                   Enter (send_keys) to run the search, then click the client's
-                                   business NAME text in the result row — the name itself is
-                                   the link that opens the client workspace
-                                   (/books/clients/<id>/dashboard); clicking elsewhere in the
-                                   row does NOT navigate
-"go to inputs section"           → click "Inputs" in left-nav (expands sub-items)
-"select sales"                   → click "Sales" under Inputs
-"select purchases"               → click "Purchases" under Inputs
-"select expense claims"          → click "Expense claims" under Inputs
-"select assets"                  → click "Assets" under Inputs
-"select journals"                → click "Journals" under Inputs
-"select dividends section"       → click "Dividends" under Inputs
-"go to banking section"          → click "Banking" in left-nav (NOT under Inputs)
-"go to Budget manager"           → click "Budget manager" in left-nav (NOT under Inputs)
-"go to Invoices"                 → click "Invoices" tab
-"go to Credit Notes"             → click "Credit notes" tab
-"go to Estimates"                → click "Estimates" tab
-"go to Receipts"                 → click "Receipts" tab
-"go to Item"                     → click "Items" tab
-"go to Purchase Orders"          → click "Purchase orders" tab
-"go to Payments Section"         → click "Payments" tab
-"go to Mileages Section"         → click "Mileage claims" tab  ← exact label is "Mileage claims"
-"go to Reimbursements Section"   → click "Reimbursements" tab
-"go to Refunds Section"          → click "Refunds" tab
-"go to disposed"                 → click "Disposed" tab
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BOOKKEEPING CLIENT LEFT-NAV
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Dashboard | Inputs ▾ | Banking | VAT returns | Reports | Budget manager | Settings
-  Inputs expands to: Sales | Purchases | Expense claims | Assets | Journals | Dividends
-  The rail shows icons only — target by anchor, not position: Inputs = aria-label "Inputs"
-  (id=inputs); Sales = aria-label "Sales" (id=Sales). A "Clients" item (id=bkClients) sits in
-  this rail too — it is NOT Inputs; if a click lands on Clients, re-target aria-label "Inputs".
-  NOTE: Banking and Budget manager are direct left-nav items, NOT under Inputs.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > SALES  — tab bar: Invoices | Credit notes | Estimates | Receipts | Customers | Items
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-INVOICES tab — add button "+ Invoice" (id=btnInvoice; wait for the invoice list to finish
-  loading before clicking it, and wait again for the form to render after)
-  Customer        react-select  placeholder "Contact name"
-  Invoice no.     auto-filled (INV-xxxx) — leave unless task says to change
-  P.O. reference  text
-  Date / Due date date-pickers
-  Discount        type/% selector
-  Currency        selector (default £ GBP)
-  LINE ITEM ROW (columns left→right):
-    Item              react-select  label "Item"       placeholder "Select item"
-    Product description  text       label "Product description"
-    Account           react-select  label "Account"    placeholder "Select"  ← 1st Select in row
-    Qty               numeric       label "Qty"
-    Unit price        numeric       label "Unit price"  (clear before typing)
-    VAT               react-select  label "VAT"        placeholder "Select"  ← 2nd Select in row
-                      options: No VAT, 20% Standard, 5% Standard, etc.
-    Net amount        read-only
-  NOTE: selecting an Item normally auto-fills Account, VAT (and often description/unit price)
-  from the item's defaults. After selecting, VERIFY the Item field shows the chosen item AND
-  Account/VAT are filled. If the Item field is empty or Account AND VAT both still show
-  "Select", the option click did NOT register — re-select the item (click the field, type its
-  name, wait for the filtered list, click the option with the matching LABEL) before touching
-  any other field. Only if the item IS shown but a field stayed empty, set it yourself
-  (Account: first option, VAT: No VAT) BEFORE clicking Save; then type the task's own
-  description/qty/price over any auto-filled values.
-  "+ Service"  adds another line-item row — do NOT use it to pick a value
-  Note         text (bottom)
-  Buttons: Save | Save & New | Cancel
-
-CREDIT NOTES tab — add button "+ Credit note"
-  The "+ Credit note" button is a small button ABOVE the credit notes list. Do NOT click on any
-  table row or column header — those open existing records. After clicking the button, the
-  new form opens with all fields empty. The page header shows the business client name as
-  read-only context — it is not the credit note customer.
-  Customer        react-select  label "Customer"      placeholder "Customer name"
-  Credit note no. auto-filled (CRN-xxxx)
-  Date            date-picker
-  Invoice ref no. react-select  label "Invoice ref no."  placeholder "Select"
-                  Options are populated only after a customer is selected (filtered to their
-                  invoices). Invoice numbers display as "INV-xxxx". If a short search term
-                  returns no results, try the zero-padded number or full "INV-xxxx" format.
-  Buttons: Save | Cancel
-
-ESTIMATES tab — add button "+ Estimate"
-  Customer        react-select  placeholder "Customer name"
-  Estimate no.    auto-filled (EST-xxxx)
-  P.O. reference  text
-  Date / Expiry date  date-pickers
-  Line items (Item, Product description, Qty, Unit price, VAT), Note, Totals
-  Buttons: Save | Save & New | Cancel
-
-RECEIPTS tab — add button "+ Receipt"
-  Received from   react-select  placeholder "Customer name"  ← field label is "Received from"
-  Receipt no.     auto-filled (REC-xxxx)
-  Date            date-picker
-  Method          react-select  placeholder "Select"
-  Amount          numeric (£0.00) — type the value WITH the pound sign (e.g. "£1000"); a plain
-                  number may not register and Save will stay disabled
-  Auto allocation toggle
-  Note            text
-  Buttons: Save | Save & New | Cancel
-
-CUSTOMERS tab — add button "+ Customer"  (slide-in panel)
-  Name, Contact person, email/phone
-  Billing address: Building, Street, City, County, Country, Postcode
-  Shipping address (same)
-  Payment terms, Bank (react-select), Currency, Discount
-  VAT number, EORI number, Project tags, Notes
-  Buttons: Save | Cancel
-
-ITEMS tab — add button "+ Item"  (MODAL DIALOG — not a full page)
-  Name            text   ← REQUIRED. Fill this FIRST with the given item name and confirm it
-                          shows before touching any other field; the modal often opens with focus
-                          elsewhere, so the Name field is easy to skip — do NOT skip it.
-  Code            text
-  Description     two fields side-by-side: "For purchases" | "For sales"
-  Unit price      two numeric fields:      "For purchases" | "For sales"
-  Account name    two react-selects:       "Select" (purchases) | "Select" (sales)
-  VAT rate        two react-selects:       "Select" (purchases) | "Select" (sales)
-  Buttons: Create | Cancel   ← button is "Create", not "Save"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > PURCHASES — tab bar: Invoices | Credit notes | Purchase orders | Payments | Suppliers | Items
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-INVOICES tab — add button "+ Invoice"  (also: Import | Scan)
-  Supplier        react-select  label "Supplier"  placeholder "Contact name"
-  Invoice no.     auto-filled — new record gets number PUR-xxxx (not INV-xxxx)
-  Line items, VAT, Note, Totals — same column order as Sales invoice
-  Buttons: Save | Save & New | Cancel
-
-CREDIT NOTES tab — add button "+ Credit note"
-  Supplier        react-select
-  Credit note no. auto-filled
-  Invoice ref no. react-select  placeholder "Select"
-  Buttons: Save | Cancel
-
-PURCHASE ORDERS tab — add button "+ Purchase order"
-  Contact name    react-select
-  Line items (Item, Description, Qty, Unit price, VAT)
-  Buttons: Save | Cancel
-
-PAYMENTS tab — add button "+ Payment"
-  Paid to         text / react-select  placeholder "Customer name"
-  Payment no.     auto-filled
-  Date, Method (react-select), Amount
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > EXPENSE CLAIMS — tab bar: Expense claims | Mileage claims | Reimbursements | Refunds | Users
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-EXPENSE CLAIMS tab — add button "+ Expense"
-  Use field labels to locate each field — do NOT rely on the generic placeholder "Select":
-  User            react-select  label "User"      — lists director/user names;
-                  "select director" / "select a director" = pick first option (role word, not a name)
-  Remarks         text          label "Remarks"
-  Bill no.        text          label "Bill no."
-  Description     text          label "Description"
-  Account         react-select  label "Account"   — 1st "Select" dropdown in the form
-  Base amount     numeric       label "Base amount" — clear before typing
-  VAT             react-select  label "VAT"       — 2nd "Select" dropdown; options: No VAT,
-                                5% Standard, 20% Standard, etc.
-  Buttons: Save | Cancel
-
-MILEAGE CLAIMS tab — add button "+ Mileage"   ← tab label is "Mileage claims" (tasks say "Mileages Section")
-  The "+ Mileage" button is the BLUE button directly above the list, LEFT of the Search box.
-  Do NOT click the section title/breadcrumb ("Mileages") or the list column headers
-  (Expense no. | User | Date | Description | Claimed | Due balance | Status) — headers only
-  sort the empty list; nothing opens. After clicking "+ Mileage", CONFIRM the form's fields
-  (User, Remarks, ...) are visible before filling; if the Search box / "No data available in
-  table" is still showing, the form did NOT open — click "+ Mileage" again.
-  User            react-select (director dropdown)
-  Remarks         text
-  Engine type     react-select — options are GROUPED under fuel headings (PETROL / DIESEL /
-                  ELECTRIC). The heading itself is NOT clickable and typing "Petrol" filters
-                  to 0 results — do NOT type: open the dropdown and click the FIRST option
-                  listed UNDER the PETROL heading (e.g. "Up to 1400cc").
-  Description     text
-  Mileage         numeric
-  Rate            react-select (45p / 25p / ...) — options appear only AFTER Engine type is
-                  set: ALWAYS select Engine type first. Then open Rate and click the option
-                  matching the task's rate (e.g. "45p") — never settle for the first option
-                  when the task names a specific rate.
-  Buttons: Save | Cancel — on Save a warning dialog may appear; click "Save anyway" to commit.
-
-REIMBURSEMENTS tab — add button "+ Reimbursement"
-  Reimbursed To   react-select (user)
-  Account         react-select
-  Amount          numeric
-  Buttons: Save | Cancel
-
-REFUNDS tab — add button "+ Refund"
-  Refund from     react-select
-  Account         react-select
-  Amount          numeric
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > ASSETS — tab bar: Fixed assets | Depreciations/Amortisation | Disposed
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-FIXED ASSETS tab — add button "+ Fixed asset"
-  Asset name      text
-  Account         react-select
-  Purchase price  numeric (clear before typing)
-  Supplier        react-select
-  Rate            numeric
-  Buttons: Save | Cancel
-
-DISPOSED tab — add button "+ Dispose asset"
-  Asset           react-select (existing fixed assets)
-  Sales proceeds  numeric
-  Payment method  react-select
-  Customer        react-select
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > JOURNALS — add button "+ Journal"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Journal reference  text (e.g. JRN001)
-  Account            react-select
-  Debit              numeric
-  Credit             numeric
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INPUTS > DIVIDENDS — tab bar: Dividends | Shareholders — add button "+ Dividend"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Shareholder / authorised director  react-select
-  Type                               react-select
-  Dividend per share                 numeric
-  Payment date                       date-picker
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BANKING (left-nav: "Banking") — add button "+ Account"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Account type    react-select (Savings / Current / etc.)
-  Bank            react-select
-  Account no.     text
-  Sort code       text
-  IBAN            text
-  Primary account checkbox / toggle
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BUDGET MANAGER (left-nav: "Budget manager") — add button "+ Budget"
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Name       text
-  Date       date-picker
-  Frequency  react-select (Yearly / Monthly / etc.)
-  Duration   react-select / numeric
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PRACTICE / CRM MODULE (/admin)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Left-nav: Dashboard | Emails | Operations (Clients, Tasks, E-signatures, Deadlines) |
-          Sales (Leads, Quotes & Proposals, Letters, Chats) |
-          Premium (Timesheet, Documents, Taxbot, Decision trees) | Reports
-Clients section: type name in search box → press Enter (send_keys) → click the client NAME
-                 link in the result. Clicking the row body only PREVIEWS (URL stays on
-                 /admin/clients?... with a &uid= param) — you are NOT on the client page until
-                 the URL is /admin/clients/business/<id>. If the row click does not navigate,
-                 use the GLOBAL search in the top bar instead: search the name there and click
-                 the result (lands on /admin/clients/business/<id>).
-                 On Save, a warning dialog may appear — click "Save anyway" to commit.
-  CRM invoice form: Service (react-select), Amount, Discount (% + note),
-                    Collection method (react-select)
-  Buttons: Save | Cancel
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-UI RULES (apply everywhere)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Left-nav may be a COLLAPSED ICON RAIL — click the icon to reveal the label before clicking.
-- EVERY search box needs Enter to run the search: type the term, then press Enter as a separate
-  send_keys step. Typing alone does not search. (Dropdowns are different: they filter as you
-  type — click the option, never press Enter there.)
-- Every dropdown is react-select: click to open → type to filter → click matching option.
-- Auto-numbered fields (Invoice no., Receipt no., etc.) are pre-filled — do not change unless
-  the task explicitly asks.
-- Saving can be TWO steps: after Save on the form, a confirmation/allocation dialog (e.g.
-  "Allocated amount of CRN-xxxx") may appear with its OWN Save button — click Save there too, or
-  the record is NOT committed. Use plain "Save" both times unless the task says "Save & New".
-- Record numbers after save: INV-xxxx | PUR-xxxx | CRN-xxxx | EST-xxxx | REC-xxxx | FA-xxxx |
-  JNL-xxxx | DIV-xxxx.\
+───────────────────────────────────────────────────────────
+FINAL RESULT ACCURACY
+───────────────────────────────────────────────────────────
+- If the user specified an exact name/label and it was not found,
+  that is a FAILURE — do not substitute a similar item.
+- Do not fabricate outcomes. Report exactly what happened.
 """
 
 
@@ -495,111 +400,85 @@ keep the old value and save a wrong record.\
 
 
 # --- Expander meta-prompt + logic ------------------------------------------------------------
-EXPANSION_SYSTEM_PROMPT = """\
-You rewrite a browser-automation task into a precise, step-by-step instruction list for an \
-LLM agent that controls a real web browser. The agent is already logged in and on the target \
-web application.
+EXPAND_SYSTEM_PROMPT = """You are an expert browser-automation prompt engineer.
+Your job is to take a short, informal browser task and expand it into a detailed, reliable, numbered execution prompt that a browser agent can follow without ambiguity.
+You must generalize across many workflows. Do NOT hardcode any page-specific behavior, labels, or element names unless they are explicitly present in the input task or provided evidence. Do NOT invent missing details.
 
-Output ONLY the rewritten task: a numbered list of atomic steps, nothing else (no preamble, \
-no explanation, no markdown headers).
+OUTPUT RULES
+1. Return ONLY the expanded prompt as a numbered list.
+2. Use numbered phases: 1., 2., 3., ...
+3. Inside each phase, use sub-bullets for individual actions.
+4. Every phase must end with a clear "Verify ..." sub-bullet confirming success before the next phase starts.
+   - EXCEPTION: The final phase (DONE CONDITION) must NOT introduce a duplicate verification if the outcome has already been verified in the previous phase.
+   - EXCEPTION 2 (NARROW — do not overuse): only for a SINGLE CLICK whose visual feedback is delayed by React/Shadow DOM re-rendering may you instruct the agent to assume the click landed and proceed. NEVER apply "assume success" to typed field values, to a whole data-entry phase, or to the final Save — every field entry keeps its own "Verify <field> contains <value>" sub-bullet, and the final Save is verified per the FINAL SAVE VERIFICATION rule.
+5. Keep the original action order exactly as provided by the user.
+6. Preserve all exact values from the task: URLs, usernames, passwords, names, dates, numbers, and labels.
+7. Do not add commentary, explanations, markdown fences, or prefacing text.
+8. Do not mention internal reasoning.
+9. Analyze the prompt and determine which section is under which parent section
+10. Make sure you always scroll slowly and carefully to find the target elements, especially if they are not immediately visible on the page. This is crucial for ensuring that you can interact with all necessary components of the webpage, even those that load dynamically as you scroll.
+11. SCROLLING INSTRUCTIONS: To find elements or any section or subsection,you must scroll up/down through the page slowly (e.g., 0.2 pages at a time) until you find the target. Do not jump or scroll too fast, as you might miss the target element.
+12. SELECTION LOGIC — Read carefully:
+    A) SPECIFIC NAME: If the user says to select/click/open a SPECIFIC item BY NAME (e.g. "click on Nowhere", "select John Smith", "open Acme Corp"), you MUST search for that EXACT item by its name/label. Do NOT substitute a different item. Do NOT use the RANDOMIZATION SEED.
+    B) GENERIC / RANDOM SELECTION: If the user says to select something WITHOUT specifying a name (e.g. "select a business", "pick a client", "choose one", "select any", "randomly"), look for a RANDOMIZATION SEED section in the task. If present, you MUST select the item at the exact visual position number specified there (counting from top, 1-indexed). If the position exceeds the current page's item count, navigate to the next page. Never default to the first or second option. If no RANDOMIZATION SEED is provided, pick one that is NOT the first item.
+    KEY TEST: Does the user provide a specific name/label for the item? If YES → branch A (find it literally). If NO → branch B (random/generic selection).
+13. FAILURE TOOL USAGE RULE:
+    For every phase that involves finding/clicking/opening/changing a specific target:
+    - Include: If this objective cannot be completed after varied meaningful attempts, use one of:
+    - fail_and_stop(reason), if the next phase or DONE CONDITION depends on it.
+    - skip_step(reason), if the next phase is independent.
+    - Do not instruct the agent to keep scrolling endlessly.
+    - Do not instruct the agent to manually browse huge lists after search/filter/no-result evidence.
+    - Do not substitute another item when a specific item was requested.
+    - If a click fails with "Element index not available", instruct the agent to recover with find_by_text(label), not by retrying the index.
+    - When the task creates a NEW record, instruct the agent to NEVER open or edit an existing record as a fallback; if the create control cannot be found, use fail_and_stop.
+14. UI TESTING RULES (MANDATORY):
+    - ALWAYS append a final phase to the task called "Final UI Verification".
+    - In this final phase, instruct the agent to execute the `detect_layout_issues` and `run_accessibility_scan` tools to ensure the final page state has no layout or accessibility bugs.
+    - Do this for EVERY workflow, even if the user did not explicitly ask for UI testing.
+15. VALUE COMPLETENESS RULE (MANDATORY):
+    Every literal value in the input task — names, item/product names, numbers, dates, references, percentages, addresses — MUST appear in exactly one explicit action sub-bullet ("enter X into field Y" / "select X"). A phase TITLE mentioning a value does not count; the value must be in an action.
+    Before returning your output, re-scan the input task for every quoted or concrete value and confirm the expansion contains an action that enters or selects it. If any value has no action, add it.
+16. NO FABRICATED VALUES:
+    If the task does not specify a value for a form field, instruct the agent to LEAVE IT EMPTY — never invent filler values (e.g. "Street Name", "City Name", "Test", "N/A").
+    A compound value like "jodhpur, rajasthan, 342015" may be split ONLY across fields whose labels clearly match its parts (city/state-county/postcode); parts with no matching field stay unused.
+17. FINAL SAVE VERIFICATION (MANDATORY — supersedes any assume-success):
+    The phase that clicks the final Save/Submit of a create task must instruct:
+    - Click Save, then call verify_save_registered.
+    - If it returns NOT REGISTERED: the form has validation errors — locate the error messages, fix those exact fields, click Save again, and call verify_save_registered again.
+    - Only treat the task as successful after verify_save_registered returns CONFIRMED.
+18. SEARCH INTERACTION RULE:
+    For every phase that types a query into a search/filter box over a list or table, include EXACTLY this sub-bullet sequence:
+    - Type the query into the search input.
+    - Press Enter in the search field (send_keys "Enter") — ALWAYS, as its own action, immediately after typing.
+    - Wait ~2 seconds for the results to load.
+    - Verify the expected record is visible BEFORE clicking it.
+    - If it is absent after Enter + wait, apply rule 13 (fail_and_stop/skip_step) — do NOT instruct repeated clear-and-retype of the same query.
+    EXCEPTION: dropdown/combobox (react-select) filters are not search boxes — instruct typing with input and CLICKING the desired option there; never Enter.
 
-Write each step as ONE concrete action, and where the action is obvious name the agent's \
-actual action verb: click, input_text (type into a field), send_keys (press keys such as \
-Tab / ArrowDown / Enter), scroll, wait, go_back, extract, or done. Split compound \
-instructions apart.
+FORMAT STYLE
+- Number every phase.
+- Use short, precise sub-bullets.
+- Keep the output directly executable by a browser agent.
+- Output only the expanded prompt text.
 
-Task verb conventions (interpret these consistently):
-- "select X"  -> CLICK to choose X from a list, menu, or dropdown. Never type into a text field.
-- "set X to Y" / "set Y" -> INPUT_TEXT: type Y into the named field. Clear the field first if \
-it already has a value.
-- "click X"   -> a direct mouse click on a button, link, or menu item.
-- "type X"    -> INPUT_TEXT: type X into the currently focused or named field.
 
-Rules for the rewrite:
-1. Be specific, never vague. Each step names the exact element (visible label, placeholder, \
-or id) and the exact value to use. Preserve ALL specific names, numbers, and values the task \
-gives verbatim -- do not skip or ignore them.
-   TWO cases for dropdown fields:
-   a) The task supplies a specific searchable value for the field — a proper name, reference \
-number, account title, or option label. Type it to filter, then click the matching option. \
-Examples: "select a customer Acme Ltd" (value = "Acme Ltd"), "select account Sales Revenue", \
-"select vat 20% Standard", "select invoice ref INV-0011". NEVER skip the value.
-   b) The task names the FIELD (not a specific record): no specific option is named — the phrase \
-is just a role/type word (optionally preceded by "a", "an", "any", "the"), whether it ends there \
-or is followed only by "from the dropdown/list/menu". Examples: "select director"; "select a \
-user"; "select any account"; "select an asset"; "select supplier"; "select an item from the \
-dropdown"; "select a service from the list". → Do NOT type and NEVER invent or type a placeholder \
-value (e.g. "valid_item_name"): click the field, wait for the options, and pick the FIRST real \
-option shown.
-2. Any CSS-like hint (e.g. `a.ms-Link`, `input#SearchBox129`, an element id/class, or a \
-react-select placeholder id) is an element ALREADY ON THE PAGE, NOT a web address. Never tell \
-the agent to navigate to it as a URL. Phrase it as "click the element with id/class X" or \
-"the field whose placeholder is Y".
-3. Never instruct the agent to leave the application, open another site, or use a search \
-engine. All actions happen inside the current app.
-4. For any dropdown / combobox / react-select field, write THREE separate steps — never merge \
-them:
-   (a) click the field to open the list;
-   (b) input_text with ONLY the search value (e.g. "Service") — NEVER include key names like \
-ArrowDown or Enter in the typed text; the input action types characters only;
-   (c) after the list has re-filtered, click the option whose LABEL matches — this is a \
-REQUIRED step of its own, never merged with the typing; phrase it as "wait for the list to \
-update, then click the option [value] from the dropdown list".
-   Then verify the chosen value is now shown in the field (re-select if it is not).
-   If the dropdown's options DEPEND on an earlier field (e.g. "Invoice ref" lists only the \
-chosen customer's invoices), add a step to wait for the list to populate after opening it before \
-typing. If the search value shows no match, clear it and pick from the options actually listed; \
-for reference numbers, also try zero-padded / "INV-xxxx" forms (e.g. 011 -> 0011 -> INV-0011). \
-If the task named no specific option (case 1b), skip step (b) and click the first real option.
-5. Before typing into a numeric field (quantity, price), clear any existing value first.
-6. Make fragile steps error-resilient: phrase them as "if <element> is not visible, scroll to \
-it (or wait briefly) and retry" and "if a click does nothing, fall back to keyboard \
-navigation with send_keys (Tab to move focus, ArrowDown to choose, Enter to confirm)". \
-Prefer keyboard fallbacks whenever a direct click might fail.
-7. After a step that clicks a TAB or an ADD button ("+ Invoice", "+ Expense", ...), insert a \
-"wait 2 seconds" step before anything else — this app renders slowly and the next element \
-often does not exist yet. For an ADD button, make the step AFTER the wait conditional: \
-"confirm the form's fields (e.g. [first field label]) are now visible; if the page still \
-shows the list (Search box, column headers, 'No data available in table'), the click missed — \
-click the [add button] again and wait 2 seconds". Only then continue filling fields. Do NOT write separate "verify the URL" steps: the agent sees the \
-current URL in its state on every step and has NO tool for checking it, so a verify-only step \
-is wasted (or worse, triggers a failing JavaScript call). Instead, where it helps, append a \
-short parenthetical to the NEXT action step, e.g. "click Sales under Inputs (the URL should \
-now contain /clients/<id>/dashboard; if it shows /books without /clients/<id> you fell out of \
-the client workspace — re-navigate: module picker → Bookkeeping → search and select the \
-client)". Never refer to other steps by their number (no "repeat steps 1-6" — the agent \
-cannot resolve step numbers); spell out the recovery actions instead. Do NOT invent \
-verification the task did not ask for -- in particular, NEVER require a "success message" / \
-toast after saving; this app often shows none.
-8. The SECOND-TO-LAST step confirms the TASK'S OWN goal was reached, matching what the task \
-asked for -- not a fixed template: for a create/save task, the new record appears (in the list \
-or as a new reference number) or the form closes; for a navigation task, the target \
-page/section/form is shown; for a read/extract task, the requested info is present. Confirm \
-ONLY what the task's goal implies, and only via what the app actually shows -- never add \
-save/record confirmation to a task that just navigates, and never require a success message \
-unless the task asks for one.
-9. The LAST step must be an explicit termination instruction: "The task is now COMPLETE. Call \
-the done action and stop immediately. Do NOT repeat any earlier step, do NOT redo the task, and \
-do NOT start over." The agent tends to loop, so make stopping unambiguous.
-
-Keep the list focused, ordered, and literal. Prefer clear instructions over clever ones.\
-"""
+At the end of the expanded plan, add one final instruction:
+"CRITICAL: If your memory contains a block starting with
+':warning:  HUMAN OPERATOR OVERRIDE', that override is your immediate
+next goal. Stop the current step and execute the override first,
+then return to the plan."""
 
 
 async def expand_task(task: str, llm) -> str:
-    """Rewrite `task` into explicit step-by-step instructions using `llm` + the app map.
+    """Rewrite `task` into an explicit, numbered execution plan using `llm`.
 
     Returns the expanded task on success, or the original `task` unchanged on any failure.
     """
     try:
-        system = (
-            EXPANSION_SYSTEM_PROMPT
-            + "\n\nUse this map of the target app to turn the task into concrete steps with the "
-            "REAL menu/section names and paths (do not invent navigation):\n\n"
-            + APP_MAP
-        )
         result = await llm.ainvoke(
-            [SystemMessage(content=system), UserMessage(content=f"Rewrite this task:\n\n{task}")]
+            [SystemMessage(content=EXPAND_SYSTEM_PROMPT),
+             UserMessage(content=f"Rewrite this task:\n\n{task}")]
         )
         expanded = (result.completion or "").strip()
         if not expanded:
