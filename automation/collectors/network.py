@@ -22,6 +22,18 @@ logger = logging.getLogger("framework.collector.network")
 # Requests slower than this (ms) are flagged as "slow" in the summary.
 _SLOW_MS = 1000.0
 
+# Credential-bearing headers are never persisted: network.json and report.html are meant to
+# be shared, and a raw Authorization header is a live session token.
+_SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie",
+                      "x-api-key", "api-key", "x-auth-token"}
+_REDACTED = "«redacted»"
+
+
+def _redact(headers: dict[str, Any]) -> dict[str, Any]:
+    """Copy `headers` with credential values replaced (case-insensitive key match)."""
+    return {k: (_REDACTED if k.lower() in _SENSITIVE_HEADERS else v)
+            for k, v in headers.items()}
+
 
 def _status_class(status: int | None, failed: bool) -> str:
     if failed:
@@ -82,7 +94,7 @@ class NetworkCollector(Collector):
         record = self._record_for(request)
         self._started_at.setdefault(request, time.monotonic())
         try:
-            record["request_headers"] = dict(request.headers)
+            record["request_headers"] = _redact(dict(request.headers))
         except Exception as exc:  # noqa: BLE001
             logger.exception("request headers error: %s", exc)
 
@@ -102,7 +114,7 @@ class NetworkCollector(Collector):
                 }
             )
             try:
-                record["response_headers"] = dict(response.headers)
+                record["response_headers"] = _redact(dict(response.headers))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("response headers error: %s", exc)
             self._finish(request, record)
