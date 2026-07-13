@@ -11,6 +11,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -213,6 +214,9 @@ def _render_html(result: "RunResult") -> str:
     # ---- Judge verdict (browser-use's built-in judge) ----
     p.append(_render_judgement(result.judgement, result.is_successful))
 
+    # ---- UI & Accessibility scans (detect_layout_issues / run_accessibility_scan) ----
+    p.append(_render_ui_scans(result.extracted_content))
+
     # ---- Agent steps (per-step progress timeline) ----
     p.append(_render_steps(result.steps, result.model_actions, result.n_steps))
 
@@ -324,6 +328,106 @@ def _render_judgement(judgement: dict[str, Any] | None, agent_success: Any) -> s
     if judgement.get("reached_captcha"):
         p.append("<div class='obs-reason'><em>⚠️ Captcha encountered during the run.</em></div>")
     p.append("</div></div></div>")
+    return "".join(p)
+
+
+# The UI-scan tools (automation/pipeline/agent_tools.py) write their results into the agent's
+# extracted_content as text with these stable prefixes and line formats. We parse the LAST
+# occurrence of each (the final page state) back into a table for the report.
+_A11Y_PREFIX = "Accessibility scan (axe-core)"
+_LAYOUT_PREFIX = "Layout scan"
+# "- button-name (critical): 40 node(s) — Buttons must have discernible text"
+_A11Y_LINE = re.compile(
+    r"^-\s*(?P<id>\S+)\s*\((?P<impact>[^)]*)\):\s*(?P<nodes>\d+)\s*node\(s\)\s*[—-]\s*(?P<help>.*)$"
+)
+# "- zero-size-control: 1+ clickable element(s) rendered at ~0 size"
+_LAYOUT_LINE = re.compile(r"^-\s*(?P<type>[\w-]+):\s*(?P<detail>.*)$")
+_A11Y_BADGE = {"critical": "b-error", "serious": "b-error", "moderate": "b-warn", "minor": "b-info"}
+
+
+def _last_startswith(entries: list[str] | None, prefix: str) -> str | None:
+    return next(
+        (e for e in reversed(entries or []) if isinstance(e, str) and e.startswith(prefix)),
+        None,
+    )
+
+
+def _render_ui_scans(extracted_content: list[str] | None) -> str:
+    """Render the layout + accessibility scan results (skipped entirely on script replays,
+    which have no agent and therefore no scan output)."""
+    layout = _last_startswith(extracted_content, _LAYOUT_PREFIX)
+    a11y = _last_startswith(extracted_content, _A11Y_PREFIX)
+    if not layout and not a11y:
+        return ""
+
+    p: list[str] = []
+    p.append("<div class='section'><div class='section-title'>"
+             "<span class='material-icons' style='color:var(--primary)'>accessibility_new</span>"
+             " UI &amp; Accessibility</div>")
+    if layout:
+        p.append(_render_layout_block(layout))
+    if a11y:
+        p.append(_render_a11y_block(a11y))
+    p.append("</div>")
+    return "".join(p)
+
+
+def _render_layout_block(text: str) -> str:
+    lines = text.splitlines()
+    issues = [m.groupdict() for m in map(_LAYOUT_LINE.match, lines[1:]) if m]
+    p: list[str] = []
+    p.append("<div class='obs-list' style='margin-bottom:14px;'>")
+    p.append("<div class='obs-row'><div class='obs-head'>"
+             "<span class='material-icons' style='color:%s'>%s</span>"
+             "<span class='obs-title'>Layout scan</span>"
+             "<span class='badge' style='background:%s;color:#fff'>%s</span></div>" % (
+                 ("var(--success)", "check", "var(--success)", "CLEAN") if not issues
+                 else ("var(--warning)", "warning", "var(--warning)", f"{len(issues)} ISSUE"
+                       + ("S" if len(issues) != 1 else ""))))
+    for it in issues:
+        p.append(f"<div class='obs-reason'><code>{_esc(it['type'])}</code> — {_esc(it['detail'])}</div>")
+    p.append("</div></div>")
+    return "".join(p)
+
+
+def _render_a11y_block(text: str) -> str:
+    lines = text.splitlines()
+    rows = [m.groupdict() for m in map(_A11Y_LINE.match, lines[1:]) if m]
+    # A non-matching tail line like "  ...and N more rule(s)" is surfaced as a note.
+    notes = [ln.strip() for ln in lines[1:]
+             if ln.strip() and not _A11Y_LINE.match(ln) and ln.strip().startswith("...")]
+    clean = not rows and "no violations" in lines[0].lower()
+
+    p: list[str] = []
+    p.append("<div class='obs-list'>")
+    p.append("<div class='obs-row'><div class='obs-head'>"
+             "<span class='material-icons' style='color:%s'>%s</span>"
+             "<span class='obs-title'>Accessibility scan (axe-core)</span>"
+             "<span class='badge' style='background:%s;color:#fff'>%s</span></div></div>" % (
+                 ("var(--success)", "check", "var(--success)", "CLEAN") if clean
+                 else ("var(--error)", "close", "var(--error)",
+                       f"{len(rows)} RULE" + ("S" if len(rows) != 1 else ""))))
+    if rows:
+        p.append("<div class='log-scroll'><table class='log'><thead><tr>"
+                 "<th style='width:220px'>Rule</th><th style='width:110px'>Severity</th>"
+                 "<th style='width:80px'>Nodes</th><th>Description</th></tr></thead><tbody>")
+        for r in rows:
+            impact = (r.get("impact") or "").lower()
+            badge = _A11Y_BADGE.get(impact, "b-muted")
+            p.append(
+                f"<tr><td class='mono nowrap' style='color:var(--text-main)'>{_esc(r['id'])}</td>"
+                f"<td class='nowrap'><span class='badge {badge}'>{_esc(impact.upper() or 'N/A')}</span></td>"
+                f"<td class='mono nowrap'>{_esc(r['nodes'])}</td>"
+                f"<td style='color:#cbd5e1'>{_esc(r['help'])}</td></tr>"
+            )
+        p.append("</tbody></table></div>")
+    elif not clean:
+        # Parsing failed (format drift) — show the raw text rather than dropping the data.
+        p.append(f"<div class='result-box muted'><pre style='white-space:pre-wrap;margin:0'>"
+                 f"{_esc(text)}</pre></div>")
+    for note in notes:
+        p.append(f"<div class='obs-reason muted'>{_esc(note)}</div>")
+    p.append("</div>")
     return "".join(p)
 
 

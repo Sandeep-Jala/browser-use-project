@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 
 import psutil
@@ -29,7 +30,8 @@ from automation.collectors.network import NetworkCollector
 from automation.config import Config
 from automation.llm import build_expander_llm
 from automation.pipeline import task_store as ts
-from automation.pipeline.prompts import APP_SYSTEM_RULES
+from automation.pipeline.agent_tools import build_tools
+from automation.pipeline.prompts import SPEED_OPTIMIZATION_PROMPT
 from automation.pipeline.report import build_report
 from automation.pipeline.runner import Runner
 from automation.pipeline.script_compile import save_steps
@@ -38,24 +40,24 @@ log = logging.getLogger("framework.main")
 
 # Terse, high-level task prompts (the app-aware expander turns these into concrete steps).
 INVOICE_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select sales, go to Invoices, add invoice, select a customer Suresh Gopi, select an item bike, set product description 'buying a new cycle', set Qty 3, Unit price 500 and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section,select sales,go to Invoices,add invoice,select a customer Suresh Gopi,select an item bike, set product description 'buying a new bike', set Qty 5, Unit price 500 and click on save"""
 )
  
 CREDIT_NOTES_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select sales, go to Credit Notes, add credit note, select a customer Suresh Gopi, select a invoice ref 011, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to inputs section,select sales,go to Credit Notes,add credit note,select a customer Metthew,select a invoice ref 011, and click on save."""
 )
  
 ESTIMATES_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select sales, go to Estimates, add estimate, select customer Mr Jones, select an item from the dropdown and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Estimates,add estimate,select customer Mr Jones, select an item from the dropdown and click on save."""
 )
  
 # UI issue while saving
 RECEIPT_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select sales, go to Receipts, add receipt, enter Suresh Gopi in receipts from field, enter amount 1000, save receipt"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Receipts,add receipt,enter Suresh Gopi in receipts from filed,enter amount 1000,save receipt."""
 )
  
 ITEM_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select sales, go to Item, add item, enter name Office Expences, set purchases description to 'buying a new item', set sales description to 'selling a new item', enter unit price purchase 100, enter unit price sell 150, create item"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Item,add item,enter name Office Expences, set purchases description to 'buying a new item', set sales description to 'selling a new item',enter unit price purchase 100,enter unit price sell 150,create item."""
 )
  
 # ---------------------------------------------------------------------------
@@ -63,20 +65,20 @@ ITEM_TASK = (
 # ---------------------------------------------------------------------------
  
 PURCHASE_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select purchases, add invoice, select customer Le Marche, select an item car from dropdown, set Qty 5, Unit price 500, set vat to No VAT and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,add invoice,select customer Le Marche,select an item car from dropdown, set Qty 5, Unit price 500,set vat to No VAT and click on save."""
 )
  
 PURCHASE_CREDIT_NOTES_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select purchases, go to Credit Notes, add credit note, select a supplier Lina, set invoice ref PUR-0071 and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Credit Notes,add credit note,select a supplier Lina,set invoice ref PUR-0071 and click on save."""
 )
  
 PURCHASE_PO_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select purchases, go to Purchase Orders, add purchase order, select contact name John, select an item furniture and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Purchase Orders,add purchase order,select contact name John,select an item furniture and click on save."""
 )
  
 # UI issue while saving
 PURCHASE_PAYMENT_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select purchases, go to Payments Section, add payment, enter Gabriel Dobson in Paid to field, enter amount 500, save payment"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Payments Section,add payment,enter Gabriel Dobson in Paid to field,enter amount 500,save payment."""
 )
  
 # ---------------------------------------------------------------------------
@@ -84,20 +86,20 @@ PURCHASE_PAYMENT_TASK = (
 # ---------------------------------------------------------------------------
  
 REIMBURSEMENTS_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select expense claims, go to Reimbursements Section, click add reimbursement, select an user name in 'Reimbursed To' field, select an account, enter amount 200, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Reimbursements Section,click add reimbursement,select an user name in 'Reimbursed To' field, select an account, enter amount 200,and click on save."""
 )
  
 MILEAGE_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select expense claims, go to Mileages Section, click add mileage, select a director from user dropdown, enter 'Mileages Business Trip' in Remarks field, select engine type Petrol, enter description mileage London to Manchester, enter mileage 200, select rate 45p, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Mileages Section,click add mileage,select a director from user dropdown,enter 'Mileages Business Trip' in Remarks field,select engine type Petrol,enter description mileage London to Manchester,enter mileage 200,select rate 45p,and click on save."""
 )
  
 EXPENSE_CLAIMS_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select expense claims, click add expense button, select director, enter Office Equipment in remarks field, enter bill no EXP123, enter description Buying New Desks, select account Eu services - 3/4, enter base amount 1500, select vat 5% standard, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,click add expense button,select director,enter Office Equipment in remarks field,enter bill no EXP123,enter description Buying New Desks,select account Eu services - 3/4,enter base amount 1500,select vat 5% standard,and click on save."""
 )
  
 # UI issue while saving
 REFUND_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select expense claims, go to Refunds Section, click add refund, select a value in refund from field, select an account, enter amount 1000 and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Refunds Section,click add refund,select a value in refund from field,select an account,Enter amount 1000 and click on save."""
 )
  
 # ---------------------------------------------------------------------------
@@ -106,28 +108,28 @@ REFUND_TASK = (
  
 # UI issue while saving
 JOURNALS_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select journals, click add journal button, enter JRN001 in journal reference field, select an account, enter value in debit 1000, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select journals,click add journal button,enter JRN001 in journal reference field,select an account,enter value in debit 1000,and click on save."""
 )
  
 FIXED_ASSET_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select assets, click add Fixed assets, enter asset name MacBook Pro, select an account, set purchase price 100, select supplier AO, enter rate 1200 and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select assets,click add Fixed assets,enter asset name MacBook Pro,select an account,set purchase price 100,select supplier AO, enter rate 1200 and click on save."""
 )
  
 DISPOSED_ASSET_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select assets, go to disposed, add dispose asset, select an asset, enter sales proceeds 800, select payment method Customer, select customer Suresh Raina and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select assets,go to disposed,add dispose asset,select an asset,enter sales proceeds 800,select payment method Customer,select customer Suresh Raina and click on save."""
 )
  
 # Issue with IBAN
 BANKING_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to banking section, click add account, account type savings, select bank CAF, enter account no 126525678, enter sort code 77-26-89, enter IBAN RB003GSD, make it as Primary account, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to banking section,click add account,account type savings, select bank CAF, enter account no 126525678, enter sort code 77-26-89,enter IBAN RB003GSD, Make it as Primary account.and click on save."""
 )
  
 BUDGET_MANAGER_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to Budget manager and click add budget, enter name Q4 Marketing, date 5th Dec, 2027, select Frequency yearly, duration 1 year, and click on save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to Budget manager and click add budget.Enter name Q4 Marketing,date 5th Dec,2027.select Frequency yearly,duration 1 year. and click on save."""
 )
  
 DIVIDEND_TASK = (
-    """go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section, select dividends section, click dividends, select an authorised director from dropdown, select a type, enter dividend per share 10, enter payment date 10/10/2026, save asset, save"""
+    """go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select dividends section,click dividends,select an authorised director from dropdown,select a type,enter dividend per share 10,enter payment date 10/10/2026,save asset,save."""
 )
  
 # ---------------------------------------------------------------------------
@@ -135,7 +137,7 @@ DIVIDEND_TASK = (
 # ---------------------------------------------------------------------------
  
 INVOICE_FULL_CREATION_TASK = (
-    """go to Bookkeeping module, search for 290 CREW LIMITED business name and select it. go to inputs section, select sales, go to Invoices, add invoice, create a new Contact name 'dpscvs' in customer field, set address jodhpur, rajasthan, 342015, set supplier address barmer, rajasthan, india, 325486, set Supplier Due Date 01/01/2027, set invoice no INV12345, set p.o. reference abc123, create an item 'IT Services', set product description 'service provider', set qty 10 and unit price 5000, set vat to No Vat, set discount 10% and click on save"""
+    """go to Bookkeeping module.search for 290 CREW LIMITED business name and select it.go to inputs section,select sales,go to Invoices,add invoice,create a new Contact name 'Dart' in customer field. set address jodhpur, rajasthan, 342015. set supplier address barmer, rajasthan, india, 325486. Supplier Set Due Date 01/01/2027. Set invoice no INV12455. set p.o. reference abc15435, create an item 'IT Services',set product description 'service provider', set qty 10 and unit price 5000, set vat to No Vat, set discount 10% and click on save."""
 )
  
 # ---------------------------------------------------------------------------
@@ -143,7 +145,7 @@ INVOICE_FULL_CREATION_TASK = (
 # ---------------------------------------------------------------------------
  
 CRM_CREATE_INVOICE_TASK = (
-    """go to clients section, search for Zachary Spencer and select it. go to create invoice, select a service, set amount to 5000 and set discount to 10%, create a discount note, select a collection method and click on save"""
+    """Go to clients section.Search for Zachary Spencer and select it. Go to "create invoice", select a service. set amount to 5000 and set discount to 10%. create a discount note.Select a collection method and click on save."""
 )
  
 # Convenience mapping for parametrised test runners
@@ -204,10 +206,25 @@ SUCCESS_MARKERS = {
     "invoice_full_creation": "Invoices",
     "crm_create_invoice":    "Invoices",
 }
-def _infer_marker(prompt: str) -> str:
-    """Best-guess success marker for a free-text task, from its record type (ordered most
-    specific first — e.g. invoice tasks mention items, so "invoice" is checked before "item")."""
+# Verbs that mean the task WRITES something (create/modify/remove a record). A free-text task
+# containing none of these is read-only — it will legitimately produce no create-write, so it
+# must not get a marker (the ground-truth gate would force-fail an honest success otherwise).
+_WRITE_VERBS = re.compile(
+    r"\b(add|create|save|submit|enter|set|make|new|record|update|edit|modify|change|delete|"
+    r"remove|upload|import|approve|pay|dispose|generate)\b", re.IGNORECASE)
+
+
+def _infer_marker(prompt: str) -> str | None:
+    """Best-guess success marker for a free-text task, or None for a read-only task.
+
+    None disables the network ground-truth gate: a task that only reads/verifies (check a
+    balance, confirm a record exists) fires no create-write, so success falls back to the
+    agent's self-report + the judge. Write tasks map to a marker by record type (ordered most
+    specific first — e.g. invoice tasks mention items, so "invoice" is checked before "item").
+    """
     p = prompt.lower()
+    if not _WRITE_VERBS.search(p):
+        return None
     checks = [
         ("purchase order", "PurchaseOrders"),
         ("credit note", "Purchase" if "purchase" in p else "Refunds"),
@@ -331,7 +348,7 @@ async def _try_adaptation(runner: Runner, task: str, tid: str, script_path, mark
 async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: str):
     """Replay the task's compiled script if one exists (AUTO), else author + validate + commit."""
     if not auto:
-        return await runner.run(task, max_steps=60, success_marker=marker)
+        return await runner.run(task, max_steps=90, success_marker=marker)
 
     tid = ts.task_id(task)
     script_path = ts.steps_path(tid)
@@ -348,10 +365,12 @@ async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: s
             return adapted
 
     print(f"[*] task {tid}: authoring with the agent (recording it)")
-    # 60 steps: with max_actions_per_step=1 every fill/click is its own step, so a full create
-    # task legitimately needs ~35-40 steps; 60 leaves room to recover from a few missteps.
+    # 90 steps: with max_actions_per_step=1 every fill/click is its own step, so a full create
+    # task legitimately needs ~35-40 steps; 90 leaves room to recover from missteps (run
+    # 20260710_094628 hit the old 60-step ceiling mid-form). The ground-truth gate still
+    # decides success, so a longer leash can't fake a pass.
     result = await runner.run(
-        task, max_steps=60, record_path=ts.recording_path(tid), success_marker=marker
+        task, max_steps=90, record_path=ts.recording_path(tid), success_marker=marker
     )
     gt = result.ground_truth or {}
     if not result.is_successful and not gt.get("create_write_seen"):
@@ -361,37 +380,26 @@ async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: s
     # Rescue path: the agent reported failure, but the network says the record WAS saved
     # (e.g. it flailed on a follow-up form after an unnoticed successful save). Compile the
     # recording anyway, truncated at the step the create-write fired on, so the post-save
-    # flailing never reaches the script. Replay validation below still decides the commit.
+    # flailing never reaches the script.
     truncate_at = None
     if not result.is_successful:
         truncate_at = gt.get("write_step")
         print(f"[*] task {tid}: agent reported failure but the create-write DID fire "
               f"(step {truncate_at}) -> compiling anyway, truncated at that step")
 
-    # Author run succeeded (ground-truth). Compile to a temp path and replay-verify it before
-    # committing as the golden script. This ensures we never save a fragile script — we only
-    # commit a script that has JUST proven it can replay perfectly end-to-end.
-    tmp_path = script_path.with_suffix(".tmp.json")
+    # Author run passed the network ground-truth gate: compile and commit the golden script
+    # directly. (No proof-replay: the workflow is author once with the LLM, then replay with
+    # different values/names via the template tier — that first value-swapped replay is the
+    # real test, and a broken script simply fails there and can be re-authored with --fresh.)
     try:
-        steps = save_steps(ts.recording_path(tid), tmp_path, max_steps=truncate_at)
+        steps = save_steps(ts.recording_path(tid), script_path, max_steps=truncate_at)
         n = len(steps)
-        print(f"[*] task {tid}: compiled {n} steps — validating replay...")
-        val = await runner.run_script(tmp_path, success_marker=marker)
-        if val.is_successful:
-            os.replace(tmp_path, script_path)
-            ts.update_manifest(tid, task, steps=n)
-            print(f"[*] task {tid}: validation PASSED -> committed {n}-step golden script")
-            await _save_template(tid, task, steps, runner.expander_llm)
-        else:
-            # Validation failed: leave any existing golden script untouched.
-            log.warning("validation FAILED for %s: %s", tid, val.final_result)
-            print(f"[*] task {tid}: validation FAILED ({val.final_result})")
-            print(f"[*] task {tid}: NOT overwriting golden script; raw trace kept for debugging")
-            tmp_path.unlink(missing_ok=True)
-    except Exception as exc:  # noqa: BLE001 - validation error must not crash the session
-        log.exception("validation error for %s: %s", tid, exc)
-        print(f"[*] task {tid}: validation error: {exc} -> NOT overwriting golden script")
-        tmp_path.unlink(missing_ok=True)
+        ts.update_manifest(tid, task, steps=n)
+        print(f"[*] task {tid}: compiled {n} steps -> committed golden script")
+        await _save_template(tid, task, steps, runner.expander_llm)
+    except Exception as exc:  # noqa: BLE001 - compile failure must not crash the session
+        log.exception("compile error for %s: %s", tid, exc)
+        print(f"[*] task {tid}: compile error: {exc} -> golden script NOT saved")
     return result
 
 
@@ -412,8 +420,17 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
             'Or pass a full prompt: --task "go to Bookkeeping module, ..."'
         )
         
-    if not success_marker:
+    # Resolve the ground-truth marker. --marker none/off disables the gate explicitly;
+    # otherwise known tasks use their configured marker and free-text tasks are inferred —
+    # including None for READ-ONLY tasks (no write verbs), which produce no create-write and
+    # must not be force-failed by the gate.
+    if success_marker and success_marker.strip().lower() in ("none", "off"):
+        success_marker = None
+    elif not success_marker:
         success_marker = SUCCESS_MARKERS.get(task_key, "Invoices") if task_key in ALL_TASKS else _infer_marker(task)
+    if success_marker is None:
+        print("[*] read-only task (or --marker none): network ground-truth gate disabled; "
+              "success comes from the agent + judge")
 
     async with async_playwright() as playwright:
         browser, _page, cdp_url = await login(playwright, config)
@@ -428,7 +445,8 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
                 expander_llm=expander_llm,
                 expand_prompt=config.expand_prompt,
                 judge_llm=expander_llm,  # feeds browser-use's built-in end-of-run judge
-                extend_system_message=APP_SYSTEM_RULES,
+                extend_system_message=SPEED_OPTIMIZATION_PROMPT,
+                tools=build_tools(),  # custom actions the prompts call (escape hatches, UI scans)
             )
 
             result = await run_task(runner, task, auto, fresh, success_marker)
@@ -464,9 +482,11 @@ def cli() -> None:
     # force a plain agent run that ignores recordings.
     parser.add_argument("--auto", action=argparse.BooleanOptionalAction, default=True, help="Replay a recorded script when one exists (default: on; use --no-auto to force a fresh agent run).")
     parser.add_argument("--fresh", action="store_true", help="Force re-authoring, ignoring existing scripts.")
-    parser.add_argument("--marker", default=os.getenv("SUCCESS_MARKER", "").strip() or None, help="Success marker URL fragment.")
+    parser.add_argument("--marker", default=os.getenv("SUCCESS_MARKER", "").strip() or None,
+                        help="Success marker URL fragment; pass 'none' to disable the "
+                             "network ground-truth gate (read-only tasks are auto-detected).")
     args = parser.parse_args()
-    
+
     asyncio.run(main(args.task, args.auto, args.fresh, args.marker))
 
 

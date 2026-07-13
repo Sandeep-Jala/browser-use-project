@@ -27,12 +27,13 @@ def build_llm(config: Config) -> BaseChatModel:
             model=config.azure_model,
             api_key=config.azure_api_key,
             base_url=config.azure_base_url,
+            temperature=0.0,
         )
 
     if provider == "groq":
         if not config.groq_api_key:
             raise SystemExit("GROQ_API_KEY is not set in .env (LLM_PROVIDER=groq)")
-        return ChatGroq(model=config.groq_model, api_key=config.groq_api_key)
+        return ChatGroq(model=config.groq_model, api_key=config.groq_api_key, temperature=0.0)
 
     raise SystemExit(f"Unknown LLM_PROVIDER: {config.llm_provider!r} (expected 'azure' or 'groq')")
 
@@ -49,4 +50,5 @@ def build_expander_llm(config: Config) -> BaseChatModel | None:
         model=config.expander_model,
         api_key=config.azure_api_key,
         base_url=config.azure_base_url,
+        temperature=0.0,
     )

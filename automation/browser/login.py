@@ -93,6 +93,10 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
     browser = await playwright.chromium.launch(
         headless=config.headless,
         args=[f"--remote-debugging-port={config.cdp_port}"],
+        # Don't let Playwright tear down the browser on Ctrl+C: the Runner installs its own
+        # SIGINT handler for the human-in-the-loop pause (see runner._prompt_and_inject), and
+        # the browser must survive the pause so the agent can resume against it.
+        handle_sigint=False,
     )
     cdp_url = f"http://localhost:{config.cdp_port}"
 

@@ -40,17 +40,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
-def _env_history_items(name: str) -> int | None:
+def _env_history_items(name: str, default: int | None = None) -> int | None:
     """Parse MAX_HISTORY_ITEMS. browser-use requires None or an int > 5, so any unset/blank/
-    invalid/out-of-range value falls back to None (unlimited history)."""
+    invalid/out-of-range value falls back to `default`."""
     raw = os.getenv(name)
     if raw is None or not raw.strip():
-        return None
+        return default
     try:
         value = int(raw.strip())
     except ValueError:
-        return None
-    return value if value > 5 else None
+        return default
+    return value if value > 5 else default
 
 
 @dataclass
@@ -81,6 +81,10 @@ class Config:
     # Cap on how many past steps the agent keeps in context (None = unlimited). Cuts per-step
     # tokens (the resent history grows each step). browser-use requires None or > 5.
     max_history_items: int | None
+    # browser-use's plan_update layer: the model re-emits its full plan in every step's output.
+    # With EXPAND_PROMPT=true the expanded numbered task is already resent every step, so this
+    # is largely redundant token weight — set ENABLE_PLANNING=false to A/B it off.
+    enable_planning: bool
     # Prompt expansion: rewrite the task into step-by-step instructions before running.
     expand_prompt: bool
     expander_model: str
@@ -109,7 +113,8 @@ class Config:
             use_vision=_env_bool("USE_VISION", default=True),
             vision_detail_level=os.getenv("VISION_DETAIL_LEVEL", "auto").strip().lower(),
             artifacts_dir=Path(os.getenv("ARTIFACTS_DIR", "artifacts")),
-            max_history_items=_env_history_items("MAX_HISTORY_ITEMS"),
+            max_history_items=_env_history_items("MAX_HISTORY_ITEMS", default=20),
+            enable_planning=_env_bool("ENABLE_PLANNING", default=True),
             expand_prompt=_env_bool("EXPAND_PROMPT", default=True),
             expander_model=os.getenv("EXPANDER_MODEL", DEFAULT_EXPANDER_MODEL),
         )
