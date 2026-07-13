@@ -35,9 +35,11 @@ _FRAMEWORK_ID = re.compile(
     re.IGNORECASE,
 )
 # A react-select descendant id carries a STABLE suffix ("option-0", "listbox") we can anchor on
-# independently of the volatile instance counter.
-_REACT_SELECT_PART = re.compile(r"^react-select-\d+-(?P<part>option-\d+|listbox|placeholder)$")
-_RS_OPTION = re.compile(r"^(?P<instance>react-select-\d+)-option-\d+$")
+# independently of the volatile instance counter. GROUPED menus nest the index
+# ("option-0-0" = first option of the first group — observed on the VAT select), hence the
+# (?:-\d+)* tail.
+_REACT_SELECT_PART = re.compile(r"^react-select-\d+-(?P<part>option-\d+(?:-\d+)*|listbox|placeholder)$")
+_RS_OPTION = re.compile(r"^(?P<instance>react-select-\d+)-option-\d+(?:-\d+)*$")
 _RS_INPUT = re.compile(r"^(?P<instance>react-select-\d+)-input$")
 # Playwright ARIA roles we can target with get_by_role. Recorded elements carry either an explicit
 # `role` attribute or a tag we can map to an implicit role.
@@ -83,6 +85,11 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     attrs = element.get("attributes") or {}
     tag = (element.get("node_name") or "").lower()
     ax_name = (element.get("ax_name") or "").strip()
+    # A real label is short. A long ax_name is a screen-reader announcement (react-select emits
+    # "option Bike, selected. Select is focused, type to refine list, ..." onto its cell), which
+    # changes every render and must never anchor a selector.
+    if len(ax_name) > 60:
+        ax_name = ""
     cands: list[str] = []
 
     # 1. Role + accessible name — Playwright's most durable, unambiguous locator.
@@ -120,6 +127,106 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     return [c for c in cands if not (c in seen or seen.add(c))]
 
 
+# Tags that can actually receive typed text. A `fill` recorded against anything else (td, div,
+# li...) is a MISCAPTURE: the agent picked a container's index, so the recorded element identity
+# is wrong even though browser-use made the typing "work" at runtime (focus fell wherever it
+# fell — observed: a description typed into a td landed in the Item react-select's filter).
+_EDITABLE_TAGS = {"input", "textarea", "select"}
+
+# Element lines in browser-use's state_message DOM listing, e.g.
+#   \t\t\t[11419]<td />
+#   \t\t\t\t|SHADOW(open)|[11367]<input type=text id=TextField1444 name=productItems.0.description />
+_SM_LINE = re.compile(r"\[(?P<idx>\d+)\]<(?P<tag>[a-zA-Z][\w-]*)\b(?P<attrs>[^>]*?)/?>")
+_SM_ATTR = re.compile(r"([a-zA-Z][\w-]*)=([^\s>]+)")
+# A react-select filter input is never the intended target of a plain-text fill.
+_RS_FILTER_ID = re.compile(r"^react-select-\d+-input$")
+# How many listing lines below the miscaptured container to search for the real field.
+_RECOVER_WINDOW = 8
+
+
+def _recover_fill_target(state_message: str, recorded_index: Any) -> dict[str, str] | None:
+    """Recover the REAL editable target of a miscaptured fill from browser-use's own recording.
+
+    The recorded interacted_element only says which *index* the agent typed at; when that index
+    was a container (td/div), the true field's identity is lost from the element — but NOT from
+    the step's state_message, browser-use's serialized DOM listing, which names every editable
+    element with its stable attributes. Scan a few lines below the container for the nearest
+    <input>/<textarea> that is a data field (not a react-select combobox filter) and return its
+    attributes. The compiled selector this produces is replay-validated before any commit, so a
+    wrong recovery can never poison a golden script.
+    """
+    if not state_message or recorded_index is None:
+        return None
+    lines = state_message.splitlines()
+    anchor = next((i for i, ln in enumerate(lines) if f"[{recorded_index}]<" in ln), None)
+    if anchor is None:
+        return None
+    for ln in lines[anchor + 1: anchor + 1 + _RECOVER_WINDOW]:
+        m = _SM_LINE.search(ln)
+        if not m or m.group("tag").lower() not in ("input", "textarea"):
+            continue
+        attrs = dict(_SM_ATTR.findall(m.group("attrs")))
+        if _RS_FILTER_ID.match(attrs.get("id", "")) or attrs.get("role") == "combobox":
+            continue  # a dropdown filter, not a data field
+        if attrs.get("type") in ("hidden", "checkbox", "radio", "button", "submit"):
+            continue
+        if any(attrs.get(k) for k in ("name", "placeholder", "aria-label")) or (
+            attrs.get("id") and not _is_dynamic_id(attrs["id"])
+        ):
+            attrs["__tag__"] = m.group("tag").lower()
+            return attrs
+    return None
+
+
+def _recovered_selectors(attrs: dict[str, str]) -> list[str]:
+    """Ranked selectors for a recovered fill target (name first — the app's stablest anchor)."""
+    cands: list[str] = []
+    for key in ("name", "placeholder", "aria-label"):
+        if attrs.get(key):
+            cands.append(_attr_sel(key, attrs[key]))
+    if attrs.get("id") and not _is_dynamic_id(attrs["id"]):
+        cands.append(_attr_sel("id", attrs["id"]))
+    return cands
+
+
+# Attributes kept in a fingerprint — the durable, identifying ones (a self-healing scorer
+# weighs them at replay). `class`/`value` are deliberately excluded: they churn on this React
+# app and would drag the score toward the wrong element.
+_FP_ATTRS = ("id", "name", "aria-label", "placeholder", "title", "data-testid", "type", "href")
+
+
+def _fingerprint(element: dict[str, Any]) -> dict[str, Any]:
+    """Distill a recorded element into a self-healing fingerprint.
+
+    Everything here is already in the recorded element dict (see DOMInteractedElement.to_dict);
+    compile just stops discarding it. Used ONLY as a replay fallback: when every ranked selector
+    fails, `_heal_locate` scores the live DOM against this fingerprint and acts on the best,
+    unambiguous match instead of aborting the whole script.
+    """
+    attrs = element.get("attributes") or {}
+    tag = (element.get("node_name") or "").lower()
+    ax_name = (element.get("ax_name") or "").strip()
+    if len(ax_name) > 60:  # screen-reader announcement blob, not a label (see _selectors)
+        ax_name = ""
+    fp: dict[str, Any] = {
+        "tag": tag or None,
+        "role": _role_of(attrs, tag) or ((attrs.get("role") or "").strip().lower() or None),
+        "text": ax_name or None,
+        "attrs": {k: attrs[k] for k in _FP_ATTRS if attrs.get(k)},
+        "xpath": element.get("x_path") or None,
+        "bounds": element.get("bounds") or None,
+    }
+    return {k: v for k, v in fp.items() if v}
+
+
+def _attach_fp(step: dict[str, Any], element: dict[str, Any]) -> dict[str, Any]:
+    """Attach a self-healing fingerprint to a step (no-op if the element yields nothing useful)."""
+    fp = _fingerprint(element)
+    if fp:
+        step["fingerprint"] = fp
+    return step
+
+
 def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
     """Append a step, collapsing the agent's slow-app retries against the last real step.
 
@@ -149,8 +256,42 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
     steps.append(step)
 
 
+# The app's react-select "+ Create \"<name>\"" option. Its label embeds the (per-replay
+# changing) name, so replay clicks it via :has-text("Create") — the only option containing
+# that word in an open menu — with position as last resort.
+_CREATE_LINE = re.compile(r'^\W*Create\s*"\s*(?P<inline>[^"]*)')
+
+
+def _create_option_name(state_message: str, backend_id: Any) -> str | None:
+    """The record name if the clicked option is a '+ Create "<name>"' option, else None.
+
+    The recorded option element carries no ax_name, but browser-use's DOM listing
+    (state_message) renders the option's child text on the lines directly below its
+    [backend_id] line — either inline (`Create "Bobby"`) or split across lines
+    (`Create "` / `Bobby` / `"`). Anchoring on the element's own lines is what makes this
+    precise: the word "Create" also appears in the task text embedded elsewhere in the
+    state_message.
+    """
+    if not state_message or backend_id is None:
+        return None
+    lines = state_message.splitlines()
+    anchor = next((i for i, ln in enumerate(lines) if f"[{backend_id}]" in ln), None)
+    if anchor is None:
+        return None
+    seg = [ln.strip() for ln in lines[anchor + 1: anchor + 6]]
+    for i, ln in enumerate(seg):
+        m = _CREATE_LINE.match(ln)
+        if not m:
+            continue
+        name = (m.group("inline") or "").strip()
+        if not name and i + 1 < len(seg):  # name on the following listing line
+            name = seg[i + 1].strip().strip('"').strip()
+        return name or None
+    return None
+
+
 def _dropdown_option_steps(
-    element: dict[str, Any], steps: list[dict[str, Any]]
+    element: dict[str, Any], steps: list[dict[str, Any]], state_message: str = "",
 ) -> list[dict[str, Any]] | None:
     """For a click on a react-select OPTION, synthesize a click BY LABEL instead of the
     recorded positional option click. Returns the replacement step(s), or None to fall
@@ -171,6 +312,17 @@ def _dropdown_option_steps(
     match = _RS_OPTION.match(attrs.get("id") or "")
     if not match:
         return None
+    # '+ Create "<name>"' option: creates a NEW record. Its label embeds the name — which
+    # changes when the template tier swaps in a new value — and its position depends on how
+    # many existing records the menu lists (observed at option-17). Click it by the constant
+    # word "Create" instead; the recorded position is only a fallback.
+    created = _create_option_name(state_message, element.get("backend_node_id"))
+    if created:
+        part = _REACT_SELECT_PART.match(attrs.get("id") or "")
+        return [{"action": "click", "selectors": [
+            'css=[id*="-option"]:has-text("Create")',
+            f'css=[id$="-{part.group("part")}"]' if part else 'css=[id$="-option-0"]',
+        ]}]
     ax_name = (element.get("ax_name") or "").strip()
     prev = next((s for s in reversed(steps) if s.get("action") != "wait"), None)
     typed = ""
@@ -220,28 +372,82 @@ def compile_recording(
     for item in history:
         actions = (item.get("model_output") or {}).get("action") or []
         elements = (item.get("state") or {}).get("interacted_element") or []
+        # ActionResults for this step, aligned to actions (one action per step in this app).
+        # find_by_text stashes the element it clicked here (agent_tools.py) since a custom
+        # action gets no state.interacted_element.
+        results = item.get("result") or []
         for i, action in enumerate(actions):
             if not action:
                 continue
             name = next(iter(action))
             params = action[name] or {}
             element = elements[i] if i < len(elements) else None
-            if name == "navigate" and params.get("url"):
+            if name == "find_by_text" and params.get("click_first"):
+                # A navigation/click made via find_by_text: recover its target element from the
+                # recorded metadata and compile it exactly like a built-in click. Without this,
+                # every find_by_text click (menus, Sales, btnInvoice, Save, ...) is dropped and
+                # the replay skeleton collapses.
+                element = None
+                if i < len(results) and isinstance(results[i], dict):
+                    md = results[i].get("metadata")
+                    if isinstance(md, dict):
+                        element = md.get("interacted_element")
+                if element:
+                    synth = _dropdown_option_steps(element, steps,
+                                                   item.get("state_message") or "")
+                    if synth is not None:
+                        for s in synth:
+                            _push_step(steps, s)
+                    else:
+                        sels = _selectors(element)
+                        if sels:
+                            _push_step(steps, _attach_fp(
+                                {"action": "click", "selectors": sels}, element))
+            elif name == "navigate" and params.get("url"):
                 _push_step(steps, {"action": "goto", "url": params["url"]})
             elif name == "click" and element:
-                synth = _dropdown_option_steps(element, steps)
+                synth = _dropdown_option_steps(element, steps,
+                                               item.get("state_message") or "")
                 if synth is not None:
                     for s in synth:
                         _push_step(steps, s)
                     continue
                 sels = _selectors(element)
                 if sels:
-                    _push_step(steps, {"action": "click", "selectors": sels})
+                    _push_step(steps, _attach_fp(
+                        {"action": "click", "selectors": sels}, element))
             elif name == "input" and element:
+                # Miscapture repair: a fill recorded against a non-editable container means the
+                # element identity is wrong (agent typed at a td/div index). Recover the real
+                # field from this step's state_message instead of compiling the container.
+                if (element.get("node_name") or "").lower() not in _EDITABLE_TAGS and \
+                        "contenteditable" not in (element.get("attributes") or {}):
+                    rec = _recover_fill_target(item.get("state_message") or "",
+                                               params.get("index"))
+                    sels = _recovered_selectors(rec) if rec else []
+                    if sels:
+                        logger.warning(
+                            "fill %r was recorded against <%s> (not editable); recovered real "
+                            "target %s from state_message", str(params.get("text", ""))[:40],
+                            element.get("node_name"), sels[0])
+                        _push_step(steps, {
+                            "action": "fill", "selectors": sels,
+                            "value": str(params.get("text", "")),
+                            "clear": params.get("clear", True), "recovered": True,
+                            "fingerprint": {"tag": rec.pop("__tag__", "input"),
+                                            "attrs": {k: v for k, v in rec.items()
+                                                      if k in _FP_ATTRS}},
+                        })
+                        continue
+                    logger.warning(
+                        "fill %r recorded against non-editable <%s> and no recovery target "
+                        "found; compiling container selectors (replay may descend)",
+                        str(params.get("text", ""))[:40], element.get("node_name"))
                 sels = _selectors(element)
                 if sels:
-                    step = {"action": "fill", "selectors": sels,
-                            "value": params.get("text", ""), "clear": params.get("clear", True)}
+                    step = _attach_fp({"action": "fill", "selectors": sels,
+                            "value": str(params.get("text", "")), "clear": params.get("clear", True)},
+                            element)
                     # Typing into a react-select filter input: stamp the select instance so a
                     # following option click can be resolved BY the typed label (and so
                     # parameterize() groups retried fills of this field together).
@@ -301,6 +507,117 @@ def _step_selectors(step: dict[str, Any]) -> list[str]:
 
 _EDITABLE_SEL = "input, textarea, select, [contenteditable='true'], [contenteditable='']"
 
+# --- Self-healing fallback -------------------------------------------------------------------
+# When every ranked selector for a step fails, score the live DOM against the step's recorded
+# fingerprint and act on the single best, UNAMBIGUOUS match (mirrors _resolve's "refuse an
+# ambiguous locator" rule). This rescues elements whose durable anchors all regenerated (the
+# xpath-only react-select fields that otherwise abort a whole replay).
+_HEAL_ATTR = "data-heal-target"   # temporary marker the scorer stamps on its winner
+# A heal commits only when best >= THRESHOLD and best beats the runner-up by >= MARGIN, so a
+# lone strong signal (exact id/name/aria-label, weight 4) or a coherent bundle of weaker ones
+# wins, but two lookalike fields (small margin) are refused — replay-validation then fails safe.
+_HEAL_THRESHOLD = 4.0
+_HEAL_MARGIN = 1.5
+
+# In-page scorer. Receives {fp, editable, attr, threshold, margin}; clears any prior marker,
+# scores visible (and, if editable, editable) candidates by attribute/role/tag/text overlap plus
+# a small position tiebreak, and stamps the winner with `attr` when it clears the gates.
+_HEAL_JS = r"""
+(a) => {
+  var fp = a.fp || {}, attrs = fp.attrs || {};
+  var wantTag = fp.tag || null, wantText = (fp.text || '').trim().toLowerCase();
+  var ATTR = a.attr;
+  var prev = document.querySelectorAll('[' + ATTR + ']');
+  for (var p = 0; p < prev.length; p++) prev[p].removeAttribute(ATTR);
+  function norm(s){ return (s == null ? '' : '' + s).trim().toLowerCase(); }
+  function toks(s){ return norm(s).split(/[^a-z0-9]+/).filter(function(w){ return w.length > 1; }); }
+  function visible(el){
+    var s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function editableEl(el){
+    var t = el.tagName.toLowerCase();
+    if (t === 'input') return el.type !== 'hidden';
+    if (t === 'textarea' || t === 'select') return true;
+    return !!el.isContentEditable;
+  }
+  var nodes;
+  if (a.editable) nodes = document.querySelectorAll("input, textarea, select, [contenteditable='true'], [contenteditable='']");
+  else if (wantTag) nodes = document.getElementsByTagName(wantTag);
+  else nodes = document.querySelectorAll('*');
+  var wantToks = toks(wantText);
+  var cx = null, cy = null;
+  if (fp.bounds) { cx = fp.bounds.x + fp.bounds.width / 2; cy = fp.bounds.y + fp.bounds.height / 2; }
+  var scored = [];
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    if (!el || !el.getAttribute) continue;
+    if (a.editable && !editableEl(el)) continue;
+    if (!visible(el)) continue;
+    var sc = 0;
+    if (attrs['data-testid'] && el.getAttribute('data-testid') === attrs['data-testid']) sc += 5;
+    if (attrs['id'] && el.id === attrs['id']) sc += 4;
+    if (attrs['name'] && el.getAttribute('name') === attrs['name']) sc += 4;
+    if (attrs['aria-label'] && el.getAttribute('aria-label') === attrs['aria-label']) sc += 3;
+    if (attrs['placeholder'] && el.getAttribute('placeholder') === attrs['placeholder']) sc += 3;
+    if (attrs['href'] && el.getAttribute('href') === attrs['href']) sc += 2;
+    if (attrs['title'] && el.getAttribute('title') === attrs['title']) sc += 1.5;
+    if (attrs['type'] && el.getAttribute('type') === attrs['type']) sc += 0.5;
+    if (fp.role) { var r = norm(el.getAttribute('role')); if (r && r === fp.role) sc += 2; }
+    if (wantTag && el.tagName.toLowerCase() === wantTag) sc += 1;
+    if (wantText) {
+      var et = norm(el.innerText || el.textContent || el.getAttribute('aria-label') || el.value || el.getAttribute('placeholder'));
+      if (et === wantText) sc += 3;
+      else if (wantToks.length) {
+        var ets = toks(et), ov = 0;
+        for (var k = 0; k < wantToks.length; k++) if (ets.indexOf(wantToks[k]) >= 0) ov++;
+        sc += 1.5 * (ov / wantToks.length);
+      }
+    }
+    if (cx !== null) {
+      var rr = el.getBoundingClientRect();
+      var d = Math.sqrt(Math.pow(rr.left + rr.width / 2 - cx, 2) + Math.pow(rr.top + rr.height / 2 - cy, 2));
+      sc += Math.max(0, 2 - d / 300);
+    }
+    if (sc > 0) scored.push({ el: el, sc: sc });
+  }
+  if (!scored.length) return { healed: false };
+  scored.sort(function(x, y){ return y.sc - x.sc; });
+  var best = scored[0], margin = best.sc - (scored.length > 1 ? scored[1].sc : 0);
+  if (best.sc < a.threshold || margin < a.margin) return { healed: false, score: best.sc, margin: margin };
+  best.el.setAttribute(ATTR, '1');
+  return { healed: true, score: best.sc, margin: margin,
+           desc: best.el.tagName.toLowerCase() + (best.el.id ? '#' + best.el.id : '') };
+}
+"""
+
+
+async def _heal_locate(page: Page, fingerprint: dict[str, Any], editable: bool):
+    """Score the live DOM against `fingerprint` and return (locator, label) for a confident,
+    unambiguous match, else None. The winner is stamped with _HEAL_ATTR so we can locate it
+    without a durable selector; scoring clears any prior stamp so only one is ever tagged."""
+    try:
+        info = await page.evaluate(_HEAL_JS, {
+            "fp": fingerprint, "editable": bool(editable), "attr": _HEAL_ATTR,
+            "threshold": _HEAL_THRESHOLD, "margin": _HEAL_MARGIN,
+        })
+    except Exception as exc:  # noqa: BLE001 - a heal attempt must never crash the replay
+        logger.debug("heal scorer failed: %s", exc)
+        return None
+    if not info or not info.get("healed"):
+        return None
+    loc = page.locator(f"[{_HEAL_ATTR}]")
+    try:
+        if await loc.count() != 1:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    logger.info("↺ healed via fingerprint (score=%.1f margin=%.1f -> %s)",
+                info.get("score", 0.0), info.get("margin", 0.0), info.get("desc", "?"))
+    return loc.first, f"healed:{info.get('desc', '?')}"
+
 
 async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                    require_editable: bool = False):
@@ -348,7 +665,119 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                 errors.append(f"{sel} -> vanished during editability check")
                 continue
         return candidate, sel
+    # Every ranked selector failed. Before giving up, try the self-healing fallback: score the
+    # live DOM against the step's recorded fingerprint and act on a confident, unique match.
+    fingerprint = step.get("fingerprint")
+    if fingerprint:
+        healed = await _heal_locate(page, fingerprint, require_editable)
+        if healed is not None:
+            return healed
     raise RuntimeError("no unique candidate matched: " + " | ".join(errors))
+
+
+# How many times to re-resolve + re-act a step that fails transiently before giving up.
+_MAX_ATTEMPTS = 3
+# Substrings of errors caused by the app RE-RENDERING a row/menu mid-interaction: the node we
+# located (or was about to act on) detaches before we can use it. This is the dominant replay
+# failure on this React app — selecting a line-item Item auto-fills Account/VAT and rebuilds the
+# whole <tr>, so a field located a beat too early vanishes. Re-resolving after a short settle,
+# once React has finished swapping the subtree, almost always succeeds. We retry ONLY these:
+# a genuine logic error (wrong value, missing field) still fails, so no bad script is committed.
+_TRANSIENT = (
+    "vanished during editability check",
+    "no unique candidate matched",
+    "not attached",
+    "element is not attached",
+    "element is not stable",
+    "detached",
+    "element was detached",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(t in msg for t in _TRANSIENT)
+
+
+async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> str:
+    """Resolve + click, re-resolving after a settle if the target detaches mid-render."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            loc, sel = await _resolve(page, step, timeout_ms)
+            try:
+                await loc.click(timeout=5000)
+            except Exception:  # noqa: BLE001 - typically "another element intercepts pointer events"
+                # react-select renders a placeholder div UNDER an input container that intercepts
+                # pointer events; a forced click dispatches at the element's position — i.e. onto
+                # the overlaying control, which is the real target.
+                logger.warning("click on %r intercepted/failed; retrying with force", sel)
+                await loc.click(timeout=timeout_ms, force=True)
+            return sel
+        except Exception as exc:  # noqa: BLE001
+            if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
+                logger.info("click step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
+                            exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
+                await page.wait_for_timeout(_SETTLE_MS * 2)
+                continue
+            raise
+    raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> str:
+    """Resolve + fill, re-resolving after a settle if the field detaches mid-render."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            loc, sel = await _resolve(page, step, timeout_ms, require_editable=True)
+            if step.get("clear", True):
+                await loc.fill("", timeout=timeout_ms)
+            await loc.fill(step.get("value", ""), timeout=timeout_ms)
+            return sel
+        except Exception as exc:  # noqa: BLE001
+            if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
+                logger.info("fill step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
+                            exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
+                await page.wait_for_timeout(_SETTLE_MS * 2)
+                continue
+            raise
+    raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+# Budget for each click of the flyout-reopen recovery (predecessor + retried target). Shorter
+# than the main timeout: the recovery either works quickly or the failure was real.
+_REOPEN_MS = 8000
+
+
+async def _click_with_flyout_recovery(
+    page: Page, steps: list[dict[str, Any]], idx: int, timeout_ms: int
+) -> str:
+    """Click step `idx`, and if its target is unreachable, re-click the nearest PREVIOUS click
+    step once, then retry the target.
+
+    This is the replay-engine version of the FLYOUT SUBMENUS recovery the agent prompt documents:
+    submenu items (e.g. Sales under Inputs) exist only while their parent flyout is open, and any
+    app re-render closes it. On a slow render the flyout can close between our predecessor click
+    and this step's probe; re-probing the target alone (what _click_with_retry does) can never
+    bring it back — only re-clicking its opener can. If the recovery also fails, the ORIGINAL
+    error is raised so the report shows the real failure.
+    """
+    step = steps[idx]
+    try:
+        return await _click_with_retry(page, step, timeout_ms)
+    except Exception as exc:  # noqa: BLE001
+        prev = next((steps[j] for j in range(idx - 1, -1, -1)
+                     if steps[j].get("action") == "click"), None)
+        if prev is None:
+            raise
+        logger.info("click step %d unreachable (%s); re-clicking predecessor to reopen its "
+                    "flyout, then retrying the target once", idx, str(exc)[:120])
+        try:
+            await _click_with_retry(page, prev, _REOPEN_MS)
+            await page.wait_for_timeout(_SETTLE_MS)
+            sel = await _click_with_retry(page, step, _REOPEN_MS)
+        except Exception:  # noqa: BLE001 - recovery failed; surface the original failure
+            raise exc
+        logger.info("↺ flyout recovery succeeded for step %d (%s)", idx, sel)
+        return sel
 
 
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
@@ -356,6 +785,10 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
 
     `log` records which concrete selector resolved for each interaction, so a healer/validator can
     see exactly how each step was located (and which candidate won).
+
+    NOTE on create-record scripts: values are replayed EXACTLY as compiled. A "create X" flow
+    only replays while X does not exist — run it with a different name via the template tier,
+    or delete the record in the app first.
     """
     executed = 0
     log: list[dict[str, Any]] = []
@@ -365,22 +798,11 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
             if action == "goto":
                 await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
             elif action == "click":
-                loc, sel = await _resolve(page, step, timeout_ms)
-                try:
-                    await loc.click(timeout=5000)
-                except Exception:  # noqa: BLE001 - typically "another element intercepts pointer events"
-                    # react-select renders a placeholder div UNDER an input container that
-                    # intercepts pointer events; a forced click dispatches at the element's
-                    # position — i.e. onto the overlaying control, which is the real target.
-                    logger.warning("click on %r intercepted/failed; retrying with force", sel)
-                    await loc.click(timeout=timeout_ms, force=True)
+                sel = await _click_with_flyout_recovery(page, steps, idx, timeout_ms)
                 log.append({"step": idx, "action": action, "used": sel})
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "fill":
-                loc, sel = await _resolve(page, step, timeout_ms, require_editable=True)
-                if step.get("clear", True):
-                    await loc.fill("", timeout=timeout_ms)
-                await loc.fill(step.get("value", ""), timeout=timeout_ms)
+                sel = await _fill_with_retry(page, step, timeout_ms)
                 log.append({"step": idx, "action": action, "used": sel})
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "press":
