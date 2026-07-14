@@ -43,6 +43,23 @@ def has_script(tid: str) -> bool:
     return steps_path(tid).exists()
 
 
+def archive_script(tid: str) -> list[Path]:
+    """Move a task's golden script + template into recordings/archive/ (timestamped) so a
+    re-authored script can land at the same tid paths without losing the broken version.
+    Returns the archived paths (empty if nothing existed to archive)."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = RECORDINGS_DIR / "archive"
+    moved: list[Path] = []
+    for src, kind in ((steps_path(tid), "steps"), (template_path(tid), "template")):
+        if not src.exists():
+            continue
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        dst = archive_dir / f"{tid}.{kind}.{stamp}.json"
+        os.replace(src, dst)
+        moved.append(dst)
+    return moved
+
+
 def load_manifest() -> dict[str, Any]:
     """Read recordings/manifest.json; {} if it is missing or corrupt."""
     if not MANIFEST_PATH.exists():

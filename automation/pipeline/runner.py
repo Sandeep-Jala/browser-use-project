@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import signal
@@ -135,6 +136,18 @@ class RunResult:
     # marker was configured for this task. When present and create_write_seen is False, the
     # run's self-reported success was overridden to False (nothing was actually saved).
     ground_truth: dict[str, Any] | None = None
+    # How run_task produced this result: "replay" | "adapted" | "authored" |
+    # "replay_failed->authored" | "agent" (plain --no-auto run). None for direct Runner calls.
+    mode: str | None = None
+    # run_script only: the raw replay outcome {executed, failed_at, error, log}. The log says
+    # which selector located each step — including "healed" winner identities that
+    # promote_healed persists into the golden script after a successful run.
+    replay: dict[str, Any] | None = None
+    # Post-run telemetry assertions (see pipeline/assertions.py). assertions_passed gates a
+    # SEPARATE verdict from is_successful: overall PASS = is_successful and
+    # assertions_passed is not False. None = no assertions were evaluated.
+    assertion_results: list[dict[str, Any]] = field(default_factory=list)
+    assertions_passed: bool | None = None
 
     def summary(self) -> str:
         status = "✅" if self.is_successful else ("⚠️" if self.is_done else "❌")
@@ -618,14 +631,19 @@ class Runner:
             # The final Save's POST can still be IN FLIGHT when the last step returns —
             # observed: POST /Invoices issued but response not yet received (status None) at
             # teardown, failing the gate on a run that actually saved. Poll the live network
-            # log briefly so in-flight writes can complete before we stop listening.
-            if success_marker and outcome["failed_at"] is None:
+            # log briefly so in-flight writes can complete before we stop listening. This
+            # runs even when a step FAILED: a Save's POST can be in flight when a later step
+            # breaks, and missing it would let the fallback re-author a task whose record
+            # actually saved (duplicate record).
+            if success_marker:
                 net = next((c for c in collectors if c.name == "network"), None)
                 for _ in range(16):  # up to ~8s
                     if net is not None and _create_write_seen(
                             net.results().get("requests", []) or [], success_marker):
                         break
-                    await page.wait_for_timeout(500)
+                    # asyncio.sleep, not page.wait_for_timeout: after a failed step the page
+                    # may be unusable, and the poll must still complete.
+                    await asyncio.sleep(0.5)
         finally:
             for collector in collectors:
                 try:
@@ -666,8 +684,14 @@ class Runner:
             errors=[outcome["error"]] if outcome["error"] else [],
             collector_results=collector_results, artifacts=artifacts,
             screenshots=[], steps=[], judgement=None, usage=None,
-            ground_truth=ground_truth,
+            ground_truth=ground_truth, replay=outcome,
         )
+        try:
+            log_path = run_dir / "replay_log.json"
+            log_path.write_text(_json.dumps(outcome, indent=2))
+            result.artifacts["replay_log"] = log_path
+        except Exception as exc:  # noqa: BLE001 - the log is evidence, not a requirement
+            logger.warning("could not write replay_log.json: %s", exc)
         logger.info("◀ SCRIPT done %s: success=%s executed=%s/%s %.1fs",
                     run_id, ok, outcome["executed"], len(steps), duration)
         return result

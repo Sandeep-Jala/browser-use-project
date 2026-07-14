@@ -85,9 +85,22 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     attrs = element.get("attributes") or {}
     tag = (element.get("node_name") or "").lower()
     ax_name = (element.get("ax_name") or "").strip()
+    cands = _selectors_from_parts(tag, attrs, ax_name)
+    # 7. Positional xpath — last resort.
+    xpath = element.get("x_path")
+    if xpath:
+        cands.append("xpath=/" + xpath.lstrip("/"))
+    return cands
+
+
+def _selectors_from_parts(tag: str, attrs: dict[str, Any], ax_name: str) -> list[str]:
+    """Ranked candidates (ranks 1-6) from raw element parts. Shared by compile-time
+    `_selectors` and replay-time heal promotion, so a healed winner is ranked through the
+    exact same durability policy as a freshly recorded element."""
     # A real label is short. A long ax_name is a screen-reader announcement (react-select emits
     # "option Bike, selected. Select is focused, type to refine list, ..." onto its cell), which
     # changes every render and must never anchor a selector.
+    ax_name = (ax_name or "").strip()
     if len(ax_name) > 60:
         ax_name = ""
     cands: list[str] = []
@@ -118,10 +131,6 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     # 6. Exact accessible-name text.
     if ax_name:
         cands.append(f'text="{_esc(ax_name)}"')
-    # 7. Positional xpath — last resort.
-    xpath = element.get("x_path")
-    if xpath:
-        cands.append("xpath=/" + xpath.lstrip("/"))
 
     seen: set[str] = set()
     return [c for c in cands if not (c in seen or seen.add(c))]
@@ -588,16 +597,34 @@ _HEAL_JS = r"""
   var best = scored[0], margin = best.sc - (scored.length > 1 ? scored[1].sc : 0);
   if (best.sc < a.threshold || margin < a.margin) return { healed: false, score: best.sc, margin: margin };
   best.el.setAttribute(ATTR, '1');
+  // Winner identity, so a successful heal can be promoted into the golden script's selector
+  // list (same attribute family as the fingerprint).
+  var FP = ['id', 'name', 'aria-label', 'placeholder', 'title', 'data-testid', 'type', 'href'];
+  var wAttrs = {};
+  for (var f = 0; f < FP.length; f++) {
+    var av = best.el.getAttribute(FP[f]);
+    if (av) wAttrs[FP[f]] = av;
+  }
+  var br = best.el.getBoundingClientRect();
   return { healed: true, score: best.sc, margin: margin,
-           desc: best.el.tagName.toLowerCase() + (best.el.id ? '#' + best.el.id : '') };
+           desc: best.el.tagName.toLowerCase() + (best.el.id ? '#' + best.el.id : ''),
+           winner: {
+             tag: best.el.tagName.toLowerCase(),
+             role: norm(best.el.getAttribute('role')) || null,
+             text: ('' + (best.el.innerText || best.el.textContent || '')).trim().slice(0, 80),
+             attrs: wAttrs,
+             bounds: { x: br.left, y: br.top, width: br.width, height: br.height }
+           } };
 }
 """
 
 
 async def _heal_locate(page: Page, fingerprint: dict[str, Any], editable: bool):
-    """Score the live DOM against `fingerprint` and return (locator, label) for a confident,
-    unambiguous match, else None. The winner is stamped with _HEAL_ATTR so we can locate it
-    without a durable selector; scoring clears any prior stamp so only one is ever tagged."""
+    """Score the live DOM against `fingerprint` and return (locator, label, winner) for a
+    confident, unambiguous match, else None. The winner element is stamped with _HEAL_ATTR so
+    we can locate it without a durable selector; scoring clears any prior stamp so only one is
+    ever tagged. `winner` is the element's identity ({tag, role, text, attrs, bounds}) so a
+    successful heal can later be promoted into the golden script (see promote_healed)."""
     try:
         info = await page.evaluate(_HEAL_JS, {
             "fp": fingerprint, "editable": bool(editable), "attr": _HEAL_ATTR,
@@ -616,12 +643,14 @@ async def _heal_locate(page: Page, fingerprint: dict[str, Any], editable: bool):
         return None
     logger.info("↺ healed via fingerprint (score=%.1f margin=%.1f -> %s)",
                 info.get("score", 0.0), info.get("margin", 0.0), info.get("desc", "?"))
-    return loc.first, f"healed:{info.get('desc', '?')}"
+    return loc.first, f"healed:{info.get('desc', '?')}", info.get("winner") or None
 
 
 async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                    require_editable: bool = False):
-    """Return a locator for the first candidate that resolves to EXACTLY ONE visible element.
+    """Return (locator, selector_label, healed_winner) for the first candidate that resolves
+    to EXACTLY ONE visible element. `healed_winner` is None unless the self-healing fallback
+    located the element (then it carries the winner's identity for promotion).
 
     Refusing to act on an ambiguous match is what prevents "clicks somewhere else": rather than
     silently taking `.first`, we require a unique hit. Non-final candidates get a short probe
@@ -660,11 +689,11 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                         errors.append(f"{sel} -> visible but not an editable field")
                         continue
                     # The recorded element was the field's container; type into its input.
-                    return inner.first, f"{sel} >> {_EDITABLE_SEL}"
+                    return inner.first, f"{sel} >> {_EDITABLE_SEL}", None
             except Exception:  # noqa: BLE001 - element vanished mid-check; try the next
                 errors.append(f"{sel} -> vanished during editability check")
                 continue
-        return candidate, sel
+        return candidate, sel, None
     # Every ranked selector failed. Before giving up, try the self-healing fallback: score the
     # live DOM against the step's recorded fingerprint and act on a confident, unique match.
     fingerprint = step.get("fingerprint")
@@ -699,11 +728,12 @@ def _is_transient(exc: Exception) -> bool:
     return any(t in msg for t in _TRANSIENT)
 
 
-async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> str:
-    """Resolve + click, re-resolving after a settle if the target detaches mid-render."""
+async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> tuple[str, dict[str, Any] | None]:
+    """Resolve + click, re-resolving after a settle if the target detaches mid-render.
+    Returns (selector_label, healed_winner_or_None)."""
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            loc, sel = await _resolve(page, step, timeout_ms)
+            loc, sel, healed = await _resolve(page, step, timeout_ms)
             try:
                 await loc.click(timeout=5000)
             except Exception:  # noqa: BLE001 - typically "another element intercepts pointer events"
@@ -712,7 +742,7 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
                 # the overlaying control, which is the real target.
                 logger.warning("click on %r intercepted/failed; retrying with force", sel)
                 await loc.click(timeout=timeout_ms, force=True)
-            return sel
+            return sel, healed
         except Exception as exc:  # noqa: BLE001
             if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
                 logger.info("click step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
@@ -723,15 +753,16 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
     raise RuntimeError("unreachable")  # loop either returns or raises
 
 
-async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> str:
-    """Resolve + fill, re-resolving after a settle if the field detaches mid-render."""
+async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> tuple[str, dict[str, Any] | None]:
+    """Resolve + fill, re-resolving after a settle if the field detaches mid-render.
+    Returns (selector_label, healed_winner_or_None)."""
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            loc, sel = await _resolve(page, step, timeout_ms, require_editable=True)
+            loc, sel, healed = await _resolve(page, step, timeout_ms, require_editable=True)
             if step.get("clear", True):
                 await loc.fill("", timeout=timeout_ms)
             await loc.fill(step.get("value", ""), timeout=timeout_ms)
-            return sel
+            return sel, healed
         except Exception as exc:  # noqa: BLE001
             if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
                 logger.info("fill step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
@@ -749,7 +780,7 @@ _REOPEN_MS = 8000
 
 async def _click_with_flyout_recovery(
     page: Page, steps: list[dict[str, Any]], idx: int, timeout_ms: int
-) -> str:
+) -> tuple[str, dict[str, Any] | None]:
     """Click step `idx`, and if its target is unreachable, re-click the nearest PREVIOUS click
     step once, then retry the target.
 
@@ -773,11 +804,11 @@ async def _click_with_flyout_recovery(
         try:
             await _click_with_retry(page, prev, _REOPEN_MS)
             await page.wait_for_timeout(_SETTLE_MS)
-            sel = await _click_with_retry(page, step, _REOPEN_MS)
+            sel, healed = await _click_with_retry(page, step, _REOPEN_MS)
         except Exception:  # noqa: BLE001 - recovery failed; surface the original failure
             raise exc
         logger.info("↺ flyout recovery succeeded for step %d (%s)", idx, sel)
-        return sel
+        return sel, healed
 
 
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
@@ -798,12 +829,18 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
             if action == "goto":
                 await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
             elif action == "click":
-                sel = await _click_with_flyout_recovery(page, steps, idx, timeout_ms)
-                log.append({"step": idx, "action": action, "used": sel})
+                sel, healed = await _click_with_flyout_recovery(page, steps, idx, timeout_ms)
+                entry = {"step": idx, "action": action, "used": sel}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "fill":
-                sel = await _fill_with_retry(page, step, timeout_ms)
-                log.append({"step": idx, "action": action, "used": sel})
+                sel, healed = await _fill_with_retry(page, step, timeout_ms)
+                entry = {"step": idx, "action": action, "used": sel}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "press":
                 await page.keyboard.press(step["keys"])
@@ -821,3 +858,62 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
             return {"executed": executed, "failed_at": idx,
                     "error": f"{type(exc).__name__}: {exc}", "log": log}
     return {"executed": executed, "failed_at": None, "error": None, "log": log}
+
+
+# Ceiling for a step's candidate list after heal promotions, so repeated healings of a churny
+# element can't grow it without bound (promoted candidates prepend; the oldest fallbacks drop).
+_MAX_SELECTORS = 8
+
+
+def promote_healed(steps_path: str | Path, replay_log: list[dict[str, Any]]) -> list[int]:
+    """Persist successful replay healings into the golden script (atomic rewrite).
+
+    For each replay-log entry that carries a healed winner, synthesize durable selectors from
+    the winner's identity via the same ranking policy as compile time and PREPEND them to that
+    step's candidate list (the old anchors stay as fallbacks), then refresh the step's
+    fingerprint from the winner. A winner with no durable anchor only refreshes the
+    fingerprint. Returns the indices of the updated steps ([] leaves the file untouched).
+
+    Caller contract: only invoke after the replay PASSED its ground-truth gate — a failed run
+    must never rewrite a golden script.
+    """
+    steps_path = Path(steps_path)
+    steps: list[dict[str, Any]] = json.loads(steps_path.read_text())
+    promoted: list[int] = []
+    for entry in replay_log or []:
+        winner = entry.get("healed")
+        idx = entry.get("step")
+        if not winner or idx is None or not 0 <= idx < len(steps):
+            continue
+        step = steps[idx]
+        tag = (winner.get("tag") or "").lower()
+        attrs = dict(winner.get("attrs") or {})
+        if winner.get("role"):
+            attrs.setdefault("role", winner["role"])  # _role_of reads the explicit role here
+        text = (winner.get("text") or "").strip()
+
+        new_sels = _selectors_from_parts(tag, attrs, text)
+        old_sels = _step_selectors(step)  # normalizes the legacy single-`selector` form
+        seen: set[str] = set()
+        merged = [s for s in new_sels + old_sels
+                  if not (s in seen or seen.add(s))][:_MAX_SELECTORS]
+        if merged != old_sels:
+            step["selectors"] = merged
+            step.pop("selector", None)
+
+        fp = step.get("fingerprint") or {}
+        fp["tag"] = tag or fp.get("tag")
+        fp["role"] = winner.get("role") or _role_of(attrs, tag) or fp.get("role")
+        if text and len(text) <= 60:  # same "a real label is short" rule as _selectors
+            fp["text"] = text
+        fp["attrs"] = {**(fp.get("attrs") or {}),
+                       **{k: attrs[k] for k in _FP_ATTRS if attrs.get(k)}}
+        if winner.get("bounds"):
+            fp["bounds"] = winner["bounds"]
+        step["fingerprint"] = {k: v for k, v in fp.items() if v}
+        promoted.append(idx)
+        logger.info("⬆ promoted healed selectors into step %d: %s", idx, new_sels or "(fingerprint only)")
+
+    if promoted:
+        _atomic_write(steps_path, json.dumps(steps, indent=2))
+    return promoted
