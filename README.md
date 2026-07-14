@@ -34,6 +34,9 @@ automation/
     assertions.py      # declarative telemetry assertions (no_5xx, no_console_errors, ...)
     suite.py           # run many tasks on one login -> suite.json + suite.html
     task_store.py      # task identity (prompt hash) + recording/script registry
+    subtask_store.py   # subtask identity + the SHARED subtask library (library/)
+    decompose.py       # split a task into subtasks (spec-declared / cached / derived / LLM)
+    hybrid.py          # hybrid engine: replay recorded subtasks, LLM only for the gaps
   collectors/
     base.py            # Collector ABC (attaches to a Playwright BrowserContext)
     network.py         # request/response/requestfailed via Playwright
@@ -92,6 +95,8 @@ uv run python -m automation --suite invoice,purchase,item
 | `--fresh` | force re-authoring even if a script already exists (suite mode: only with an explicit task list) |
 | `--no-fallback` | keep a broken replay as the result instead of archiving the script and re-authoring with the agent (fallback is on by default) |
 | `--no-continue-on-failure` | suite mode: stop at the first task that doesn't pass |
+| `SUBTASKS` / `--subtasks` | author/repair through the **hybrid subtask engine**: replay recorded subtasks from the shared library, LLM only for the gaps (default **on**; `--no-subtasks` falls back to whole-task authoring) |
+| `--redecompose` | regenerate the task's cached subtask decomposition |
 
 The exit code is CI-ready: `0` only when the flow completed (ground-truth gate) **and** the
 telemetry assertions passed.
@@ -106,6 +111,9 @@ telemetry assertions passed.
 - `recordings/<task_id>.template.json` — the script with its values lifted into a `{{param}}`
   dictionary (`customer`, `qty`, `unit_price`, ...), created alongside each golden script
 - `recordings/manifest.json` — `task_id -> prompt` map (+ each task's `params` dictionary)
+- `library/` — the shared subtask library (hybrid engine): per-subtask
+  `<sid>.steps.json` / `.template.json` / `.recording.json` / `.meta.json` + `manifest.json`
+- `decompositions/<task_id>.json` — cached subtask decomposition per task prompt
 
 ### How record / replay works
 
@@ -120,6 +128,37 @@ each committed script is parameterized into a template whose values live in a na
 (one small LLM call), the new values are read into the dictionary, the tokens are swapped in,
 and the instantiated script is replay-validated before being committed as a golden script of
 its own. Structural edits (different tab, extra fields) fall back to full agent re-authoring.
+
+### Hybrid subtask engine (`--subtasks`)
+
+At scale (thousands of tasks a day, ~10 subtasks each), whole-task granularity makes the
+two expensive paths — authoring a new task and repairing a broken replay — cost a full LLM
+run even when most of the flow is already known. By default (disable with `--no-subtasks`
+or `SUBTASKS=false`), those two paths go through `pipeline/hybrid.py` instead:
+
+- The task is **decomposed** into subtasks (`pipeline/decompose.py`): an explicit
+  `TaskSpec.subtasks` declaration wins; otherwise a cached decomposition, a derived match
+  (same task shape, different values — no LLM), or one LLM call (cached forever after).
+- Each subtask is keyed into a **global shared library** (`library/`) by its
+  *parameterized* prompt + the normalized URL context it starts from. The
+  "select {{business}} business" prefix every registry task shares is ONE library entry —
+  authored once, replayed everywhere, tolerant of value changes via the same template
+  machinery as the whole-task tier.
+- Per subtask: a library hit **replays** (no LLM, healing included); a miss is
+  **agent-authored** with a prompt scoped to just that step and committed to the library.
+  A failed replay hands the same live page to the agent for **in-place recovery** — no
+  whole-task re-author. Entries that keep failing are archived and re-authored clean.
+- All segments share ONE live browser session — replay and agent segments interleave on
+  the same page with no teardown, so each picks up exactly where the previous left off.
+- Per-subtask success gates: the save-owning subtask must fire the parent's create-write
+  (network ground truth, windowed to that segment); navigation subtasks check the recorded
+  end-of-segment URL context; the parent-level marker gate is unchanged on top.
+- A fully-passing hybrid run is **stitched back** into a whole-task golden script under
+  the task's tid, so the next run takes the ordinary fast replay path. Steady state
+  converges to zero-LLM whole-task replays; the engine only re-enters on authoring/repair.
+
+The whole-task replay fast path and template-adaptation tier are unchanged whether the
+flag is on or off.
 
 ### Self-healing replays
 

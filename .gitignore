@@ -28,3 +28,7 @@ nohup.out
 
 # Recorded action traces for replay
 recordings/
+
+# Hybrid subtask engine stores (shared subtask library + cached decompositions)
+library/
+decompositions/

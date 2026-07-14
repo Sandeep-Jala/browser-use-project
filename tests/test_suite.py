@@ -150,3 +150,32 @@ async def test_per_task_assertion_override(tmp_path):
     assert by_key["strict"]["assertions_ok"] is False
     assert by_key["lenient"]["assertions_ok"] is True
     assert summary["ok"] is False
+
+
+async def test_hybrid_result_populates_subtask_fields(tmp_path):
+    async def run_one(spec):
+        result = _result(tmp_path, spec.key, mode="hybrid")
+        result.subtasks = [
+            {"index": 0, "mode": "replay", "ok": True},
+            {"index": 1, "mode": "replay", "ok": True},
+            {"index": 2, "mode": "authored", "ok": True},
+        ]
+        return result
+
+    summary = await run_suite([_spec("hy")], run_one, artifacts_dir=tmp_path)
+
+    record = summary["tasks"][0]
+    assert record["subtask_modes"] == ["replay", "replay", "authored"]
+    assert record["library_hits"] == 2
+    # Whole-task runs keep the fields empty (additive change).
+    assert "subtask_modes" in record
+
+
+async def test_whole_task_result_leaves_subtask_fields_none(tmp_path):
+    async def run_one(spec):
+        return _result(tmp_path, spec.key)
+
+    summary = await run_suite([_spec("plain")], run_one, artifacts_dir=tmp_path)
+    record = summary["tasks"][0]
+    assert record["subtask_modes"] is None
+    assert record["library_hits"] is None

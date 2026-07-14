@@ -399,6 +399,85 @@ keep the old value and save a wrong record.\
 """
 
 
+DECOMPOSE_SYSTEM_PROMPT = """\
+You split a browser-automation task into an ordered list of SUBTASKS for a hybrid \
+record/replay engine. Each subtask is a self-contained UI milestone that starts and ends in \
+a stable page state — e.g. "search and select a business", "navigate to a section/tab", \
+"open a create form, fill it and save". Subtasks are recorded and replayed INDEPENDENTLY \
+across many tasks, so cut at natural page-state boundaries and keep navigation separate \
+from data entry where the task's wording allows.
+
+Output ONLY strict JSON — no prose, no markdown fences:
+  {"subtasks": [
+     {"template_prompt": "<subtask with every literal value replaced by a {{snake_case}} token>",
+      "values": {"<token>": "<the literal value, copied VERBATIM from the task>", ...},
+      "is_save_step": <true|false>},
+     ...]}
+
+Rules:
+- 2 to 15 subtasks, preserving the task's original action order exactly.
+- Every literal value in the task (names, numbers, descriptions, references, dates) appears \
+in EXACTLY ONE subtask, replaced by a {{snake_case}} token named for the ROLE it plays \
+(customer, item, qty, unit_price, remarks, ...). Its verbatim value goes in that subtask's \
+"values". Words that are part of the procedure (module names, section names, button labels) \
+are NOT values — leave them literal.
+- Substituting every subtask's values back into its template_prompt must reproduce the \
+task's original wording for that span. Do not reword, add, or drop actions.
+- Exactly ONE subtask has "is_save_step": true — the one whose final action commits the \
+record (clicks Save/Submit). If the task saves nothing, every subtask has false.
+- Do not invent steps the task does not mention (no login, no verification-only subtasks).\
+"""
+
+
+def scoped_subtask_prompt(
+    subtask: str,
+    completed: list[str],
+    remaining: list[str],
+    dirty: bool = False,
+    prior_failure: str | None = None,
+) -> str:
+    """Build the agent prompt for ONE subtask of a workflow already in progress.
+
+    Scopes the agent hard to the single subtask: the page is already in its starting state
+    (earlier subtasks were replayed or agent-driven on this same live session), and later
+    subtasks are handled separately — so no re-navigation, no redoing, no running ahead.
+    With `dirty`, a failed replay already half-executed this subtask and the agent must
+    inspect current state and finish/correct it rather than start from scratch.
+    """
+    lines = [
+        "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
+        "browser. The page is already in the correct starting state for your step.",
+    ]
+    if completed:
+        lines.append("\nAlready done (do NOT redo, verify, or navigate back to these):")
+        lines.extend(f"  - {c}" for c in completed)
+    lines.append(
+        "\nDo NOT navigate to the app root, re-select the business, or restart the flow."
+    )
+    lines.append(f"\nYOUR ONLY JOB: {subtask}")
+    if dirty:
+        failure = f" It failed with: {prior_failure}." if prior_failure else ""
+        lines.append(
+            f"\nA previous automated attempt at THIS step partially completed it and then "
+            f"stopped.{failure} Inspect the current page state FIRST — fields may already "
+            f"hold correct values, menus or forms may already be open. Finish or correct "
+            f"the step from where it stands; do not blindly redo actions already done."
+        )
+    if remaining:
+        nxt = remaining[0]
+        if len(nxt) > 120:
+            nxt = nxt[:117] + "..."
+        lines.append(
+            f"\nWhen your job is complete, call done immediately with success=true. Do NOT "
+            f"begin the next step ({nxt}) — it is handled separately."
+        )
+    else:
+        lines.append(
+            "\nWhen your job is complete, call done immediately with success=true."
+        )
+    return "\n".join(lines)
+
+
 # --- Expander meta-prompt + logic ------------------------------------------------------------
 EXPAND_SYSTEM_PROMPT = """You are an expert browser-automation prompt engineer.
 Your job is to take a short, informal browser task and expand it into a detailed, reliable, numbered execution prompt that a browser agent can follow without ambiguity.

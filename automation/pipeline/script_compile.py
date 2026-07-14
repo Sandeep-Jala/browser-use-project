@@ -360,13 +360,18 @@ def _dropdown_option_steps(
 
 
 def compile_recording(
-    recording_path: str | Path, max_steps: int | None = None
+    recording_path: str | Path, max_steps: int | None = None, *,
+    emit_start_goto: bool = True,
 ) -> list[dict[str, Any]]:
     """Turn a saved agent history JSON into an ordered list of {action, ...} steps.
 
     `max_steps` keeps only the first N agent steps. Used to cut a recording at the step where
     the create-write fired (see ground_truth["write_step"]), so an agent that flailed AFTER
     the record was actually saved never gets its post-save junk into the script.
+
+    `emit_start_goto=False` skips the leading goto to the recording's start URL. Mid-flow
+    subtask segments need this: on an SPA a reload destroys live form state, and the segment's
+    context-keyed lookup already guarantees the page is in its start state when it replays.
     """
     data = json.loads(Path(recording_path).read_text())
     steps: list[dict[str, Any]] = []
@@ -375,9 +380,10 @@ def compile_recording(
         history = history[:max_steps]
     # Assert a known starting page: the agent's flow began on this URL, so replay must too.
     # Without it, replay silently depends on wherever the browser happened to be left.
-    start_url = ((history[0].get("state") or {}).get("url") if history else None)
-    if start_url and start_url.startswith("http"):
-        steps.append({"action": "goto", "url": start_url})
+    if emit_start_goto:
+        start_url = ((history[0].get("state") or {}).get("url") if history else None)
+        if start_url and start_url.startswith("http"):
+            steps.append({"action": "goto", "url": start_url})
     for item in history:
         actions = (item.get("model_output") or {}).get("action") or []
         elements = (item.get("state") or {}).get("interacted_element") or []
@@ -489,10 +495,12 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def save_steps(
-    recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None
+    recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None, *,
+    emit_start_goto: bool = True,
 ) -> list[dict[str, Any]]:
     """Compile `recording_path` and write the step list to `steps_path` atomically."""
-    steps = compile_recording(recording_path, max_steps=max_steps)
+    steps = compile_recording(recording_path, max_steps=max_steps,
+                              emit_start_goto=emit_start_goto)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 

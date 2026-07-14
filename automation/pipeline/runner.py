@@ -137,8 +137,13 @@ class RunResult:
     # run's self-reported success was overridden to False (nothing was actually saved).
     ground_truth: dict[str, Any] | None = None
     # How run_task produced this result: "replay" | "adapted" | "authored" |
-    # "replay_failed->authored" | "agent" (plain --no-auto run). None for direct Runner calls.
+    # "replay_failed->authored" | "agent" (plain --no-auto run) | "hybrid" |
+    # "replay_failed->hybrid" (subtask engine). None for direct Runner calls.
     mode: str | None = None
+    # Hybrid runs only: one entry per subtask segment — {index, sid, prompt, context, mode,
+    # ok, gate, steps_executed, duration_seconds, healed_steps, tokens, error}. None for
+    # whole-task runs.
+    subtasks: list[dict[str, Any]] | None = None
     # run_script only: the raw replay outcome {executed, failed_at, error, log}. The log says
     # which selector located each step — including "healed" winner identities that
     # promote_healed persists into the golden script after a successful run.
@@ -198,6 +203,20 @@ class Runner:
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_id, run_dir
 
+    async def _start_collectors(self, pw_browser: Any, run_dir: Path) -> list[Collector]:
+        """Start one collector per (context, factory) across the browser's contexts.
+        A collector that fails to start is skipped — telemetry must not block a run."""
+        collectors: list[Collector] = []
+        for context in pw_browser.contexts:
+            for factory in self.collector_factories:
+                collector = factory(context, run_dir)
+                try:
+                    await collector.start()
+                    collectors.append(collector)
+                except Exception as exc:  # noqa: BLE001 - a collector must not block the run
+                    logger.warning("collector %s failed to start: %s", collector.name, exc)
+        return collectors
+
     async def run(
         self, task: str, max_steps: int = 25, record_path: Path | None = None,
         success_marker: str | None = None,
@@ -241,16 +260,106 @@ class Runner:
         # Open a Playwright connection to the same browser for telemetry. Listen across all
         # existing contexts so we catch whichever one the agent drives.
         pw_browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
-        collectors: list[Collector] = []
-        for context in pw_browser.contexts:
-            for factory in self.collector_factories:
-                collector = factory(context, run_dir)
-                try:
-                    await collector.start()
-                    collectors.append(collector)
-                except Exception as exc:  # noqa: BLE001 - a collector must not block the run
-                    logger.warning("collector %s failed to start: %s", collector.name, exc)
+        collectors = await self._start_collectors(pw_browser, run_dir)
 
+        collector_results: dict[str, Any] = {}
+        artifacts: dict[str, Path] = {}
+        try:
+            seg = await self.run_agent_segment(
+                agent_task, session, collectors, max_steps=max_steps,
+                record_path=record_path, success_marker=success_marker,
+            )
+        finally:
+            # Stop collectors, gather their results, then tear down both connections.
+            for collector in collectors:
+                try:
+                    await collector.stop()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("collector %s stop error: %s", collector.name, exc)
+
+            for collector in collectors:
+                collector_results[collector.name] = collector.results()
+                path = collector.write()
+                if path is not None:
+                    artifacts[collector.name] = path
+
+            try:
+                # connect_over_cdp: closes our Playwright connection only, not the browser.
+                await pw_browser.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("playwright connection close error: %s", exc)
+
+            try:
+                await session.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("session.stop() during cleanup: %s", exc)
+
+        history = seg["history"]
+        result = RunResult(
+            task=task,
+            run_id=run_id,
+            artifacts_dir=run_dir,
+            expanded_task=expanded_task,
+            is_done=history.is_done(),
+            is_successful=history.is_successful(),
+            has_errors=history.has_errors(),
+            final_result=history.final_result(),
+            urls=history.urls(),
+            n_steps=history.number_of_steps(),
+            duration_seconds=history.total_duration_seconds(),
+            extracted_content=history.extracted_content(),
+            model_actions=history.model_actions(),
+            errors=history.errors(),
+            collector_results=collector_results,
+            artifacts=artifacts,
+            screenshots=seg["screenshots"],
+            steps=seg["steps"],
+            judgement=seg["judgement"],
+            usage=seg["usage"],
+        )
+
+        # Ground-truth gate: the agent + LLM judge can report success without the record ever
+        # being saved. If a marker is configured and no matching create-write hit the network,
+        # override the self-reported success to failure so the report reflects reality.
+        if success_marker:
+            requests = collector_results.get("network", {}).get("requests", []) or []
+            write = _first_create_write(requests, success_marker)
+            create_write_seen = write is not None
+            overridden = bool(not create_write_seen and result.is_successful)
+            result.ground_truth = {
+                "marker": success_marker,
+                "create_write_seen": create_write_seen,
+                # Agent step the commit fired on — lets run_task truncate a rescued
+                # recording at the save, cutting any post-save flailing.
+                "write_step": write.get("step") if write else None,
+                "overrode_success": overridden,
+            }
+            if overridden:
+                logger.info(
+                    "◀ ground-truth override %s: reported success but no create-write to '%s' "
+                    "seen in network → marking failed", run_id, success_marker,
+                )
+                result.is_successful = False
+                result.has_errors = True
+
+        logger.info("◀ done %s: %s", run_id, result.summary())
+        return result
+
+    async def run_agent_segment(
+        self, agent_task: str, session: Any, collectors: list[Collector], *,
+        max_steps: int = 25, record_path: Path | None = None,
+        success_marker: str | None = None, request_offset: int = 0,
+    ) -> dict[str, Any]:
+        """Run ONE agent execution against an already-started session with already-running
+        collectors. Owns NO lifecycle: the caller starts/stops the session, the Playwright
+        connection, and the collectors — which is what lets the hybrid engine interleave
+        agent segments with script replays on the same live page.
+
+        `request_offset` windows the save probe to requests captured from that index on, so
+        a mid-task segment doesn't credit a create-write an earlier segment fired.
+
+        Returns {"history", "screenshots", "steps", "usage", "judgement"}.
+        """
         agent = Agent(
             task=agent_task,
             llm=self.llm,
@@ -374,8 +483,6 @@ class Runner:
                 pause_state["requested"] = False
                 self._prompt_and_inject(_agent)
 
-        collector_results: dict[str, Any] = {}
-        artifacts: dict[str, Path] = {}
         # Own SIGINT for the duration of the run so Ctrl+C opens the override prompt instead of
         # killing the process (browser-use's own handler is off via enable_signal_handler=False).
         prev_sigint: Any = None
@@ -390,11 +497,13 @@ class Runner:
         # Wire the agent's verify_save_registered tool to the SAME ground truth the end-of-run
         # gate uses (_first_create_write over the live network log), so the agent can check
         # mid-run whether its Save actually reached the server and fix validation errors.
+        # `request_offset` windows the probe to THIS segment's traffic.
         network_collector = next((c for c in collectors if c.name == "network"), None)
         if success_marker and network_collector is not None:
             agent_tools.set_save_probe(
                 lambda: _first_create_write(
-                    network_collector.results().get("requests", []) or [], success_marker
+                    (network_collector.results().get("requests", []) or [])[request_offset:],
+                    success_marker,
                 )
             )
 
@@ -407,29 +516,6 @@ class Runner:
                     signal.signal(signal.SIGINT, prev_sigint)
                 except (ValueError, OSError):
                     pass
-            # Stop collectors, gather their results, then tear down both connections.
-            for collector in collectors:
-                try:
-                    await collector.stop()
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("collector %s stop error: %s", collector.name, exc)
-
-            for collector in collectors:
-                collector_results[collector.name] = collector.results()
-                path = collector.write()
-                if path is not None:
-                    artifacts[collector.name] = path
-
-            try:
-                # connect_over_cdp: closes our Playwright connection only, not the browser.
-                await pw_browser.close()
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("playwright connection close error: %s", exc)
-
-            try:
-                await session.stop()
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("session.stop() during cleanup: %s", exc)
 
         # Save the action trace for later deterministic replay (no LLM) if requested.
         if record_path is not None:
@@ -482,55 +568,13 @@ class Runner:
         # second judge of our own.
         judgement = self._extract_judgement(history)
 
-        result = RunResult(
-            task=task,
-            run_id=run_id,
-            artifacts_dir=run_dir,
-            expanded_task=expanded_task,
-            is_done=history.is_done(),
-            is_successful=history.is_successful(),
-            has_errors=history.has_errors(),
-            final_result=history.final_result(),
-            urls=history.urls(),
-            n_steps=history.number_of_steps(),
-            duration_seconds=history.total_duration_seconds(),
-            extracted_content=history.extracted_content(),
-            model_actions=history.model_actions(),
-            errors=history.errors(),
-            collector_results=collector_results,
-            artifacts=artifacts,
-            screenshots=screenshots,
-            steps=steps,
-            judgement=judgement,
-            usage=usage,
-        )
-
-        # Ground-truth gate: the agent + LLM judge can report success without the record ever
-        # being saved. If a marker is configured and no matching create-write hit the network,
-        # override the self-reported success to failure so the report reflects reality.
-        if success_marker:
-            requests = collector_results.get("network", {}).get("requests", []) or []
-            write = _first_create_write(requests, success_marker)
-            create_write_seen = write is not None
-            overridden = bool(not create_write_seen and result.is_successful)
-            result.ground_truth = {
-                "marker": success_marker,
-                "create_write_seen": create_write_seen,
-                # Agent step the commit fired on — lets run_task truncate a rescued
-                # recording at the save, cutting any post-save flailing.
-                "write_step": write.get("step") if write else None,
-                "overrode_success": overridden,
-            }
-            if overridden:
-                logger.info(
-                    "◀ ground-truth override %s: reported success but no create-write to '%s' "
-                    "seen in network → marking failed", run_id, success_marker,
-                )
-                result.is_successful = False
-                result.has_errors = True
-
-        logger.info("◀ done %s: %s", run_id, result.summary())
-        return result
+        return {
+            "history": history,
+            "screenshots": screenshots,
+            "steps": steps,
+            "usage": usage,
+            "judgement": judgement,
+        }
 
     def _prompt_and_inject(self, agent: Any) -> None:
         """Human-in-the-loop: at a between-steps pause (Ctrl+C), read ONE instruction from the
@@ -610,15 +654,7 @@ class Runner:
             page = real_pages[0] if real_pages else pages[0]
             if len(pages) > 1:
                 logger.warning("Multiple pages found (%d). Selected page URL: %s", len(pages), page.url)
-        collectors: list[Collector] = []
-        for context in pw_browser.contexts:
-            for factory in self.collector_factories:
-                collector = factory(context, run_dir)
-                try:
-                    await collector.start()
-                    collectors.append(collector)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("collector %s failed to start: %s", collector.name, exc)
+        collectors = await self._start_collectors(pw_browser, run_dir)
 
         started = datetime.now()
         outcome: dict[str, Any] = {"executed": 0, "failed_at": None, "error": None}

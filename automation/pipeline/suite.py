@@ -48,6 +48,10 @@ class TaskRecord:
     tokens: int | None = None
     cost: float | None = None
     error: str | None = None
+    # Hybrid runs only: per-subtask modes (e.g. ["replay", "replay", "authored"]) and how
+    # many segments came from the shared library at zero LLM cost. None for whole-task runs.
+    subtask_modes: list[str] | None = None
+    library_hits: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -68,13 +72,17 @@ def _record_from_result(spec: TaskSpec, result: Any, suite_dir: Path,
     replay_log = (result.replay or {}).get("log") or []
     usage = result.usage or {}
     html_path = report_paths.get("html")
+    subtasks = getattr(result, "subtasks", None)
     return TaskRecord(
         key=spec.key, tid=ts.task_id(spec.prompt), status=status,
         assertions_ok=result.assertions_passed,
         mode=result.mode,
         duration_seconds=round(result.duration_seconds, 1),
         healed_steps=sorted({e["step"] for e in replay_log if e.get("healed")}),
-        reauthored=result.mode == "replay_failed->authored",
+        reauthored=result.mode in ("replay_failed->authored", "replay_failed->hybrid"),
+        subtask_modes=[s.get("mode") for s in subtasks] if subtasks else None,
+        library_hits=(sum(1 for s in subtasks if s.get("mode") == "replay")
+                      if subtasks else None),
         assertions={
             "passed": sum(1 for a in checks if a.get("passed") is True),
             "failed": sum(1 for a in checks if a.get("passed") is False),

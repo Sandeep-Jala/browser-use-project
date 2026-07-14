@@ -88,6 +88,13 @@ class Config:
     # Prompt expansion: rewrite the task into step-by-step instructions before running.
     expand_prompt: bool
     expander_model: str
+    # Hybrid subtask engine (pipeline/hybrid.py): author/repair tasks subtask-by-subtask
+    # against the shared library instead of one whole-task agent run. Default ON;
+    # SUBTASKS=false or --no-subtasks falls back to whole-task authoring per run.
+    use_subtasks: bool
+    # Agent step budget for ONE subtask segment (whole-task authoring uses 90; a subtask is
+    # ~a tenth of a task, so 25 leaves room to recover from missteps without runaway cost).
+    subtask_max_steps: int
 
     @classmethod
     def from_env(cls, env_path: str | os.PathLike[str] | None = None) -> "Config":
@@ -117,12 +124,19 @@ class Config:
             enable_planning=_env_bool("ENABLE_PLANNING", default=True),
             expand_prompt=_env_bool("EXPAND_PROMPT", default=True),
             expander_model=os.getenv("EXPANDER_MODEL", DEFAULT_EXPANDER_MODEL),
+            use_subtasks=_env_bool("SUBTASKS", default=True),
+            subtask_max_steps=int(os.getenv("SUBTASK_MAX_STEPS", "25")),
         )
 
     def ensure_dirs(self) -> None:
         """Create output directories if they don't exist yet."""
         self.errors_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        # Hybrid subtask engine stores (module constants in subtask_store).
+        from automation.pipeline import subtask_store as _ss
+
+        _ss.LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+        _ss.DECOMPOSITIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     @property
     def cdp_url(self) -> str:

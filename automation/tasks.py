@@ -17,12 +17,31 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class SubtaskDecl:
+    """One declared subtask of a task (hybrid subtask engine, see pipeline/hybrid.py).
+
+    `prompt` may carry {{tokens}} whose concrete values live in `values` — the tokenized
+    prompt is the subtask's LIBRARY identity, so two tasks that differ only in values share
+    one library recording. `marker` marks the save-owning subtask (the parent's create-write
+    fires here); `postcondition` is an optional cheap success check for subtasks with no
+    write: {"url_contains": "..."} or {"visible": "<selector>"}.
+    """
+    prompt: str
+    values: dict[str, str] | None = None
+    marker: str | None = None
+    postcondition: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     key: str
     prompt: str
     marker: str | None = None          # ground-truth URL fragment; None = read-only task
     assertions: dict[str, Any] | None = None  # per-task assertion overrides; None = defaults
     tags: tuple[str, ...] = ()
+    # Explicit subtask decomposition for the hybrid engine; None = LLM decomposition
+    # (computed once per prompt and cached under decompositions/<tid>.json).
+    subtasks: tuple[SubtaskDecl, ...] | None = None
 
 
 # Terse, high-level task prompts (the app-aware expander turns these into concrete steps).
@@ -35,6 +54,25 @@ TASKS: dict[str, TaskSpec] = {t.key: t for t in (
         prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section,select sales,go to Invoices,add invoice,select a customer Suresh Gopi,select an item bike, set product description 'buying a new bike', set Qty 5, Unit price 500 and click on save""",
         marker="Invoices",
         tags=("sales",),
+        # Reference explicit decomposition for the hybrid subtask engine. The tokenized
+        # prompts are shared library identities: every task starting with the same
+        # business-selection / navigation subtasks reuses the SAME recordings.
+        subtasks=(
+            SubtaskDecl(
+                prompt="go to Bookkeeping module, search and select {{business}} business name",
+                values={"business": "290 CREW LIMITED"},
+            ),
+            SubtaskDecl(prompt="go to inputs section, select sales, go to Invoices"),
+            SubtaskDecl(
+                prompt="add invoice: select a customer {{customer}}, select an item "
+                       "{{item}}, set product description '{{product_description}}', "
+                       "set Qty {{qty}}, Unit price {{unit_price}} and click on save",
+                values={"customer": "Suresh Gopi", "item": "bike",
+                        "product_description": "buying a new bike",
+                        "qty": "5", "unit_price": "500"},
+                marker="Invoices",
+            ),
+        ),
     ),
     TaskSpec(
         key="credit_notes",

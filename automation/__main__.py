@@ -184,12 +184,19 @@ def _promote_heals(tid: str, task: str, script_path, result) -> None:
 
 
 async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: str,
-                   fallback: bool = True):
+                   fallback: bool = True, spec=None, use_subtasks: bool = False,
+                   redecompose: bool = False):
     """Replay the task's compiled script if one exists (AUTO), else author + validate + commit.
 
     With `fallback` (default), a broken golden-script replay archives the script and
     re-authors the task with the agent instead of failing the run — the app changed, so the
     recording is stale by definition. `--no-fallback` keeps the failure as the result.
+
+    With `use_subtasks`, the two expensive paths — authoring a new task and repairing a
+    broken replay — go through the hybrid subtask engine (pipeline/hybrid.py) instead of a
+    whole-task agent run: recorded subtasks replay from the shared library, the LLM fills
+    only the gaps, and a passing run stitches back into a whole-task golden script. The
+    whole-task replay fast path is unchanged either way.
     """
     if not auto:
         result = await runner.run(task, max_steps=90, success_marker=marker)
@@ -212,7 +219,8 @@ async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: s
         # a half-filled form, and only a whole run can pass the ground-truth gate honestly.
         build_report(result)
         print(f"[*] task {tid}: replay FAILED ({result.final_result}) -> archiving script "
-              f"and re-authoring with the agent")
+              f"and re-authoring with the "
+              f"{'hybrid subtask engine' if use_subtasks else 'agent'}")
         archived = ts.archive_script(tid)
         for path in archived:
             print(f"[*] task {tid}: archived {path}")
@@ -222,8 +230,15 @@ async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: s
             reauthor_count=ts.load_manifest().get(tid, {}).get("reauthor_count", 0) + 1,
         )
         await _reset_app_state(runner)
-        result = await _author_and_commit(runner, task, tid, marker)
-        result.mode = "replay_failed->authored"
+        if use_subtasks:
+            from automation.pipeline.hybrid import run_hybrid_task
+
+            result = await run_hybrid_task(runner, task, spec=spec, marker=marker,
+                                           redecompose=redecompose)
+            result.mode = "replay_failed->hybrid"
+        else:
+            result = await _author_and_commit(runner, task, tid, marker)
+            result.mode = "replay_failed->authored"
         return result
 
     # No exact script: before paying for a full agent authoring run, try adapting a recorded
@@ -236,6 +251,11 @@ async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: s
             adapted.mode = "adapted"
             return adapted
 
+    if use_subtasks:
+        from automation.pipeline.hybrid import run_hybrid_task
+
+        return await run_hybrid_task(runner, task, spec=spec, marker=marker,
+                                     fresh=fresh, redecompose=redecompose)
     return await _author_and_commit(runner, task, tid, marker)
 
 
@@ -283,11 +303,14 @@ async def _author_and_commit(runner: Runner, task: str, tid: str, marker: str):
 
 
 async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | None = None,
-               fallback: bool = True) -> bool:
+               fallback: bool = True, use_subtasks: bool | None = None,
+               redecompose: bool = False) -> bool:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
     config.ensure_dirs()
     _kill_stale_browser(config.cdp_port)
+    if use_subtasks is None:
+        use_subtasks = config.use_subtasks
 
     try:
         spec = resolve_task(task_raw)
@@ -325,7 +348,8 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
             )
 
             result = await run_task(runner, task, auto, fresh, success_marker,
-                                    fallback=fallback)
+                                    fallback=fallback, spec=spec,
+                                    use_subtasks=use_subtasks, redecompose=redecompose)
             checks = asserts.apply(result, asserts.merge_spec(asserts.DEFAULT_SPEC,
                                                               spec.assertions))
             paths = build_report(result)
@@ -335,6 +359,14 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
             print(result.summary())
             if result.mode:
                 print(f"   mode: {result.mode}")
+            if result.subtasks:
+                print("   subtasks:")
+                for s in result.subtasks:
+                    status = "ok" if s.get("ok") else "FAIL"
+                    print(f"     {s['index']:>2}. {status:<5} {s.get('mode') or '—':<26} "
+                          f"{s.get('steps_executed', 0):>3} steps "
+                          f"{s.get('duration_seconds', 0):>6}s  "
+                          f"{(s.get('prompt') or '')[:60]}")
             if checks:
                 failed = [c for c in checks if c.passed is False]
                 print(f"   assertions: {'FAIL' if failed else 'pass'} "
@@ -364,13 +396,16 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
 
 
 async def main_suite(selector: str, auto: bool, fresh: bool, fallback: bool,
-                     continue_on_failure: bool) -> bool:
+                     continue_on_failure: bool, use_subtasks: bool | None = None,
+                     redecompose: bool = False) -> bool:
     """Run a set of tasks on ONE login/browser and write a suite-level report.
     Returns the CI verdict: every task PASS with assertions passing."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
     config.ensure_dirs()
     _kill_stale_browser(config.cdp_port)
+    if use_subtasks is None:
+        use_subtasks = config.use_subtasks
 
     try:
         specs = select_tasks(selector)
@@ -399,7 +434,8 @@ async def main_suite(selector: str, auto: bool, fresh: bool, fallback: bool,
 
             async def run_one(spec):
                 return await run_task(runner, spec.prompt, auto, fresh, spec.marker,
-                                      fallback=fallback)
+                                      fallback=fallback, spec=spec,
+                                      use_subtasks=use_subtasks, redecompose=redecompose)
 
             async def reset():
                 await _reset_app_state(runner)
@@ -461,14 +497,23 @@ def cli() -> None:
     parser.add_argument("--marker", default=os.getenv("SUCCESS_MARKER", "").strip() or None,
                         help="Success marker URL fragment; pass 'none' to disable the "
                              "network ground-truth gate (read-only tasks are auto-detected).")
+    parser.add_argument("--subtasks", action=argparse.BooleanOptionalAction, default=None,
+                        help="Author/repair through the hybrid subtask engine: replay "
+                             "recorded subtasks from the shared library, LLM only for the "
+                             "gaps (default: SUBTASKS env var, else on).")
+    parser.add_argument("--redecompose", action="store_true",
+                        help="Regenerate the task's cached subtask decomposition "
+                             "(the cache is otherwise immutable per prompt).")
     args = parser.parse_args()
 
     if args.suite:
         ok = asyncio.run(main_suite(args.suite, args.auto, args.fresh, args.fallback,
-                                    args.continue_on_failure))
+                                    args.continue_on_failure, use_subtasks=args.subtasks,
+                                    redecompose=args.redecompose))
     else:
         ok = asyncio.run(main(args.task, args.auto, args.fresh, args.marker,
-                              fallback=args.fallback))
+                              fallback=args.fallback, use_subtasks=args.subtasks,
+                              redecompose=args.redecompose))
     raise SystemExit(0 if ok else 1)
 
 

@@ -309,6 +309,9 @@ def _render_html(result: "RunResult") -> str:
                  " Agent Final Findings</div>"
                  f"<div class='result-box'>{findings}</div></div>")
 
+    # ---- Hybrid subtask segments (pipeline/hybrid.py) ----
+    p.append(_render_subtasks(getattr(result, "subtasks", None)))
+
     # ---- Ground-truth network check (did the record actually get saved?) ----
     p.append(_render_ground_truth(result.ground_truth))
 
@@ -395,6 +398,45 @@ def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
     elif not seen:
         p.append("<div class='obs-reason'>No matching create-write was sent during this run.</div>")
     p.append("</div></div></div>")
+    return "".join(p)
+
+
+def _render_subtasks(subtasks: list[dict[str, Any]] | None) -> str:
+    """Render a hybrid run's per-segment outcomes: one row per subtask with its mode
+    (library replay vs agent-authored), gate verdict, and cost."""
+    if not subtasks:
+        return ""
+    replayed = sum(1 for s in subtasks if s.get("mode") == "replay")
+    p: list[str] = []
+    p.append("<div class='section'><div class='section-title'>"
+             "<span class='material-icons' style='color:var(--primary)'>account_tree</span>"
+             f" Subtasks ({replayed} replayed / {len(subtasks) - replayed} authored)"
+             "</div><div class='obs-list'>")
+    for s in subtasks:
+        ok = s.get("ok")
+        if ok:
+            icon, color, label, badge = ("check", "var(--success)", "OK",
+                                         "background:var(--success);color:#fff")
+        else:
+            icon, color, label, badge = ("close", "var(--error)", "FAIL",
+                                         "background:var(--error);color:#fff")
+        gate = s.get("gate") or {}
+        detail = (f"{s.get('mode')} · {s.get('steps_executed', 0)} steps · "
+                  f"{s.get('duration_seconds', 0)}s · gate: {gate.get('kind', '—')}")
+        if s.get("tokens"):
+            detail += f" · {s['tokens']:,} tokens"
+        if s.get("healed_steps"):
+            detail += f" · healed {s['healed_steps']}"
+        p.append("<div class='obs-row'><div class='obs-head'>"
+                 f"<span class='material-icons' style='color:{color}'>{icon}</span>"
+                 f"<span class='obs-title'>{s.get('index')}. "
+                 f"{_esc((s.get('prompt') or '')[:120])}<br>"
+                 f"<span style='color:var(--text-muted)'>{_esc(detail)}</span></span>"
+                 f"<span class='badge' style='{badge}'>{label}</span></div>")
+        if s.get("error"):
+            p.append(f"<div class='obs-reason'><code>{_esc(str(s['error'])[:300])}</code></div>")
+        p.append("</div>")
+    p.append("</div></div>")
     return "".join(p)
 
 
