@@ -1,6 +1,5 @@
 """subtask_store tests: context normalization, identity, archive/meta/manifest round-trips.
-Library paths are module constants, so tests monkeypatch them onto tmp_path (the same
-pattern as test_task_store)."""
+Library paths are module constants, so tests monkeypatch them onto tmp_path."""
 import json
 
 import pytest
@@ -43,6 +42,18 @@ def test_subtask_id_stable_across_whitespace_and_case():
     b = ss.subtask_id("select {{business}} business", "/bookkeeping")
     assert a == b
     assert len(a) == 16
+
+
+def test_subtask_id_ignores_token_names_and_trailing_punctuation():
+    """Two decompositions of different parent tasks must converge on ONE library entry
+    even when the LLM named the token differently or cut the span before/after a '.'."""
+    a = ss.subtask_id("go to Bookkeeping module, search and select {{business}} "
+                      "business name", "/admin")
+    b = ss.subtask_id("go to Bookkeeping module, search and select {{business_name}} "
+                      "business name.", "/admin")
+    assert a == b
+    # But different wording (a different navigation target) stays a different entry.
+    assert a != ss.subtask_id("go to Bookkeeping module and select {{business}}", "/admin")
 
 
 def test_subtask_id_context_sensitive():

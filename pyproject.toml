@@ -24,6 +24,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Import `automation` from the repo root directly: iCloud (Desktop sync) keeps setting
+# the macOS UF_HIDDEN flag on the venv's editable-install .pth, and Python >= 3.11
+# silently skips hidden .pth files, which breaks collection with ModuleNotFoundError.
+pythonpath = ["."]
 
 [build-system]
 requires = ["hatchling"]

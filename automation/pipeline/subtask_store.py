@@ -1,14 +1,17 @@
-"""Subtask identity + the shared subtask library.
+"""Task/subtask identity + the shared subtask library.
 
-The library is the subtask-granularity twin of task_store's recordings/: one entry per
-(parameterized subtask prompt, starting page context) pair, shared GLOBALLY across parent
-tasks — the "select {{business}} business" prefix every task starts with is ONE entry here,
-authored once and replayed everywhere.
+The library holds one entry per (parameterized subtask prompt, starting page context) pair,
+shared GLOBALLY across parent tasks — the "select {{business}} business" prefix every task
+starts with is ONE entry here, authored once and replayed everywhere. It is the only
+recording store: there is no whole-task script tier above it.
 
 Identity: `subtask_id(template_prompt, context)` hashes the TOKENIZED prompt (values lifted
 into {{param}} tokens), so "add invoice for customer Suresh Gopi" and "... for customer Mr
 Jones" resolve to the same entry; the `context` half is the normalized URL the page is on
 when the subtask starts, disambiguating same-worded subtasks that begin on different pages.
+
+`task_id(prompt)` is the coarser twin: a stable hash of a PARENT task prompt, used to key its
+cached decomposition and to label runs.
 
 Layout (LIBRARY_DIR):
   {sid}.steps.json      compiled segment steps (concrete values from the authoring run)
@@ -18,9 +21,9 @@ Layout (LIBRARY_DIR):
                         so ~100k replays/day don't serialize on one atomically-rewritten file
   manifest.json         identity registry (template_prompt, params, context, end_context...),
                         written only when an entry is created or archived
-  archive/              retired entries, timestamped (same scheme as task_store)
+  archive/              retired entries, timestamped
 
-DECOMPOSITIONS_DIR holds one cached decomposition per PARENT prompt hash (task_store.task_id).
+DECOMPOSITIONS_DIR holds one cached decomposition per PARENT prompt hash (task_id).
 """
 from __future__ import annotations
 
@@ -42,6 +45,13 @@ _VOLATILE_SEGMENT = re.compile(
     r"^(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,})$",
     re.IGNORECASE,
 )
+
+# {{param}} tokens in a template prompt — the ONE definition of the decomposer's token
+# grammar (decompose.py reuses it; group 1 is the token name). Token NAMES are erased
+# from library identity: the LLM decomposer names tokens freely ({{business}} one run,
+# {{business_name}} the next), and a name difference must not split two identically-worded
+# subtasks into separate library entries.
+TOKEN_RE = re.compile(r"\{\{([a-z][a-z0-9_]*)\}\}")
 
 
 def normalize_context(url: str) -> str:
@@ -73,9 +83,27 @@ def normalize_context(url: str) -> str:
     return norm
 
 
+def task_id(prompt: str) -> str:
+    """Stable short id for a PARENT task prompt (whitespace/case-insensitive).
+
+    Keys the cached decomposition (decompositions/<tid>.json) and labels runs. Identity is
+    the ORIGINAL user prompt, so editing a task's wording by even one word gives it a new id
+    and orphans its cached decomposition — see tests/test_tasks.py::test_task_ids_stable.
+    """
+    norm = " ".join(prompt.split()).lower()
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+
 def subtask_id(template_prompt: str, context: str) -> str:
-    """Stable short id for a (tokenized subtask prompt, starting context) pair."""
+    """Stable short id for a (tokenized subtask prompt, starting context) pair.
+
+    Normalized hard so decompositions of DIFFERENT parent tasks converge on one entry:
+    whitespace collapsed, lowercased, token names erased ({{business}} == {{business_name}}
+    — wording carries the identity, not what the LLM called the slot), and trailing
+    punctuation dropped (where the decomposer cuts a span decides whether it ends in '.').
+    """
     norm = " ".join(template_prompt.split()).lower()
+    norm = TOKEN_RE.sub("{{*}}", norm).rstrip(" .,;")
     return hashlib.sha256(f"{norm}\n{context}".encode("utf-8")).hexdigest()[:16]
 
 

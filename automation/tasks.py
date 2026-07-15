@@ -5,9 +5,11 @@ Adding a task is ONE entry in `TASKS`. The `marker` is the network ground-truth 
 read-only (the gate is disabled). `assertions` holds per-task overrides for the assertion
 engine (see pipeline/assertions.py); `tags` group tasks for suite selection (`tag:sales`).
 
-CRITICAL: prompts are identity. task_store.task_id hashes the prompt to find a task's golden
-script, so editing a prompt's text (even whitespace is normalized, but words are not) orphans
-its recording. tests/test_tasks.py pins every prompt's task id for exactly this reason.
+CRITICAL: prompts are identity. subtask_store.task_id hashes the prompt to key the task's
+cached subtask decomposition, so editing a prompt's text (whitespace is normalized, words are
+not) orphans that cache and forces a fresh LLM decomposition — which may cut the task into
+different subtasks and so miss the library entries the old split used.
+tests/test_tasks.py pins every prompt's task id for exactly this reason.
 """
 from __future__ import annotations
 
@@ -39,8 +41,10 @@ class TaskSpec:
     marker: str | None = None          # ground-truth URL fragment; None = read-only task
     assertions: dict[str, Any] | None = None  # per-task assertion overrides; None = defaults
     tags: tuple[str, ...] = ()
-    # Explicit subtask decomposition for the hybrid engine; None = LLM decomposition
-    # (computed once per prompt and cached under decompositions/<tid>.json).
+    # Escape-hatch override for the hybrid engine; normally None — subtask decomposition
+    # is the LLM decomposer's job (computed once per prompt, cached under
+    # decompositions/<tid>.json, regenerable with --redecompose). Declare subtasks here
+    # only when the decomposer keeps splitting a specific task wrongly.
     subtasks: tuple[SubtaskDecl, ...] | None = None
 
 
@@ -54,29 +58,10 @@ TASKS: dict[str, TaskSpec] = {t.key: t for t in (
         prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section,select sales,go to Invoices,add invoice,select a customer Suresh Gopi,select an item bike, set product description 'buying a new bike', set Qty 5, Unit price 500 and click on save""",
         marker="Invoices",
         tags=("sales",),
-        # Reference explicit decomposition for the hybrid subtask engine. The tokenized
-        # prompts are shared library identities: every task starting with the same
-        # business-selection / navigation subtasks reuses the SAME recordings.
-        subtasks=(
-            SubtaskDecl(
-                prompt="go to Bookkeeping module, search and select {{business}} business name",
-                values={"business": "290 CREW LIMITED"},
-            ),
-            SubtaskDecl(prompt="go to inputs section, select sales, go to Invoices"),
-            SubtaskDecl(
-                prompt="add invoice: select a customer {{customer}}, select an item "
-                       "{{item}}, set product description '{{product_description}}', "
-                       "set Qty {{qty}}, Unit price {{unit_price}} and click on save",
-                values={"customer": "Suresh Gopi", "item": "bike",
-                        "product_description": "buying a new bike",
-                        "qty": "5", "unit_price": "500"},
-                marker="Invoices",
-            ),
-        ),
     ),
     TaskSpec(
         key="credit_notes",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to inputs section,select sales,go to Credit Notes,add credit note,select any customer,select any invoice ref from the dropdown, and click on save.""",
+        prompt="""go to Bookkeeping module, search and select MAK NOTTINGHAM LTD business name. Go to inputs section,select sales,go to Credit Notes,add credit note,select any customer,select any invoice ref from the dropdown, and click on save.""",
         marker="Refunds",  # sales credit notes are committed via the /Refunds endpoint
         tags=("sales",),
     ),

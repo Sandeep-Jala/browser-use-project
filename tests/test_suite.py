@@ -28,7 +28,7 @@ def _result(tmp_path, key, *, successful=True, done=True, with_5xx=False, mode="
                            "healed": {"tag": "button", "attrs": {}}} for s in healed]}
     return RunResult(
         task=key, run_id=f"run_{key}", artifacts_dir=tmp_path / f"run_{key}",
-        expanded_task=None, is_done=done, is_successful=successful,
+        is_done=done, is_successful=successful,
         has_errors=not successful, final_result=f"{key} finished", urls=[], n_steps=3,
         duration_seconds=2.0, extracted_content=[], model_actions=[], errors=[],
         collector_results={"network": {"summary": {}, "requests": requests},

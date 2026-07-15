@@ -7,7 +7,7 @@ cross-task reuse is decided.
 
 Resolution order (get_decomposition):
   1. spec.subtasks declared in the task registry  -> build directly, cache canonically
-  2. exact cache hit: decompositions/<task_id(prompt)>.json
+  2. exact cache hit: decompositions/<subtask_store.task_id(prompt)>.json
   3. derived match (deterministic, NO LLM): a cached decomposition whose parent prompt equals
      this prompt with only values swapped is re-instantiated with the new values — "same task,
      different customer/qty" reuses the SAME library entries at zero token cost
@@ -19,7 +19,6 @@ The cache is immutable per prompt hash; --redecompose regenerates it.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -27,13 +26,14 @@ from typing import Any
 from browser_use.llm.messages import SystemMessage, UserMessage
 
 from automation.pipeline import subtask_store as sstore
-from automation.pipeline import task_store as ts
 from automation.pipeline.adapt import _parse_json_reply, _template_regex
 from automation.pipeline.prompts import DECOMPOSE_SYSTEM_PROMPT
 
 logger = logging.getLogger("framework.decompose")
 
-_TOKEN = re.compile(r"\{\{([a-z][a-z0-9_]*)\}\}")
+# The token grammar is owned by subtask_store (library identity depends on it) — one
+# definition, so the decomposer and the id normalizer can never drift apart.
+_TOKEN = sstore.TOKEN_RE
 MAX_SUBTASKS = 15
 
 
@@ -217,7 +217,7 @@ async def get_decomposition(
     """
     if marker is None and spec is not None:
         marker = getattr(spec, "marker", None)
-    tid = ts.task_id(prompt)
+    tid = sstore.task_id(prompt)
 
     # Tier 1: explicit declaration on the TaskSpec.
     declared = getattr(spec, "subtasks", None) if spec is not None else None

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from automation.pipeline import assertions as asr
-from automation.pipeline import task_store as ts
+from automation.pipeline import subtask_store as sstore
 from automation.pipeline.report import build_report, build_suite_report
 from automation.tasks import TaskSpec
 
@@ -38,9 +38,10 @@ class TaskRecord:
     tid: str
     status: str                       # PASS | DONE | FAIL | ERROR | SKIPPED
     assertions_ok: bool | None = None  # None = none evaluated; False turns a PASS into PASS*
-    mode: str | None = None           # replay | adapted | authored | replay_failed->authored
+    mode: str | None = None           # always "hybrid" (the only execution path)
     duration_seconds: float = 0.0
     healed_steps: list[int] = field(default_factory=list)
+    # True when a stale library recording had to be re-authored by the agent mid-run.
     reauthored: bool = False
     assertions: dict[str, Any] = field(default_factory=dict)  # {passed, failed, skipped, failed_names}
     run_id: str | None = None
@@ -74,12 +75,14 @@ def _record_from_result(spec: TaskSpec, result: Any, suite_dir: Path,
     html_path = report_paths.get("html")
     subtasks = getattr(result, "subtasks", None)
     return TaskRecord(
-        key=spec.key, tid=ts.task_id(spec.prompt), status=status,
+        key=spec.key, tid=sstore.task_id(spec.prompt), status=status,
         assertions_ok=result.assertions_passed,
         mode=result.mode,
         duration_seconds=round(result.duration_seconds, 1),
         healed_steps=sorted({e["step"] for e in replay_log if e.get("healed")}),
-        reauthored=result.mode in ("replay_failed->authored", "replay_failed->hybrid"),
+        # Re-authoring is now per-SEGMENT: a task counts as re-authored when any subtask's
+        # library replay broke and the agent had to take it over.
+        reauthored=any(s.get("mode") == "replay_failed->authored" for s in subtasks or []),
         subtask_modes=[s.get("mode") for s in subtasks] if subtasks else None,
         library_hits=(sum(1 for s in subtasks if s.get("mode") == "replay")
                       if subtasks else None),
@@ -129,7 +132,7 @@ async def run_suite(
             record = _record_from_result(spec, result, suite_dir, report_paths)
         except Exception as exc:  # noqa: BLE001 - one broken task must not sink the suite
             logger.exception("task %s errored: %s", spec.key, exc)
-            record = TaskRecord(spec.key, ts.task_id(spec.prompt), "ERROR",
+            record = TaskRecord(spec.key, sstore.task_id(spec.prompt), "ERROR",
                                 error=f"{type(exc).__name__}: {exc}")
             if browser_alive is not None and not await browser_alive():
                 abort_reason = f"browser gone after task '{spec.key}'"
@@ -141,7 +144,7 @@ async def run_suite(
             remaining = specs[i + 1:]
             reason = abort_reason or "continue-on-failure disabled"
             for skipped in remaining:
-                records.append(TaskRecord(skipped.key, ts.task_id(skipped.prompt),
+                records.append(TaskRecord(skipped.key, sstore.task_id(skipped.prompt),
                                           "SKIPPED", error=reason))
             if remaining:
                 print(f"----- skipping {len(remaining)} remaining task(s): {reason}")

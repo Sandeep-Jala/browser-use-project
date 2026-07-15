@@ -137,7 +137,7 @@ def _synthetic_result(tmp_path: Path):
     from automation.pipeline.runner import RunResult
     return RunResult(
         task="synthetic", run_id="test_run", artifacts_dir=tmp_path,
-        expanded_task=None, is_done=True, is_successful=True, has_errors=False,
+        is_done=True, is_successful=True, has_errors=False,
         final_result="done", urls=[], n_steps=3, duration_seconds=1.2,
         extracted_content=[], model_actions=[], errors=[],
         collector_results=_collected(

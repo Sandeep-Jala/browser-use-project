@@ -81,19 +81,13 @@ class Config:
     # Cap on how many past steps the agent keeps in context (None = unlimited). Cuts per-step
     # tokens (the resent history grows each step). browser-use requires None or > 5.
     max_history_items: int | None
-    # browser-use's plan_update layer: the model re-emits its full plan in every step's output.
-    # With EXPAND_PROMPT=true the expanded numbered task is already resent every step, so this
-    # is largely redundant token weight — set ENABLE_PLANNING=false to A/B it off.
+    # browser-use's plan_update layer: the model re-emits its full plan in every step's
+    # output. Set ENABLE_PLANNING=false to A/B off its token weight.
     enable_planning: bool
-    # Prompt expansion: rewrite the task into step-by-step instructions before running.
-    expand_prompt: bool
+    # Model for the subtask decomposer, the end-of-run judge, and adapt.parameterize.
     expander_model: str
-    # Hybrid subtask engine (pipeline/hybrid.py): author/repair tasks subtask-by-subtask
-    # against the shared library instead of one whole-task agent run. Default ON;
-    # SUBTASKS=false or --no-subtasks falls back to whole-task authoring per run.
-    use_subtasks: bool
-    # Agent step budget for ONE subtask segment (whole-task authoring uses 90; a subtask is
-    # ~a tenth of a task, so 25 leaves room to recover from missteps without runaway cost).
+    # Agent step budget for ONE subtask segment: a subtask is ~a tenth of a task, so 25
+    # leaves room to recover from missteps without runaway cost.
     subtask_max_steps: int
 
     @classmethod
@@ -122,9 +116,7 @@ class Config:
             artifacts_dir=Path(os.getenv("ARTIFACTS_DIR", "artifacts")),
             max_history_items=_env_history_items("MAX_HISTORY_ITEMS", default=20),
             enable_planning=_env_bool("ENABLE_PLANNING", default=True),
-            expand_prompt=_env_bool("EXPAND_PROMPT", default=True),
             expander_model=os.getenv("EXPANDER_MODEL", DEFAULT_EXPANDER_MODEL),
-            use_subtasks=_env_bool("SUBTASKS", default=True),
             subtask_max_steps=int(os.getenv("SUBTASK_MAX_STEPS", "25")),
         )
 

@@ -12,9 +12,10 @@ torn down between subtasks, so an agent segment starts from the exact DOM state 
 replay left (and vice versa). Segment steps carry no leading goto — the context-keyed library
 lookup guarantees the page is already in the segment's start state.
 
-After a fully-passing hybrid run, the segments are stitched back into a whole-task golden
-script under the parent tid, so the next run of the task takes the cheap whole-task replay
-path (`__main__.run_task` tier 1) instead of re-entering the engine.
+This is the ONLY execution path: there is no whole-task replay tier above it. A task gets
+faster as its subtasks land in the library — and because the library is keyed on (tokenized
+prompt, page context) rather than the parent task, a subtask recorded by one task replays
+inside every other task that shares that wording.
 """
 from __future__ import annotations
 
@@ -30,7 +31,6 @@ from playwright.async_api import Page
 
 from automation.pipeline import adapt
 from automation.pipeline import subtask_store as sstore
-from automation.pipeline import task_store as ts
 from automation.pipeline.decompose import Subtask, get_decomposition
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
@@ -72,6 +72,45 @@ def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Ga
     return Gate(kind="steps")
 
 
+def _describe_expected_end(gate: Gate) -> str | None:
+    """The gate's pass condition in words the agent can act on, or None when the gate has
+    no page-state condition (marker gates verify via verify_save_registered instead, and
+    steps gates have nothing to check). This is what turns the library's recorded outcome
+    into the authoring agent's explicit done-condition."""
+    if gate.kind != "postcondition":
+        return None
+    # Branch order mirrors evaluate_gate exactly, so the condition described to the agent
+    # is always the one the gate will enforce.
+    if gate.postcondition and gate.postcondition.get("url_contains"):
+        return f'the page URL contains "{gate.postcondition["url_contains"]}"'
+    if gate.postcondition and gate.postcondition.get("visible"):
+        return f'the element matching "{gate.postcondition["visible"]}" is visible'
+    if gate.end_context:
+        return (f'the page URL path matches "{gate.end_context}" '
+                f'(lowercased; each "*" stands for a record id)')
+    return None
+
+
+# Postcondition settle window: an SPA can still be re-rendering/navigating when a
+# segment's last step returns, so every page-state check gets a few short re-polls before
+# a miss counts as a failure. (Gate tests shrink the delay to keep the suite fast.)
+_SETTLE_TRIES = 6
+_SETTLE_DELAY = 0.5
+
+
+async def _settled(check: Any, steps_ok: bool) -> bool:
+    """True as soon as the page-state `check` passes, re-polling briefly while it doesn't.
+    A failed-steps segment gets its single honest evaluation (so the gate detail is still
+    recorded) but no settle window — the gate cannot pass anyway."""
+    for i in range(_SETTLE_TRIES):
+        if await check():
+            return True
+        if not steps_ok or i == _SETTLE_TRIES - 1:
+            return False
+        await asyncio.sleep(_SETTLE_DELAY)
+    return False
+
+
 async def evaluate_gate(
     gate: Gate, *, steps_ok: bool, page: Page | None,
     requests_window: list[dict[str, Any]],
@@ -92,24 +131,32 @@ async def evaluate_gate(
     if gate.kind == "postcondition":
         detail: dict[str, Any] = {"kind": "postcondition"}
         ok = steps_ok
+        check = None
         try:
             if gate.postcondition and gate.postcondition.get("url_contains"):
                 frag = str(gate.postcondition["url_contains"]).lower()
-                url = page.url if page is not None else ""
                 detail["url_contains"] = frag
-                ok = ok and frag in url.lower()
+
+                async def check() -> bool:
+                    return page is not None and frag in page.url.lower()
             elif gate.postcondition and gate.postcondition.get("visible"):
                 sel = str(gate.postcondition["visible"])
                 detail["visible"] = sel
-                visible = False
-                if page is not None:
-                    visible = await page.locator(sel).first.is_visible()
-                ok = ok and visible
+
+                async def check() -> bool:
+                    return page is not None and \
+                        await page.locator(sel).first.is_visible()
             elif gate.end_context:
-                current = sstore.normalize_context(page.url if page is not None else "")
                 detail["end_context"] = gate.end_context
-                detail["reached"] = current
-                ok = ok and current == gate.end_context
+
+                async def check() -> bool:
+                    detail["reached"] = sstore.normalize_context(
+                        page.url if page is not None else "")
+                    return detail["reached"] == gate.end_context
+            if check is not None:
+                # No short-circuit on a failed-steps segment: _settled still evaluates
+                # once so the detail (e.g. "reached") lands in the report.
+                ok = await _settled(check, steps_ok) and ok
         except Exception as exc:  # noqa: BLE001 - an unreadable page fails the check honestly
             logger.warning("postcondition check errored: %s", exc)
             detail["error"] = str(exc)
@@ -140,9 +187,6 @@ class Segment:
     error: str | None = None
     replay: dict[str, Any] | None = None
     write_step: int | None = None   # agent-relative step the create-write fired on (rescue)
-    # The concrete steps this segment ran/produced, for stitch-back; None when the segment
-    # has no committable step list (dirty recovery, failed segment).
-    commit_steps: list[dict[str, Any]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -185,7 +229,7 @@ class HybridSession:
 
     def current_page(self) -> Page | None:
         """The single live tab, re-queried each call (agent segments can mutate the page
-        list). Prefers the first non-blank page — the same pick run_script makes."""
+        list). Prefers the first non-blank page, so the page pick stays deterministic."""
         pages = [p for ctx in self.pw_browser.contexts for p in ctx.pages]
         if not pages:
             return None
@@ -226,7 +270,7 @@ class HybridSession:
 
     async def wait_for_inflight_write(self, marker: str) -> None:
         """The final Save's POST can still be in flight when the last step returns; poll the
-        live log briefly so it can land before the gate reads it (same rule as run_script)."""
+        live log briefly so it can land before the gate reads it."""
         for _ in range(16):  # up to ~8s
             if _first_create_write(self.all_requests(), marker) is not None:
                 return
@@ -273,7 +317,7 @@ class HybridSession:
                 "overrode_success": False,
             }
         return RunResult(
-            task=task, run_id=self.run_id, artifacts_dir=self.run_dir, expanded_task=None,
+            task=task, run_id=self.run_id, artifacts_dir=self.run_dir,
             is_done=True, is_successful=None, has_errors=False, final_result=None,
             urls=[], n_steps=0, duration_seconds=duration, extracted_content=[],
             model_actions=[], errors=[], collector_results=collector_results,
@@ -309,8 +353,6 @@ class HybridSession:
         )
         if steps_ok and not seg.ok:
             seg.error = seg.error or f"segment gate failed: {seg.gate}"
-        if seg.ok:
-            seg.commit_steps = steps
         seg.duration_seconds = (datetime.now() - started).total_seconds()
         return seg
 
@@ -324,7 +366,9 @@ class HybridSession:
         started = datetime.now()
         watermark = self.network_watermark()
         prompt = scoped_subtask_prompt(
-            sub.instantiated_prompt, completed, remaining, dirty, prior_failure)
+            sub.instantiated_prompt, completed, remaining, dirty, prior_failure,
+            expected_end=_describe_expected_end(gate),
+            owns_save=gate.kind == "marker")
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
                       context=context, mode="authored")
         try:
@@ -355,7 +399,14 @@ class HybridSession:
         )
         seg.write_step = seg.gate.get("write_step")
         if not seg.ok:
-            seg.error = history.final_result() or f"segment gate failed: {seg.gate}"
+            if steps_ok:
+                # The agent believed it succeeded but the gate disagreed: surface the gate
+                # verdict, not the agent's happy final text.
+                seg.error = (f"gate failed: {seg.gate} "
+                             f"(agent claimed success: {history.final_result()!r})")
+            else:
+                seg.error = history.final_result() or f"segment gate failed: {seg.gate}"
+        seg.duration_seconds = (datetime.now() - started).total_seconds()
         return seg
 
 
@@ -421,7 +472,7 @@ async def _save_segment_template(sid: str, prompt: str, steps: list[dict[str, An
 def _promote_segment_heals(sid: str, seg: Segment, *, from_template: bool) -> None:
     """Persist a PASSED replay's healings into the library entry. Skipped for
     template-instantiated replays (v1): the healed selectors would carry concrete values
-    into the tokenized steps. Concrete entries promote exactly like whole-task scripts."""
+    into the tokenized steps. Concrete entries promote their healed selectors as-is."""
     if from_template or not seg.healed_steps:
         return
     try:
@@ -477,45 +528,36 @@ async def _author_segment(
             context=context, end_context=end_context,
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
-        seg.commit_steps = steps
         logger.info("segment %s: committed %d steps to the library", sid, len(steps))
     except Exception as exc:  # noqa: BLE001 - compile failure must not fail a passed segment
         logger.exception("segment %s compile/commit error: %s", sid, exc)
     return seg
 
 
-# ------------------------------- stitch-back -------------------------------
-
-
-def stitch_and_commit(tid: str, task: str, segments: list[Segment],
-                      start_url: str | None) -> list[dict[str, Any]] | None:
-    """Concatenate a fully-passing hybrid run's concrete segment steps into a whole-task
-    golden script under the parent tid, so the next run takes the cheap whole-task replay
-    path. Requires every segment to carry committable steps (a dirty recovery breaks the
-    chain — its steps don't start from the segment's context). Returns the stitched steps
-    or None if stitching wasn't possible."""
-    if not segments or any(s.commit_steps is None for s in segments):
-        return None
-    stitched: list[dict[str, Any]] = []
-    if start_url and start_url.startswith("http"):
-        stitched.append({"action": "goto", "url": start_url})
-    for s in segments:
-        stitched.extend(s.commit_steps or [])
-    from automation.pipeline.script_compile import _atomic_write
-
-    _atomic_write(ts.steps_path(tid), json.dumps(stitched, indent=2))
-    ts.update_manifest(tid, task, steps=len(stitched), stitched_from_hybrid=True)
-    logger.info("task %s: stitched %d segments into a %d-step golden script",
-                tid, len(segments), len(stitched))
-    return stitched
-
-
 # ------------------------------- the hybrid loop -------------------------------
+
+
+def reauthor_match(reauthor: str | None, sub: Subtask) -> bool:
+    """True when --reauthor names this subtask. `reauthor` is a comma-list mixing subtask
+    indexes ("3") and case-insensitive prompt substrings ("add estimate"); either the
+    template or the instantiated wording can match."""
+    if not reauthor:
+        return False
+    for token in (t.strip().lower() for t in reauthor.split(",")):
+        if not token:
+            continue
+        if token.isdigit():
+            if int(token) == sub.index:
+                return True
+        elif token in sub.template_prompt.lower() \
+                or token in sub.instantiated_prompt.lower():
+            return True
+    return False
 
 
 async def run_hybrid_task(
     runner: Runner, task: str, spec: Any = None, marker: str | None = None, *,
-    fresh: bool = False, redecompose: bool = False, stitch: bool = True,
+    fresh: bool = False, redecompose: bool = False, reauthor: str | None = None,
 ) -> RunResult:
     """Execute `task` subtask-by-subtask: replay what the library knows, author the rest.
 
@@ -527,12 +569,11 @@ async def run_hybrid_task(
     Task verdict = every segment ok AND (when the parent has a marker) the create-write seen
     anywhere in the whole run's network log — the parent gate's semantics are unchanged.
     """
-    tid = ts.task_id(task)
+    tid = sstore.task_id(task)
     subtasks = await get_decomposition(task, llm=runner.expander_llm, spec=spec,
                                        marker=marker, redecompose=redecompose)
     logger.info("▶ HYBRID %s: %d subtask(s)", tid, len(subtasks))
     hs = await HybridSession.open(runner)
-    start_url = await hs.current_url()
     segments: list[Segment] = []
     completed: list[str] = []
     try:
@@ -543,8 +584,9 @@ async def run_hybrid_task(
             gate = segment_gate(sub, entry, context)
             remaining = [s.instantiated_prompt for s in subtasks[i + 1:]]
             seg: Segment | None = None
+            force_author = reauthor_match(reauthor, sub)
 
-            if not fresh and sstore.has_script(sid):
+            if not fresh and not force_author and sstore.has_script(sid):
                 steps = instantiate_library_entry(sid, sub)
                 if steps is not None:
                     print(f"[*] subtask {i} [{sid}]: library hit -> replay "
@@ -574,7 +616,12 @@ async def run_hybrid_task(
                           f"resolve -> authoring")
 
             if seg is None:
-                if not sstore.has_script(sid):
+                if force_author and sstore.has_script(sid):
+                    # The existing entry stays as the gate's end_context reference and is
+                    # only overwritten if the fresh authoring passes its gate.
+                    print(f"[*] subtask {i} [{sid}]: --reauthor -> authoring with the "
+                          f"agent (entry replaced only on success)")
+                elif not sstore.has_script(sid):
                     print(f"[*] subtask {i} [{sid}]: no library entry -> authoring "
                           f"with the agent")
                 seg = await _author_segment(hs, sub, sid, context, gate,
@@ -612,28 +659,6 @@ async def run_hybrid_task(
         + ("" if all_ok else f" — FAILED at subtask {len(segments) - 1}")
     )
 
-    if stitch and result.is_successful:
-        try:
-            stitched = stitch_and_commit(tid, task, segments, start_url)
-            if stitched is not None:
-                await _save_whole_task_template(tid, task, stitched, runner.expander_llm)
-        except Exception as exc:  # noqa: BLE001 - stitching is a bonus, not a requirement
-            logger.warning("stitch-back failed for %s: %s", tid, exc)
-
     logger.info("◀ HYBRID done %s: success=%s %s", tid, result.is_successful,
                 result.final_result)
     return result
-
-
-async def _save_whole_task_template(tid: str, task: str, steps: list[dict[str, Any]],
-                                    llm: Any) -> None:
-    """Parameterize a stitched whole-task script so the existing template-adaptation tier
-    keeps working on it (the stitched twin of __main__._save_template)."""
-    try:
-        template = await adapt.parameterize(task, steps, llm)
-        if not template:
-            return
-        adapt.save_template(ts.template_path(tid), template)
-        ts.update_manifest(tid, task, params=template["params"])
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("could not save stitched template for %s: %s", tid, exc)

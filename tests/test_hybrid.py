@@ -1,4 +1,4 @@
-"""hybrid engine tests: the subtask loop, gates, commit rules, and stitch-back.
+"""hybrid engine tests: the subtask loop, gates, and library commit rules.
 
 The browser-facing surface (HybridSession) is faked — the same injected-seam style as
 test_suite — while the loop, the library commit rules (_author_segment), and the gate
@@ -10,10 +10,9 @@ import pytest
 
 from automation.pipeline import hybrid
 from automation.pipeline import subtask_store as ss
-from automation.pipeline import task_store as ts
 from automation.pipeline.decompose import Subtask
-from automation.pipeline.hybrid import (Gate, Segment, evaluate_gate, run_hybrid_task,
-                                        segment_gate, stitch_and_commit)
+from automation.pipeline.hybrid import (Gate, Segment, evaluate_gate, reauthor_match,
+                                        run_hybrid_task, segment_gate)
 from automation.pipeline.runner import RunResult
 from automation.tasks import SubtaskDecl, TaskSpec
 
@@ -23,10 +22,7 @@ def stores(tmp_path, monkeypatch):
     monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path / "library")
     monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "library" / "manifest.json")
     monkeypatch.setattr(ss, "DECOMPOSITIONS_DIR", tmp_path / "decompositions")
-    monkeypatch.setattr(ts, "RECORDINGS_DIR", tmp_path / "recordings")
-    monkeypatch.setattr(ts, "MANIFEST_PATH", tmp_path / "recordings" / "manifest.json")
     (tmp_path / "library").mkdir()
-    (tmp_path / "recordings").mkdir()
     return tmp_path
 
 
@@ -50,7 +46,7 @@ FAKE_RECORDING = {"history": [{
 
 def _skeleton_result(ground_truth=None):
     return RunResult(
-        task=PROMPT, run_id="test", artifacts_dir=".", expanded_task=None, is_done=True,
+        task=PROMPT, run_id="test", artifacts_dir=".", is_done=True,
         is_successful=None, has_errors=False, final_result=None, urls=[], n_steps=0,
         duration_seconds=0.0, extracted_content=[], model_actions=[], errors=[],
         ground_truth=ground_truth,
@@ -85,8 +81,6 @@ class FakeSession:
         seg = self.replays.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
         seg.prompt = sub.instantiated_prompt
-        if seg.ok:
-            seg.commit_steps = steps
         return seg
 
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
@@ -141,7 +135,7 @@ async def test_all_segments_authored_then_committed(stores, monkeypatch):
     fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
                                           _seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert fake.agent_calls == 2 and fake.replay_calls == 0
     assert result.mode == "hybrid"
@@ -167,7 +161,7 @@ async def test_library_hit_replays_without_agent(stores, monkeypatch):
 
     fake = FakeSession(_runner(), replays=[_seg(True), _seg(True)])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert fake.replay_calls == 2 and fake.agent_calls == 0
     assert result.is_successful is True
@@ -190,7 +184,7 @@ async def test_replay_fail_dirty_recovery_does_not_commit(stores, monkeypatch):
                                            _seg(True)],
                        agents=[_seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert result.is_successful is True
     assert result.subtasks[0]["mode"] == "replay_failed->authored"
@@ -208,7 +202,7 @@ async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
     fake = FakeSession(_runner(), replays=[_seg(False, executed=0, error="no selector")],
                        agents=[_seg(True, mode="authored"), _seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert result.is_successful is True
     # Failed before touching the page -> old entry archived, clean re-author committed.
@@ -218,11 +212,65 @@ async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
         [{"action": "goto", "url": "http://app/section"}]
 
 
+async def test_reauthor_forces_agent_only_for_named_subtask(stores, monkeypatch):
+    """--reauthor: the named subtask goes back through the agent even though its library
+    entry replays fine, and its entry is REPLACED by the fresh recording; the other
+    subtask still replays untouched."""
+    ctx = ss.normalize_context("http://app/section")
+    sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
+    sid1 = ss.subtask_id(SPEC.subtasks[1].prompt, ctx)
+    stale = [{"action": "click", "selectors": ["text=Detour"]},
+             {"action": "click", "selectors": ["text=Back"]}]
+    _seed_entry(sid0, stale)
+    _seed_entry(sid1)
+
+    fake = FakeSession(_runner(), replays=[_seg(True)],
+                       agents=[_seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake, reauthor="0")
+
+    assert result.is_successful is True
+    assert fake.agent_calls == 1 and fake.replay_calls == 1
+    assert result.subtasks[0]["mode"] == "authored"
+    assert result.subtasks[1]["mode"] == "replay"
+    # The stale detour steps were replaced by the fresh recording's compiled steps.
+    assert json.loads(ss.steps_path(sid0).read_text()) == \
+        [{"action": "goto", "url": "http://app/section"}]
+
+
+async def test_reauthor_failure_keeps_old_entry(stores, monkeypatch):
+    """A failed re-author must NOT clobber the working library entry."""
+    ctx = ss.normalize_context("http://app/section")
+    sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
+    stale = [{"action": "click", "selectors": ["text=Works"]}]
+    _seed_entry(sid0, stale)
+
+    fake = FakeSession(_runner(), agents=[_seg(False, error="lost", mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake, reauthor="go to the section")
+
+    assert result.is_successful is False
+    assert json.loads(ss.steps_path(sid0).read_text()) == stale
+
+
+def test_reauthor_match_indexes_and_substrings():
+    sub = Subtask(index=3, template_prompt="add estimate, select customer {{customer}}",
+                  values={"customer": "Mr Jones"})
+    assert reauthor_match("3", sub)
+    assert reauthor_match("0, 3", sub)
+    assert reauthor_match("Add Estimate", sub)
+    assert reauthor_match("mr jones", sub)          # instantiated wording matches too
+    assert not reauthor_match("0,1", sub)
+    assert not reauthor_match("go to invoices", sub)
+    assert not reauthor_match(None, sub)
+    assert not reauthor_match("", sub)
+
+
 async def test_failed_segment_breaks_loop(stores, monkeypatch):
     fake = FakeSession(_runner(), agents=[_seg(False, error="could not", mode="authored"),
                                           _seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert result.is_successful is False
     assert fake.agent_calls == 1          # the second subtask never ran
@@ -236,25 +284,10 @@ async def test_parent_marker_gate_still_required(stores, monkeypatch):
                                           _seg(True, mode="authored")],
                        create_write_seen=False)
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=False)
+    result = await _run(fake)
 
     assert all(s["ok"] for s in result.subtasks)
     assert result.is_successful is False
-
-
-async def test_stitch_back_commits_whole_task_script(stores, monkeypatch):
-    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
-                                          _seg(True, mode="authored")])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await _run(fake, stitch=True)
-
-    assert result.is_successful is True
-    tid = ts.task_id(PROMPT)
-    stitched = json.loads(ts.steps_path(tid).read_text())
-    # Leading goto to the task's start URL + each segment's steps in order.
-    assert stitched[0] == {"action": "goto", "url": "http://app/section"}
-    assert len(stitched) == 3
-    assert ts.load_manifest()[tid]["stitched_from_hybrid"] is True
 
 
 # ------------------------------- unit: gates -------------------------------
@@ -281,7 +314,8 @@ async def test_steps_gate_is_passthrough():
     assert ok is False
 
 
-async def test_url_contains_postcondition():
+async def test_url_contains_postcondition(monkeypatch):
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)  # failing case polls the settle window
     gate = Gate(kind="postcondition", postcondition={"url_contains": "invoices"})
     page = SimpleNamespace(url="http://app/x/Invoices/list")
     ok, _ = await evaluate_gate(gate, steps_ok=True, page=page, requests_window=[])
@@ -291,14 +325,15 @@ async def test_url_contains_postcondition():
     assert ok is False
 
 
-async def test_end_context_postcondition():
+async def test_end_context_postcondition(monkeypatch):
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
     gate = Gate(kind="postcondition", end_context="/x/inputs/sales")
     page = SimpleNamespace(url="http://app/x/inputs/sales?tab=1")
     ok, detail = await evaluate_gate(gate, steps_ok=True, page=page, requests_window=[])
     assert ok is True and detail["reached"] == "/x/inputs/sales"
     page = SimpleNamespace(url="http://app/x/dashboard")
-    ok, _ = await evaluate_gate(gate, steps_ok=True, page=page, requests_window=[])
-    assert ok is False
+    ok, detail = await evaluate_gate(gate, steps_ok=True, page=page, requests_window=[])
+    assert ok is False and detail["reached"] == "/x/dashboard"
 
 
 def test_segment_gate_resolution():
@@ -316,25 +351,3 @@ def test_segment_gate_resolution():
     # Same end context as start (a fill segment) -> steps floor.
     assert segment_gate(sub_plain, {"end_context": "/a"}, "/a").kind == "steps"
     assert segment_gate(sub_plain, None, "/a").kind == "steps"
-
-
-# ------------------------------- unit: stitch-back -------------------------------
-
-
-def test_stitch_requires_every_segment(stores):
-    good = Segment(index=0, sid="a", prompt="p", context="/c", mode="replay", ok=True,
-                   commit_steps=[{"action": "click", "selectors": ["text=X"]}])
-    dirty = Segment(index=1, sid="b", prompt="p2", context="/c", mode="authored", ok=True,
-                    commit_steps=None)  # dirty recovery: not committable
-    assert stitch_and_commit("tid1", "task", [good, dirty], "http://app/start") is None
-    assert not ts.steps_path("tid1").exists()
-
-    good2 = Segment(index=1, sid="b", prompt="p2", context="/c", mode="authored", ok=True,
-                    commit_steps=[{"action": "press", "keys": "Enter"}])
-    stitched = stitch_and_commit("tid1", "task", [good, good2], "http://app/start")
-    assert stitched == [
-        {"action": "goto", "url": "http://app/start"},
-        {"action": "click", "selectors": ["text=X"]},
-        {"action": "press", "keys": "Enter"},
-    ]
-    assert json.loads(ts.steps_path("tid1").read_text()) == stitched

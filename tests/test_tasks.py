@@ -1,19 +1,23 @@
 """Registry identity + selection tests.
 
 The frozen hashes below were computed from the task prompts BEFORE they moved from
-__main__.py into automation/tasks.py. task_store.task_id hashes the prompt to locate a
-task's golden script, so if any of these change, that task's recording is orphaned —
-a failure here means a prompt was edited (even one word), not that the test is stale.
-If a prompt change is intentional, re-author the task and update its hash here.
+__main__.py into automation/tasks.py. subtask_store.task_id hashes the prompt to key the
+task's cached subtask decomposition, so if any of these change, that cache is orphaned and
+the task is re-decomposed — possibly into a different split that misses its library
+entries. A failure here means a prompt was edited (even one word), not that the test is
+stale. If a prompt change is intentional, update its hash here.
 """
 import pytest
 
-from automation.pipeline import task_store as ts
+from automation.pipeline import subtask_store as ss
 from automation.tasks import TASKS, TaskSpec, resolve_task, select_tasks
 
 FROZEN_TIDS = {
     "invoice": "b1e80d296d010bfa",
-    "credit_notes": "85e1c12969229856",
+    # Business switched 290 CREW LIMITED -> MAK NOTTINGHAM LTD (2026-07-15): the former's
+    # invoices were consumed by earlier credit-note runs, so "select any invoice ref" had
+    # nothing to pick.
+    "credit_notes": "ae94840e75ca4c1f",
     "estimates": "a0e85521700c798d",
     "receipt": "e4fbce6bfb7d147f",
     "item": "93f89bb2d795ff03",
@@ -31,7 +35,7 @@ FROZEN_TIDS = {
     "banking": "8f7bc65c2a411131",
     "budget_manager": "3a82e778d765ce63",
     "dividend": "53b429e5f90d0771",
-    "invoice_full_creation": "f8511fac5543467a",
+    "invoice_full_creation": "63fdcdf6b82e770b",
     "crm_create_invoice": "c15b853adfd1c42d",
 }
 
@@ -41,9 +45,9 @@ def test_no_tasks_lost_or_invented():
 
 
 def test_task_ids_stable():
-    drifted = {k: ts.task_id(TASKS[k].prompt)
+    drifted = {k: ss.task_id(TASKS[k].prompt)
                for k in FROZEN_TIDS
-               if ts.task_id(TASKS[k].prompt) != FROZEN_TIDS[k]}
+               if ss.task_id(TASKS[k].prompt) != FROZEN_TIDS[k]}
     assert not drifted, f"prompt text drifted (golden scripts orphaned): {drifted}"
 
 

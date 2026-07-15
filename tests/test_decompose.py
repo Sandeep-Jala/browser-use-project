@@ -6,7 +6,6 @@ import pytest
 
 from automation.pipeline import decompose
 from automation.pipeline import subtask_store as ss
-from automation.pipeline import task_store as ts
 from automation.tasks import SubtaskDecl, TaskSpec
 
 
@@ -69,7 +68,7 @@ async def test_spec_subtasks_win_and_are_cached(library):
     # No subtask declared a marker -> the save defaults to the LAST subtask.
     assert subs[0].marker is None and subs[1].marker == "Invoices"
     # Cached canonically under the parent prompt's tid.
-    cached = ss.load_decomposition(ts.task_id(PROMPT))
+    cached = ss.load_decomposition(ss.task_id(PROMPT))
     assert cached and cached["source"] == "spec"
 
 
@@ -115,7 +114,7 @@ async def test_derived_match_reuses_templates_with_new_values_no_llm(library):
     assert subs[0].values == {"business": "ACME LTD"}
     assert subs[1].values == {"customer": "Mr Jones", "qty": "9"}
     assert subs[1].marker == "Invoices"
-    derived = ss.load_decomposition(ts.task_id(new_prompt))
+    derived = ss.load_decomposition(ss.task_id(new_prompt))
     assert derived and derived["source"].startswith("derived:")
 
 
@@ -155,7 +154,7 @@ async def test_hallucinated_value_rejected_then_fallback(library):
     assert llm.calls == 2  # one retry, then give up
     assert len(subs) == 1  # whole-prompt fallback
     assert subs[0].marker == "Invoices"
-    assert ss.load_decomposition(ts.task_id(PROMPT)) is None  # garbage is never cached
+    assert ss.load_decomposition(ss.task_id(PROMPT)) is None  # garbage is never cached
 
 
 @pytest.mark.asyncio

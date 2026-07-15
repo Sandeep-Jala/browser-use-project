@@ -1,23 +1,15 @@
 """All the prompt text for the framework, in one place.
 
-Two prompts drive the run, each used by a different part of the pipeline:
-  * SPEED_OPTIMIZATION_PROMPT -> appended to the agent's system prompt every step.
-  * EXPAND_SYSTEM_PROMPT      -> the meta-prompt that rewrites a terse task into concrete steps.
+  * SPEED_OPTIMIZATION_PROMPT   -> appended to the agent's system prompt every step.
+  * scoped_subtask_prompt()     -> the task given to the agent for ONE subtask segment.
+  * DECOMPOSE_SYSTEM_PROMPT     -> splits a task into subtasks (pipeline/decompose.py).
+  * PARAMETERIZE_SYSTEM_PROMPT  -> tokenizes a recorded script (pipeline/adapt.py).
 
-These prompts are app-agnostic: they teach the agent/expander GENERAL browser-automation
-tactics (react-select handling, scrolling, escape hatches, verification) rather than a
-hardcoded map of one site, so no per-app navigation map is needed.
-
-`expand_task()` (the only logic here) runs the expander: one LLM call that turns a high-level
-task into an explicit, numbered execution plan.
+These prompts are app-agnostic: they teach the agent GENERAL browser-automation tactics
+(react-select handling, scrolling, escape hatches, verification) rather than a hardcoded map
+of one site, so no per-app navigation map is needed.
 """
 from __future__ import annotations
-
-import logging
-
-from browser_use.llm.messages import SystemMessage, UserMessage
-
-logger = logging.getLogger("framework.prompts")
 
 
 # --- Agent system rules (appended to the agent's system prompt every step) -------------------
@@ -278,6 +270,16 @@ When you click Submit/Send and a validation error appears
     specific dropdown from a PREVIOUS step.
 
 ───────────────────────────────────────────────────────────
+PLACEHOLDER WORDS IN INSTRUCTIONS ("any", "a", "an")
+───────────────────────────────────────────────────────────
+When a task says "select any customer", "select a service", or
+"choose an item":
+  • "any", "a", and "an" are NOT literal names of records.
+  • Do NOT type "any customer" or "a service" into a search box.
+  • Open the dropdown, look at the actual available options, and
+    click one of them.
+
+───────────────────────────────────────────────────────────
 ESCAPE-HATCH TOOLS — Mandatory Decision Tree
 ───────────────────────────────────────────────────────────
 After a required objective FAILS, ask yourself:
@@ -369,36 +371,6 @@ get DIFFERENT names.
 """
 
 
-TEMPLATE_MATCH_SYSTEM_PROMPT = """\
-You match a NEW browser-automation task against recorded TASK TEMPLATES and read the new \
-parameter values out of it. Each template is given as: its id in [brackets], its parameter \
-dictionary (param name -> the value used when it was recorded), and the prompt it was \
-recorded from.
-
-A template matches only if the new task is the SAME PROCEDURE: identical navigation (same \
-module, sections, tabs), the same record type, and the same fields filled the same way — \
-differing ONLY in the parameter values. Any structural difference (different section or tab, \
-a field present in one but not the other, extra or missing actions, a different record type) \
-means NO match. When in doubt, return null; a wrong match wastes a full run.
-
-Output ONLY strict JSON — no prose, no markdown fences:
-  {"match_id": "<id of the matched template>",
-   "values": {"<param>": "<that parameter's value in the NEW task>", ...}}
-or, if no template qualifies:
-  {"match_id": null, "values": {}}
-
-Value rules:
-- "values" must contain EVERY parameter of the matched template. If the new task keeps a \
-value unchanged, repeat the recorded value.
-- Copy each value VERBATIM from the new task's text — no rewording, renumbering, or \
-normalization; these strings are typed into the app exactly as given.
-- The params dict lists EVERYTHING the template can change. If the new task differs from the \
-template's prompt in a value that has NO corresponding parameter (e.g. it names a different \
-customer but the template has no customer param), return null — replaying would silently \
-keep the old value and save a wrong record.\
-"""
-
-
 DECOMPOSE_SYSTEM_PROMPT = """\
 You split a browser-automation task into an ordered list of SUBTASKS for a hybrid \
 record/replay engine. Each subtask is a self-contained UI milestone that starts and ends in \
@@ -416,6 +388,14 @@ Output ONLY strict JSON — no prose, no markdown fences:
 
 Rules:
 - 2 to 15 subtasks, preserving the task's original action order exactly.
+- Cut SHARED PREFIXES identically: many tasks open with the same navigation wording \
+("go to <module>, search and select <business>...", "go to <section>..."). Split that \
+wording into the same standalone subtasks every time — never merge a shared navigation \
+span into a data-entry subtask — so its recording is reused across tasks.
+- Token names are the shortest snake_case ROLE noun: {{business}}, {{customer}}, \
+{{supplier}}, {{item}}, {{qty}}, {{unit_price}}, {{amount}}, {{date}}, {{remarks}}. Use \
+the SAME name for the same role in every task (e.g. always {{business}}, never \
+{{business_name}}).
 - Every literal value in the task (names, numbers, descriptions, references, dates) appears \
 in EXACTLY ONE subtask, replaced by a {{snake_case}} token named for the ROLE it plays \
 (customer, item, qty, unit_price, remarks, ...). Its verbatim value goes in that subtask's \
@@ -435,6 +415,8 @@ def scoped_subtask_prompt(
     remaining: list[str],
     dirty: bool = False,
     prior_failure: str | None = None,
+    expected_end: str | None = None,
+    owns_save: bool = False,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
 
@@ -443,6 +425,11 @@ def scoped_subtask_prompt(
     subtasks are handled separately — so no re-navigation, no redoing, no running ahead.
     With `dirty`, a failed replay already half-executed this subtask and the agent must
     inspect current state and finish/correct it rather than start from scratch.
+
+    Carries the per-action verification discipline inline (segments are not expanded into
+    numbered plans), plus `expected_end` — a concrete done-condition read from the
+    library entry's gate: the end state this segment reached in previous SUCCESSFUL runs.
+    `owns_save` marks the segment whose final action commits the record.
     """
     lines = [
         "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
@@ -463,108 +450,37 @@ def scoped_subtask_prompt(
             f"hold correct values, menus or forms may already be open. Finish or correct "
             f"the step from where it stands; do not blindly redo actions already done."
         )
+    lines.append(
+        "\nVERIFY EVERY ACTION before taking the next one:\n"
+        "  - Read each action's receipt. A click receipt naming a DIFFERENT element than "
+        "you intended, or an input receipt echoing different text than you typed, means "
+        "the action did NOT work — recover before moving on.\n"
+        "  - After a click that should navigate or open something, confirm the page "
+        "actually changed (new URL, heading, or the expected panel visible). If nothing "
+        "changed, the click did not register: re-locate the target with find_by_text and "
+        "click it again."
+    )
+    if expected_end:
+        lines.append(
+            f"\nDONE CONDITION: this step is complete ONLY when {expected_end} — the end "
+            f"state recorded from previous successful runs. Check it after your final "
+            f"action; if it does not hold, your job is NOT done: keep working, or report "
+            f"failure honestly."
+        )
+    if owns_save:
+        lines.append(
+            "\nThis step COMMITS the record. After clicking Save, call "
+            "verify_save_registered; only report success after it returns CONFIRMED. NOT "
+            "REGISTERED means validation blocked the save: find the error messages on the "
+            "form, fix those exact fields, and save again."
+        )
     if remaining:
-        nxt = remaining[0]
-        if len(nxt) > 120:
-            nxt = nxt[:117] + "..."
-        lines.append(
-            f"\nWhen your job is complete, call done immediately with success=true. Do NOT "
-            f"begin the next step ({nxt}) — it is handled separately."
-        )
-    else:
-        lines.append(
-            "\nWhen your job is complete, call done immediately with success=true."
-        )
+        lines.append("\nStill ahead in this workflow (context only — each is handled "
+                     "separately AFTER you finish; do NOT start any of them):")
+        lines.extend(f"  - {r[:117] + '...' if len(r) > 120 else r}" for r in remaining)
+    lines.append(
+        "\nWhen your job is complete AND verified, call done with success=true. The "
+        "harness independently checks your end state — done with success=true when the "
+        "end state was not actually reached is recorded as a failed run."
+    )
     return "\n".join(lines)
-
-
-# --- Expander meta-prompt + logic ------------------------------------------------------------
-EXPAND_SYSTEM_PROMPT = """You are an expert browser-automation prompt engineer.
-Your job is to take a short, informal browser task and expand it into a detailed, reliable, numbered execution prompt that a browser agent can follow without ambiguity.
-You must generalize across many workflows. Do NOT hardcode any page-specific behavior, labels, or element names unless they are explicitly present in the input task or provided evidence. Do NOT invent missing details.
-
-OUTPUT RULES
-1. Return ONLY the expanded prompt as a numbered list.
-2. Use numbered phases: 1., 2., 3., ...
-3. Inside each phase, use sub-bullets for individual actions.
-4. Every phase must end with a clear "Verify ..." sub-bullet confirming success before the next phase starts.
-   - EXCEPTION: The final phase (DONE CONDITION) must NOT introduce a duplicate verification if the outcome has already been verified in the previous phase.
-   - EXCEPTION 2 (NARROW — do not overuse): only for a SINGLE CLICK whose visual feedback is delayed by React/Shadow DOM re-rendering may you instruct the agent to assume the click landed and proceed. NEVER apply "assume success" to typed field values, to a whole data-entry phase, or to the final Save — every field entry keeps its own "Verify <field> contains <value>" sub-bullet, and the final Save is verified per the FINAL SAVE VERIFICATION rule.
-5. Keep the original action order exactly as provided by the user.
-6. Preserve all exact values from the task: URLs, usernames, passwords, names, dates, numbers, and labels.
-7. Do not add commentary, explanations, markdown fences, or prefacing text.
-8. Do not mention internal reasoning.
-9. Analyze the prompt and determine which section is under which parent section
-10. Make sure you always scroll slowly and carefully to find the target elements, especially if they are not immediately visible on the page. This is crucial for ensuring that you can interact with all necessary components of the webpage, even those that load dynamically as you scroll.
-11. SCROLLING INSTRUCTIONS: To find elements or any section or subsection,you must scroll up/down through the page slowly (e.g., 0.2 pages at a time) until you find the target. Do not jump or scroll too fast, as you might miss the target element.
-12. SELECTION LOGIC — Read carefully:
-    A) SPECIFIC NAME: If the user says to select/click/open a SPECIFIC item BY NAME (e.g. "click on Nowhere", "select John Smith", "open Acme Corp"), you MUST search for that EXACT item by its name/label. Do NOT substitute a different item. Do NOT use the RANDOMIZATION SEED.
-    B) GENERIC / RANDOM SELECTION: If the user says to select something WITHOUT specifying a name (e.g. "select a business", "pick a client", "choose one", "select any", "randomly"), look for a RANDOMIZATION SEED section in the task. If present, you MUST select the item at the exact visual position number specified there (counting from top, 1-indexed). If the position exceeds the current page's item count, navigate to the next page. Never default to the first or second option. If no RANDOMIZATION SEED is provided, pick one that is NOT the first item.
-    KEY TEST: Does the user provide a specific name/label for the item? If YES → branch A (find it literally). If NO → branch B (random/generic selection).
-13. FAILURE TOOL USAGE RULE:
-    For every phase that involves finding/clicking/opening/changing a specific target:
-    - Include: If this objective cannot be completed after varied meaningful attempts, use one of:
-    - fail_and_stop(reason), if the next phase or DONE CONDITION depends on it.
-    - skip_step(reason), if the next phase is independent.
-    - Do not instruct the agent to keep scrolling endlessly.
-    - Do not instruct the agent to manually browse huge lists after search/filter/no-result evidence.
-    - Do not substitute another item when a specific item was requested.
-    - If a click fails with "Element index not available", instruct the agent to recover with find_by_text(label), not by retrying the index.
-    - When the task creates a NEW record, instruct the agent to NEVER open or edit an existing record as a fallback; if the create control cannot be found, use fail_and_stop.
-14. UI TESTING RULES (MANDATORY):
-    - ALWAYS append a final phase to the task called "Final UI Verification".
-    - In this final phase, instruct the agent to execute the `detect_layout_issues` and `run_accessibility_scan` tools to ensure the final page state has no layout or accessibility bugs.
-    - Do this for EVERY workflow, even if the user did not explicitly ask for UI testing.
-15. VALUE COMPLETENESS RULE (MANDATORY):
-    Every literal value in the input task — names, item/product names, numbers, dates, references, percentages, addresses — MUST appear in exactly one explicit action sub-bullet ("enter X into field Y" / "select X"). A phase TITLE mentioning a value does not count; the value must be in an action.
-    Before returning your output, re-scan the input task for every quoted or concrete value and confirm the expansion contains an action that enters or selects it. If any value has no action, add it.
-16. NO FABRICATED VALUES:
-    If the task does not specify a value for a form field, instruct the agent to LEAVE IT EMPTY — never invent filler values (e.g. "Street Name", "City Name", "Test", "N/A").
-    A compound value like "jodhpur, rajasthan, 342015" may be split ONLY across fields whose labels clearly match its parts (city/state-county/postcode); parts with no matching field stay unused.
-17. FINAL SAVE VERIFICATION (MANDATORY — supersedes any assume-success):
-    The phase that clicks the final Save/Submit of a create task must instruct:
-    - Click Save, then call verify_save_registered.
-    - If it returns NOT REGISTERED: the form has validation errors — locate the error messages, fix those exact fields, click Save again, and call verify_save_registered again.
-    - Only treat the task as successful after verify_save_registered returns CONFIRMED.
-18. SEARCH INTERACTION RULE:
-    For every phase that types a query into a search/filter box over a list or table, include EXACTLY this sub-bullet sequence:
-    - Type the query into the search input.
-    - Press Enter in the search field (send_keys "Enter") — ALWAYS, as its own action, immediately after typing.
-    - Wait ~2 seconds for the results to load.
-    - Verify the expected record is visible BEFORE clicking it.
-    - If it is absent after Enter + wait, apply rule 13 (fail_and_stop/skip_step) — do NOT instruct repeated clear-and-retype of the same query.
-    EXCEPTION: dropdown/combobox (react-select) filters are not search boxes — instruct typing with input and CLICKING the desired option there; never Enter.
-
-FORMAT STYLE
-- Number every phase.
-- Use short, precise sub-bullets.
-- Keep the output directly executable by a browser agent.
-- Output only the expanded prompt text.
-
-
-At the end of the expanded plan, add one final instruction:
-"CRITICAL: If your memory contains a block starting with
-':warning:  HUMAN OPERATOR OVERRIDE', that override is your immediate
-next goal. Stop the current step and execute the override first,
-then return to the plan."""
-
-
-async def expand_task(task: str, llm) -> str:
-    """Rewrite `task` into an explicit, numbered execution plan using `llm`.
-
-    Returns the expanded task on success, or the original `task` unchanged on any failure.
-    """
-    try:
-        result = await llm.ainvoke(
-            [SystemMessage(content=EXPAND_SYSTEM_PROMPT),
-             UserMessage(content=f"Rewrite this task:\n\n{task}")]
-        )
-        expanded = (result.completion or "").strip()
-        if not expanded:
-            logger.warning("expander returned empty output; using original task")
-            return task
-        logger.info("task expanded (%d -> %d chars)", len(task), len(expanded))
-        return expanded
-    except Exception as exc:  # noqa: BLE001 - expansion is best-effort
-        logger.warning("prompt expansion failed (%s); using original task", exc)
-        return task
