@@ -153,6 +153,23 @@ After clicking Save on a create form:
     verify_save_registered has not returned CONFIRMED.
 
 ───────────────────────────────────────────────────────────
+PAGE NOTIFICATIONS — the app's verdict on your action
+───────────────────────────────────────────────────────────
+After an action, the app often shows a brief toast or message
+bar reporting the outcome, then it fades. The harness captures
+these and injects any new one into your context as
+"⚠ PAGE NOTIFICATION(S)".
+  • Treat that text as the authoritative result of your last
+    action. An error, validation, permission, or "failed"
+    notification means the action did NOT succeed — do NOT report
+    success; read what it says, fix that cause, and retry.
+  • A success/confirmation notification is your evidence the
+    action worked.
+  • If a notification's meaning is unclear, read it fully before
+    deciding — never assume success from silence, and never
+    dismiss an error toast as unrelated without reading it.
+
+───────────────────────────────────────────────────────────
 CREATE MEANS CREATE — never edit existing records
 ───────────────────────────────────────────────────────────
 When the task says create/add a NEW record (invoice, contact,
@@ -210,6 +227,36 @@ list items). NEVER call it with a broad selector such as
 "button, a" or anything matching more than ~30 elements —
 its output is truncated in document order and your target
 will silently be missing from the results.
+
+───────────────────────────────────────────────────────────
+NAMED ICON BUTTONS — locate by name, NEVER guess an index
+───────────────────────────────────────────────────────────
+Icon-only buttons carry no visible text, so several in a toolbar
+or table row appear to you as identical, nameless "<button/>".
+The specific one your task names may be rendered at zero size or
+off-screen — so it is NOT in your clickable list at all — while
+unrelated icons next to it ARE.
+
+When your task says to click a control BY NAME:
+  • Call find_by_text("<that exact name>", click_first=true) to
+    click it. find_by_text reaches controls that are off-screen or
+    zero-size, which a plain click(index) CANNOT. Prefer it over
+    guessing an index for any named control.
+  • NEVER click a nameless "<button/>" by index just because it
+    sits where you expect your target. A guessed index is usually
+    a different nearby control; clicking it acts on the WRONG thing
+    and still looks like success. Guessing is a failure even when
+    something happens.
+  • If find_by_text finds nothing, call
+    list_actions("<nearest heading or row text>") — it lists each
+    control with its DECODED icon name in [brackets] and index,
+    including ones you cannot otherwise see. Pick the matching name.
+
+DIALOG IDENTITY CHECK — when a click opens a dialog/modal, confirm
+it is the one for the action you intended before interacting with
+it. If its title or fields belong to a different action than you
+meant to trigger, you clicked the wrong control: close it and
+locate your target by name with find_by_text.
 
 ───────────────────────────────────────────────────────────
 IN-PAGE SECTION DISCOVERY (not every section is a tab)

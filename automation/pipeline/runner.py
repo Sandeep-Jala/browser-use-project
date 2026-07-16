@@ -93,6 +93,19 @@ def _search_typed_text(last_action: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _inject_context(agent: Any, notice: str) -> bool:
+    """Inject a one-off context message into the agent's NEXT step, via the browser-use
+    message-manager seam. Returns True if it landed. Shared by every step-boundary nudge."""
+    mm = getattr(agent, "_message_manager", None)
+    if mm is not None and hasattr(mm, "_add_context_message"):
+        mm._add_context_message(UserMessage(content=notice))
+        return True
+    if mm is not None and hasattr(mm, "add_new_task"):
+        mm.add_new_task(notice)
+        return True
+    return False
+
+
 @dataclass
 class RunResult:
     """Structured outcome of a single task run, distilled from agent.history."""
@@ -279,12 +292,7 @@ class Runner:
                     f"NOW to return to {urls[-2]}, then re-locate your target with "
                     f"find_by_text. Do NOT re-navigate from the top."
                 )
-                mm = getattr(_agent, "_message_manager", None)
-                if mm is not None and hasattr(mm, "_add_context_message"):
-                    mm._add_context_message(UserMessage(content=notice))
-                elif mm is not None and hasattr(mm, "add_new_task"):
-                    mm.add_new_task(notice)
-                else:
+                if not _inject_context(_agent, notice):
                     return
                 logger.info("⚠ unintended-navigation nudge injected (back to %s)", urls[-1])
             except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
@@ -309,12 +317,7 @@ class Runner:
                     "be send_keys with 'Enter' (focus is already in the search field), then "
                     "wait ~2 seconds before reading the result list."
                 )
-                mm = getattr(_agent, "_message_manager", None)
-                if mm is not None and hasattr(mm, "_add_context_message"):
-                    mm._add_context_message(UserMessage(content=notice))
-                elif mm is not None and hasattr(mm, "add_new_task"):
-                    mm.add_new_task(notice)
-                else:
+                if not _inject_context(_agent, notice):
                     return
                 logger.info("⚠ search-Enter nudge injected (typed %r)", typed[:40])
             except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
@@ -332,12 +335,35 @@ class Runner:
             print("\n⏸️  Pause queued — you'll be prompted for an instruction at the next step "
                   "boundary (Ctrl+C again to abort).", flush=True)
 
+        async def _surface_notifications(_agent: "AgentType") -> None:
+            """Toasts/message bars fade before the agent's next look, so capture them as they
+            appear (agent_tools installs the observer on first read) and inject any new ones
+            into this step's context — the app's own verdict on the last action."""
+            try:
+                notices = await agent_tools.read_new_notifications(session)
+            except Exception as exc:  # noqa: BLE001 - never break a step
+                logger.debug("notification surfacing skipped: %s", exc)
+                return
+            if not notices:
+                return
+            joined = " | ".join(n[:200] for n in notices[:5])
+            notice = (
+                f"⚠ PAGE NOTIFICATION(S) since your last action: {joined}\n"
+                "This is the app reporting the OUTCOME of what you just did. If it states an "
+                "error, validation failure, permission problem, or anything blocking, the "
+                "action did NOT succeed — address it and do NOT report success. If it confirms "
+                "success, treat that as your evidence."
+            )
+            if _inject_context(_agent, notice):
+                logger.info("⚠ page-notification surfaced: %s", joined[:80])
+
         async def _track_step(_agent: "AgentType") -> None:
             step_state["n"] += 1
             for collector in collectors:
                 collector.current_step = step_state["n"]
             _nudge_if_unintended_navigation(_agent)
             _nudge_if_search_typed(_agent)
+            await _surface_notifications(_agent)
             if pause_state["requested"]:
                 pause_state["requested"] = False
                 self._prompt_and_inject(_agent)

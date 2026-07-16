@@ -8,6 +8,8 @@ NOT part of browser-use's built-in set:
   * capped_scroll(down, pages) — discovery scroll capped at 0.5 pages per call.
   * find_by_text(text)         — find interactive elements by label in a FRESH snapshot,
                                  returning their current click indexes (optionally clicking).
+  * list_actions(near_text)    — list clickable controls near a heading/row, decoding the
+                                 nameless icon buttons (Fluent/SVG) browser-use renders blank.
   * verify_save_registered()   — ground truth for saves: did a create-write actually hit the
                                  server this run? (probe wired by the Runner per run).
   * detect_layout_issues()     — heuristic layout/overflow scan of the current page.
@@ -66,6 +68,58 @@ def clear_save_probe() -> None:
     _SAVE_PROBE = None
 
 
+# Icon-font class tokens that carry an icon's meaning (Fluent `ms-Icon--Mail`, FontAwesome
+# `fa-envelope`, generic `icon-send`). The captured group is the semantic part.
+_ICON_CLASS_RE = re.compile(r"(?:ms-Icon--|fa-|icon-|glyphicon-)([A-Za-z][A-Za-z0-9]+)")
+
+
+def _descendant_icon_hints(node: Any, depth: int = 4) -> str:
+    """Semantic hints for an otherwise-nameless icon control, harvested from its DESCENDANTS.
+
+    browser-use surfaces a node's OWN title/aria-label but never its children's, so a Fluent
+    icon button (`<button class="ms-Button--icon"><i data-icon-name="Send"/></button>`) and
+    its peers all reach the agent as bare `<button/>` — indistinguishable. We walk the subtree
+    and collect the child hints that name the icon: `data-icon-name`, child `title`/
+    `aria-label`, SVG `<title>` text, `<use href="#icon-...">` fragments, and icon-font class
+    tokens. Returns a space-joined, de-duplicated string ("" when nothing was found)."""
+    found: list[str] = []
+
+    def walk(n: Any, d: int) -> None:
+        if n is None or d < 0:
+            return
+        attrs = getattr(n, "attributes", None) or {}
+        for attr in ("data-icon-name", "title", "aria-label", "alt"):
+            val = attrs.get(attr)
+            if val:
+                found.append(str(val))
+        href = attrs.get("href") or attrs.get("xlink:href") or ""
+        if "#" in str(href):
+            found.append(str(href).rsplit("#", 1)[1])
+        for token in _ICON_CLASS_RE.findall(attrs.get("class") or ""):
+            found.append(token)
+        # SVG <title> text is a child text node under a <title> element.
+        if (getattr(n, "node_name", "") or "").lower() == "title":
+            txt = getattr(n, "node_value", "") or ""
+            if txt.strip():
+                found.append(txt)
+        for child in (getattr(n, "children", None) or []):
+            walk(child, d - 1)
+
+    try:
+        for child in (getattr(node, "children", None) or []):
+            walk(child, depth)
+    except Exception:  # noqa: BLE001 - a naming aid must never crash a lookup
+        return ""
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for hint in found:
+        h = " ".join(str(hint).split())
+        if h and h.lower() not in seen:
+            seen.add(h.lower())
+            uniq.append(h)
+    return " ".join(uniq)
+
+
 async def _eval_js(browser_session: BrowserSession | None, expression: str, *, await_promise: bool = False):
     """Run `expression` in the page over CDP and return its by-value result (or raise).
 
@@ -83,6 +137,123 @@ async def _eval_js(browser_session: BrowserSession | None, expression: str, *, a
         msg = details.get("exception", {}).get("description") or details.get("text") or str(details)
         raise RuntimeError(msg)
     return result.get("result", {}).get("value")
+
+
+# Raw-DOM locate (+ optional click) for controls that browser-use's interactive snapshot
+# OMITS. Some Fluent widgets render functional buttons at 0x0 inside a virtualized
+# ScrollablePane (e.g. the "Send NPS survey request" icon): they have a real title and a live
+# click handler, but zero layout, so they never enter the selector_map and find_by_text's
+# normal path can't see them. This queries the live DOM directly (viewport/size-independent),
+# matches ALL tokens across text + title/aria-label/name + descendant data-icon-name/title,
+# and clicks the best match via the element's own handler (works on a 0x0 node).
+_RAW_FIND_JS = r"""
+(function () {
+  try {
+    var TOKENS = %s, DOCLICK = %s;
+    var sel = 'button,a,[role=button],[role=menuitem],[role=tab],[role=link],' +
+              'input[type=button],input[type=submit],[data-is-focusable],[onclick]';
+    var out = [];
+    document.querySelectorAll(sel).forEach(function (e) {
+      var hay = [e.getAttribute('title'), e.getAttribute('aria-label'), e.getAttribute('name'),
+                 e.innerText].filter(Boolean).join(' ');
+      e.querySelectorAll('[data-icon-name],[title],[aria-label]').forEach(function (c) {
+        hay += ' ' + [c.getAttribute('data-icon-name'), c.getAttribute('title'),
+                      c.getAttribute('aria-label')].filter(Boolean).join(' ');
+      });
+      hay = hay.toLowerCase();
+      if (TOKENS.every(function (t) { return hay.indexOf(t) !== -1; })) {
+        var r = e.getBoundingClientRect();
+        var icon = e.querySelector('[data-icon-name]');
+        var name = e.getAttribute('title') || e.getAttribute('aria-label') ||
+                   e.getAttribute('name') || (e.innerText || '').trim() ||
+                   (icon && icon.getAttribute('data-icon-name')) || '';
+        out.push({ el: e, name: name.trim().slice(0, 80),
+                   visible: r.width > 0 && r.height > 0 });
+      }
+    });
+    if (!out.length) return { count: 0 };
+    out.sort(function (a, b) { return (b.visible ? 1 : 0) - (a.visible ? 1 : 0); });
+    var top = out[0], clicked = false;
+    if (DOCLICK) { try { top.el.scrollIntoView({ block: 'center' }); top.el.click(); clicked = true; } catch (e) {} }
+    return { count: out.length, clicked: clicked, name: top.name,
+             names: out.slice(0, 8).map(function (o) { return o.name; }) };
+  } catch (e) { return { error: String(e) }; }
+})()
+"""
+
+
+# Page notifications (toasts / message bars) are how the app reports the OUTCOME of an action
+# — "saved", "validation failed", "permission denied", a 500. They are transient: they fade
+# in a few seconds, so by the time the agent finishes its LLM step and looks, they are gone.
+# This installs a MutationObserver ONCE that buffers every notification as it appears, then
+# returns (and clears) the ones seen since the last read. Pattern-based, not tied to any one
+# app's markup: ARIA alert/status roles plus the common toast/message-bar class conventions.
+_NOTIF_JS = r"""
+(function () {
+  try {
+    if (!window.__ao_notifs) window.__ao_notifs = [];
+    if (!window.__ao_notif_obs) {
+      var RX = /(toast|notification|message-?bar|snackbar|growl|flash|banner|alert)/i;
+      var isNotif = function (n) {
+        if (!n || n.nodeType !== 1) return false;
+        var role = (n.getAttribute && n.getAttribute('role')) || '';
+        if (role === 'alert' || role === 'status') return true;
+        var sig = ((n.className && n.className.toString ? n.className.toString() : '') + ' ' +
+                   (n.id || '')).toLowerCase();
+        return RX.test(sig);
+      };
+      var record = function (n) {
+        var t = ((n.innerText || n.textContent || '').trim()).replace(/\s+/g, ' ');
+        if (!t || t.length > 300) return;
+        var last = window.__ao_notifs[window.__ao_notifs.length - 1];
+        if (!last || last !== t) window.__ao_notifs.push(t);
+      };
+      var scan = function (n) {
+        if (isNotif(n)) record(n);
+        else if (n.querySelectorAll)
+          n.querySelectorAll('[role=alert],[role=status]').forEach(record);
+      };
+      window.__ao_notif_obs = new MutationObserver(function (muts) {
+        muts.forEach(function (m) {
+          (m.addedNodes || []).forEach(scan);
+        });
+      });
+      window.__ao_notif_obs.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    var out = window.__ao_notifs.slice();
+    window.__ao_notifs = [];
+    return out;
+  } catch (e) { return []; }
+})()
+"""
+
+
+async def read_new_notifications(browser_session: BrowserSession | None) -> list[str]:
+    """Install the page-notification observer (idempotent) and return the toast/message-bar
+    texts seen since the last call. Best-effort: returns [] on any failure so it can never
+    break a step. Called once per agent step by the Runner to surface transient notifications
+    the agent would otherwise miss."""
+    if browser_session is None:
+        return []
+    try:
+        result = await _eval_js(browser_session, _NOTIF_JS)
+    except Exception as exc:  # noqa: BLE001 - surfacing notices must never crash a run
+        logger.debug("read_new_notifications failed: %s", exc)
+        return []
+    if not isinstance(result, list):
+        return []
+    # Clean + de-dup within the batch, order preserved. Icon fonts (Fluent, FontAwesome)
+    # render glyphs as Unicode private-use codepoints (U+E000..U+F8FF) inside the toast
+    # text; strip them so the agent reads words. An icon-only notification collapses to "".
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in result:
+        cleaned = "".join(c for c in str(item) if not ("\ue000" <= c <= "\uf8ff"))
+        t = " ".join(cleaned.split())
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 # --- Layout heuristic (runs entirely in the page) --------------------------------------------
@@ -248,6 +419,13 @@ def build_tools() -> Tools:
                         haystack += " " + val.lower()
                         if not label and attr not in ("id", "name"):
                             label = val
+                # Icon buttons carry their meaning in a child glyph browser-use drops; fold
+                # the child hints in so a nameless <button/> becomes matchable/visible.
+                hints = _descendant_icon_hints(node)
+                if hints:
+                    haystack += " " + hints.lower()
+                    if not label:
+                        label = hints
                 if all(t in haystack for t in tokens):
                     matches.append((idx, node, label))
             except Exception:  # noqa: BLE001 - skip malformed nodes, keep scanning
@@ -263,6 +441,32 @@ def build_tools() -> Tools:
 
         page_url = getattr(state, "url", "") or ""
         if not matches:
+            # Fallback: the target may exist in the DOM but be EXCLUDED from the interactive
+            # snapshot (a 0x0 button in a Fluent virtualized ScrollablePane, an off-screen
+            # control). Query the live DOM directly and, when click_first, click it via its
+            # own handler — the only way to reach a functional 0x0 element.
+            raw = None
+            try:
+                expr = _RAW_FIND_JS % (json.dumps(tokens), "true" if click_first else "false")
+                raw = await _eval_js(browser_session, expr)
+            except Exception as exc:  # noqa: BLE001 - fallback is best-effort
+                logger.debug("find_by_text raw-DOM fallback failed: %s", exc)
+            if raw and not raw.get("error") and raw.get("count"):
+                if raw.get("clicked"):
+                    msg = (f"find_by_text('{query}'): the target was not in the interactive "
+                           f"snapshot (a 0-size/off-screen control) — located it in the DOM and "
+                           f"clicked it directly: '{raw.get('name')}'. Verify the page responded "
+                           f"as expected before proceeding.")
+                    logger.info("🔎 %s", msg)
+                    return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                        include_in_memory=True)
+                names = ", ".join(f"'{n}'" for n in (raw.get("names") or []) if n)
+                msg = (f"find_by_text('{query}'): {raw['count']} match(es) exist in the DOM but "
+                       f"are NOT clickable via index (0-size/virtualized): {names}. Re-call "
+                       f"find_by_text('{query}', click_first=true) to click the best match directly.")
+                logger.info("🔎 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True)
             msg = (
                 f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
                 "The element is not in this page's DOM. FIRST check: is this the page you think "
@@ -423,6 +627,81 @@ def build_tools() -> Tools:
                 len(violations), "\n".join(lines), extra,
             )
         logger.info("♿ %s", msg.split("\n")[0])
+        return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+
+    @tools.action(
+        "List the clickable controls near a heading/row, INCLUDING unlabeled icon buttons whose "
+        "meaning is hidden in a child icon (which normally show up as a nameless '<button/>'). "
+        "Each result carries its decoded icon name and its click index. Use this when you need an "
+        "icon whose tooltip/label is not findable by text (e.g. a 'send survey', 'edit', or "
+        "'download' icon in a toolbar or table row) — call list_actions with the nearest visible "
+        "heading or row text, read the decoded names, then click the matching index. Read-only."
+    )
+    async def list_actions(near_text: str = "", browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        if browser_session is None:
+            return ActionResult(error="list_actions: BrowserSession not injected")
+        try:
+            state = await browser_session.get_browser_state_summary(include_screenshot=False)
+        except Exception as exc:  # noqa: BLE001
+            return ActionResult(error=f"list_actions: could not read page state: {exc}")
+
+        def _decoded(node: Any) -> str:
+            attrs = node.attributes or {}
+            own = " ".join((node.get_all_children_text(max_depth=5) or "").split())[:120]
+            if not own:
+                for attr in ("aria-label", "title", "name", "placeholder", "value"):
+                    if attrs.get(attr):
+                        own = str(attrs[attr])
+                        break
+            hints = _descendant_icon_hints(node)
+            if hints and hints.lower() not in own.lower():
+                return f"{own} [{hints}]".strip() if own else hints
+            return own
+
+        items = sorted(state.dom_state.selector_map.items())
+        # Anchor to the heading/row text so the list is scoped to the right region. Indexes in
+        # the selector map track document order, so a window around the landmark's index keeps
+        # the controls that belong to that section.
+        anchor = None
+        near = (near_text or "").strip().lower()
+        near_tokens = [t for t in re.split(r"[^a-z0-9]+", near) if t]
+        if near_tokens:
+            for idx, node in items:
+                try:
+                    hay = " ".join((node.get_all_children_text(max_depth=5) or "").split()).lower()
+                    if all(t in hay for t in near_tokens):
+                        anchor = idx
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        window = 40
+        rows: list[str] = []
+        for idx, node in items:
+            if anchor is not None and abs(idx - anchor) > window:
+                continue
+            try:
+                name = _decoded(node)
+            except Exception:  # noqa: BLE001
+                continue
+            if not name:
+                continue
+            tag = getattr(node, "tag_name", None) or (getattr(node, "node_name", "") or "").lower()
+            rows.append(f"index={idx} <{tag}> '{name[:70]}'")
+            if len(rows) >= 30:
+                break
+
+        where = f" near '{near_text}'" if near_text else ""
+        if not rows:
+            msg = (f"list_actions{where}: no named controls found"
+                   + (" — is this the right page/section? try a different nearby heading."
+                      if near_tokens else "."))
+            logger.info("🧭 %s", msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+        msg = (f"Clickable controls{where} (decoded icon names in [brackets]):\n"
+               + "\n".join(rows)
+               + "\nClick your target with click(index) — indexes are fresh but go stale on re-render.")
+        logger.info("🧭 list_actions%s: %d control(s)", where, len(rows))
         return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
 
     return tools
