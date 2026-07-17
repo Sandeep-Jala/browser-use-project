@@ -46,95 +46,6 @@ def _result_to_dict(result: "RunResult") -> dict[str, Any]:
     return data
 
 
-def build_suite_report(summary: dict[str, Any], out_dir: Path) -> Path:
-    """Write suite.html (KPI row + one linked table row per task) into `out_dir`."""
-    out_path = Path(out_dir) / "suite.html"
-    out_path.write_text(_render_suite_html(summary), encoding="utf-8")
-    return out_path
-
-
-_SUITE_STATUS_BADGE = {
-    "PASS": "b-ok", "PASS*": "b-warn", "DONE": "b-warn",
-    "FAIL": "b-error", "ERROR": "b-error", "SKIPPED": "b-muted",
-}
-
-
-def _render_suite_html(summary: dict[str, Any]) -> str:
-    totals = summary.get("totals", {})
-    ok = summary.get("ok")
-    verdict = "PASS" if ok else "FAIL"
-    verdict_color = "var(--success)" if ok else "var(--error)"
-
-    p: list[str] = []
-    p.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>")
-    p.append(f"<title>Suite {_esc(summary.get('suite_id'))}</title>")
-    p.append(
-        "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap' rel='stylesheet'>"
-    )
-    p.append("<link href='https://fonts.googleapis.com/icon?family=Material+Icons' rel='stylesheet'>")
-    p.append(f"<style>{_CSS}</style>")
-    # The run-report CSS lays out a sidebar grid; the suite page is a single column.
-    p.append("<style>body{display:block;padding:32px;} .content-wrapper{max-width:1200px;margin:0 auto;}"
-             ".suite-table{width:100%;border-collapse:collapse;font-size:0.85rem;}"
-             ".suite-table th{text-align:left;color:var(--text-muted);font-size:0.72rem;"
-             "text-transform:uppercase;letter-spacing:0.06em;padding:10px 12px;"
-             "border-bottom:1px solid var(--border);}"
-             ".suite-table td{padding:10px 12px;border-bottom:1px solid var(--border);"
-             "vertical-align:top;}"
-             ".suite-table a{color:var(--primary);text-decoration:none;}"
-             ".suite-table a:hover{text-decoration:underline;}</style></head><body>")
-    p.append("<div class='content-wrapper'>")
-    p.append(
-        f"<div class='main-title' style='margin-bottom:6px;'>Suite Report "
-        f"<span class='badge {_SUITE_STATUS_BADGE['PASS' if ok else 'FAIL']}' "
-        f"style='font-size:0.8rem;vertical-align:middle;'>{verdict}</span></div>"
-    )
-    p.append(f"<div class='header-meta' style='margin-bottom:24px;'>"
-             f"<span>suite {_esc(summary.get('suite_id'))}</span>"
-             f"<span>selector: {_esc(summary.get('selector') or 'all')}</span>"
-             f"<span>{summary.get('duration_seconds', 0)}s</span></div>")
-
-    p.append("<div class='kpi-grid'>")
-    p.append(_kpi("checklist", totals.get("tasks", 0), "Tasks", "in this suite", "var(--text-main)"))
-    p.append(_kpi("check", totals.get("pass", 0), "Passed", "flow + assertions",
-                  "var(--success)" if not (totals.get("fail") or totals.get("error")) else "var(--text-main)"))
-    failures = (totals.get("fail", 0) + totals.get("error", 0) + totals.get("done", 0)
-                + totals.get("skipped", 0))
-    p.append(_kpi("report", failures, "Not Passed", "fail / error / done / skipped",
-                  "var(--error)" if failures else "var(--success)"))
-    p.append(_kpi("rule", totals.get("assertion_failures", 0), "Assertion Failures",
-                  "tasks with failed checks",
-                  "var(--error)" if totals.get("assertion_failures") else "var(--success)"))
-    p.append(_kpi("timer", f"{totals.get('tokens') or 0:,}" if totals.get("tokens") else "—",
-                  "LLM Tokens", f"${totals.get('cost') or 0:.4f}", "var(--primary)"))
-    p.append("</div>")
-
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>table_rows</span>"
-             " Tasks</div>")
-    p.append("<table class='suite-table'><tr><th>Task</th><th>Status</th><th>Mode</th>"
-             "<th>Duration</th><th>Assertions</th><th>Healed</th><th>Report</th></tr>")
-    for t in summary.get("tasks", []):
-        status = t.get("status", "?")
-        display = "PASS*" if status == "PASS" and t.get("assertions_ok") is False else status
-        badge = f"<span class='badge {_SUITE_STATUS_BADGE.get(display, 'b-muted')}'>{_esc(display)}</span>"
-        a = t.get("assertions") or {}
-        checks = (f"{a.get('passed', 0)}✓ {a.get('failed', 0)}✗"
-                  + (f" — {', '.join(a.get('failed_names', []))}" if a.get("failed") else ""))
-        healed = ", ".join(str(s) for s in t.get("healed_steps") or []) or "—"
-        if t.get("reauthored"):
-            healed = "re-authored"
-        link = (f"<a href='{_esc(t['report_html'])}'>report</a>"
-                if t.get("report_html") else "—")
-        error = f"<div class='obs-reason'>{_esc(str(t.get('error'))[:200])}</div>" if t.get("error") else ""
-        p.append(f"<tr><td><code>{_esc(t.get('key'))}</code>{error}</td><td>{badge}</td>"
-                 f"<td>{_esc(t.get('mode') or '—')}</td>"
-                 f"<td>{t.get('duration_seconds', 0)}s</td><td>{_esc(checks)}</td>"
-                 f"<td>{_esc(healed)}</td><td>{link}</td></tr>")
-    p.append("</table></div></div></body></html>")
-    return "".join(p)
-
-
 # --------------------------- HTML rendering ---------------------------
 
 _CSS = (Path(__file__).parent.parent / "templates" / "report_styles.css").read_text(encoding="utf-8")
@@ -188,13 +99,13 @@ def _render_html(result: "RunResult") -> str:
     if result.is_successful and getattr(result, "assertions_passed", None) is False:
         # The flow completed and saved, but telemetry assertions failed (5xx, console
         # errors, ...): a distinct state so a "green" run with an unhealthy app stands out.
-        status, ring, ring_color = "PASS*", "var(--warning)", "var(--warning)"
+        status, ring = "PASS*", "var(--warning)"
     elif result.is_successful:
-        status, ring, ring_color = "PASS", "var(--success)", "var(--success)"
+        status, ring = "PASS", "var(--success)"
     elif result.is_done:
-        status, ring, ring_color = "DONE", "var(--warning)", "var(--warning)"
+        status, ring = "DONE", "var(--warning)"
     else:
-        status, ring, ring_color = "FAIL", "var(--error)", "var(--error)"
+        status, ring = "FAIL", "var(--error)"
 
     p: list[str] = []
     p.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>")

@@ -5,9 +5,9 @@ browser-use to the *already-authenticated* Chromium that `login.py` started (wit
 debugging port open). This keeps the authenticated session intact — no second login, no
 second window.
 
-`attach_session` returns a `BrowserSession` connected over CDP. Telemetry-related profile
-options (recording, HAR, etc.) are intentionally left off in Phase 0; later phases extend
-the profile here.
+`attach_session` returns a `BrowserSession` connected over CDP. Telemetry is NOT captured
+here — the hybrid engine attaches its own Playwright CDP connection and collectors
+(pipeline/runner.py); this profile only carries keep-alive and settle timing.
 """
 from __future__ import annotations
 
@@ -28,9 +28,19 @@ async def attach_session(cdp_url: str, config: Config) -> BrowserSession:
         A connected `BrowserSession`. The session connects lazily on first use / when the
         Agent starts; we do not kill the underlying browser here since `login.py` owns it.
     """
-    # Minimal profile for Phase 0. `keep_alive=True` ensures browser-use does not try to
-    # tear down the browser that login.py owns when the agent finishes.
-    profile = BrowserProfile(keep_alive=True)
+    # `keep_alive=True` ensures browser-use does not tear down the browser that login.py
+    # owns when the agent finishes. The timing fields make each step snapshot AFTER this
+    # slow React app has painted instead of mid-render — stale element indexes from a
+    # mid-render snapshot are a direct misclick source. Costs ~1-2s per step; each avoided
+    # misclick saves ≥3 LLM steps plus the risk of poisoning a library recording.
+    # Viewport is deliberately NOT set here: login.py's context owns screenshot geometry.
+    profile = BrowserProfile(
+        keep_alive=True,
+        minimum_wait_page_load_time=1.0,           # default 0.25 — let the SPA paint
+        wait_for_network_idle_page_load_time=1.5,  # default 0.5
+        wait_between_actions=0.5,                  # default 0.1 — DOM settles between actions
+        highlight_elements=True,                   # explicit (browser-use 0.13.3 default)
+    )
 
     session = BrowserSession(
         cdp_url=cdp_url,

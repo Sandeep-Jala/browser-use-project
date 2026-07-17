@@ -14,8 +14,10 @@ step at parameterize time, substitution is purely mechanical and per-field — t
 happen to share a value (two "5"s) are separate parameters and can never cross-contaminate,
 which is the weakness of diff-based old→new string replacement this replaces.
 
-The caller replay-validates the instantiated script against the network ground-truth gate
-before committing it (plus the inherited template) under the new prompt's own id.
+There is no pre-commit replay validation: a template is committed as soon as its authoring
+run passes the segment gate, and an instantiated script is judged by that same gate the
+moment it replays (hybrid.replay_segment). A wrong instantiation therefore fails its
+replays and the entry self-evicts (subtask_store.archive_if_failing).
 """
 from __future__ import annotations
 
@@ -82,6 +84,10 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
     def _field_key(step: dict[str, Any]) -> str | None:
         if step.get("field_id"):  # synthetic dropdown type-steps carry an explicit identity
             return str(step["field_id"])
+        if step.get("action") == "find_click":
+            # Semantic clicks are grouped by their label: retried find_clicks of the same
+            # target become one parameter.
+            return f"find_click:{step.get('text', '')}"
         selectors = step.get("selectors") or []
         for s in reversed(selectors):
             if s.startswith("xpath="):
@@ -91,7 +97,7 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for i, step in enumerate(steps):
-        if step.get("action") not in ("fill", "type"):
+        if step.get("action") not in ("fill", "type", "find_click"):
             continue
         value = str(step.get("value") if step.get("action") == "fill"
                     else step.get("text") or "").strip()
@@ -215,7 +221,7 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
             ]})
             continue
         if i in step_param:
-            if new_step.get("action") == "type":
+            if new_step.get("action") in ("type", "find_click"):
                 new_step["text"] = _token(step_param[i])
             else:
                 new_step["value"] = _token(step_param[i])

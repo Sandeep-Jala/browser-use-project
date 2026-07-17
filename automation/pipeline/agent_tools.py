@@ -46,6 +46,8 @@ from browser_use.browser import BrowserSession
 from browser_use.browser.events import ClickElementEvent
 from browser_use.dom.views import DOMInteractedElement
 
+from automation.pipeline.script_compile import RAW_FIND_JS as _RAW_FIND_JS
+
 logger = logging.getLogger("framework.tools")
 
 # Vendored axe-core, loaded once and injected into the page on demand.
@@ -146,40 +148,9 @@ async def _eval_js(browser_session: BrowserSession | None, expression: str, *, a
 # normal path can't see them. This queries the live DOM directly (viewport/size-independent),
 # matches ALL tokens across text + title/aria-label/name + descendant data-icon-name/title,
 # and clicks the best match via the element's own handler (works on a 0x0 node).
-_RAW_FIND_JS = r"""
-(function () {
-  try {
-    var TOKENS = %s, DOCLICK = %s;
-    var sel = 'button,a,[role=button],[role=menuitem],[role=tab],[role=link],' +
-              'input[type=button],input[type=submit],[data-is-focusable],[onclick]';
-    var out = [];
-    document.querySelectorAll(sel).forEach(function (e) {
-      var hay = [e.getAttribute('title'), e.getAttribute('aria-label'), e.getAttribute('name'),
-                 e.innerText].filter(Boolean).join(' ');
-      e.querySelectorAll('[data-icon-name],[title],[aria-label]').forEach(function (c) {
-        hay += ' ' + [c.getAttribute('data-icon-name'), c.getAttribute('title'),
-                      c.getAttribute('aria-label')].filter(Boolean).join(' ');
-      });
-      hay = hay.toLowerCase();
-      if (TOKENS.every(function (t) { return hay.indexOf(t) !== -1; })) {
-        var r = e.getBoundingClientRect();
-        var icon = e.querySelector('[data-icon-name]');
-        var name = e.getAttribute('title') || e.getAttribute('aria-label') ||
-                   e.getAttribute('name') || (e.innerText || '').trim() ||
-                   (icon && icon.getAttribute('data-icon-name')) || '';
-        out.push({ el: e, name: name.trim().slice(0, 80),
-                   visible: r.width > 0 && r.height > 0 });
-      }
-    });
-    if (!out.length) return { count: 0 };
-    out.sort(function (a, b) { return (b.visible ? 1 : 0) - (a.visible ? 1 : 0); });
-    var top = out[0], clicked = false;
-    if (DOCLICK) { try { top.el.scrollIntoView({ block: 'center' }); top.el.click(); clicked = true; } catch (e) {} }
-    return { count: out.length, clicked: clicked, name: top.name,
-             names: out.slice(0, 8).map(function (o) { return o.name; }) };
-  } catch (e) { return { error: String(e) }; }
-})()
-"""
+# The raw-DOM find+click algorithm lives in script_compile.RAW_FIND_JS and is SHARED with
+# the replay engine: a `find_click` step replays exactly what this tool did at record time,
+# so hover-revealed/0-size controls behave identically at author and replay time.
 
 
 # Page notifications (toasts / message bars) are how the app reports the OUTCOME of an action
@@ -312,6 +283,41 @@ _LAYOUT_JS = r"""
   }
 })()
 """
+
+
+def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
+    """The clicked element's identity, DOMInteractedElement-shaped, for the recording.
+
+    The full loader dereferences xpath/stable-hash internals that off-screen or zero-size
+    nodes — find_by_text's specialty — may lack, and a capture failure used to mean the
+    click compiled only to weak query-text fallback selectors (observed live: the "View
+    all" icon replayed against an invisible twin). So on loader failure, capture the
+    identity MANUALLY: the fields compile actually anchors on (tag, attributes, ax_name —
+    falling back to the matched label — and xpath when reachable).
+    """
+    try:
+        return DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()
+    except Exception as exc:  # noqa: BLE001 - fall through to the manual capture
+        logger.debug("find_by_text: full element capture failed (%s); using manual identity",
+                     exc)
+    try:
+        ax = getattr(getattr(node, "ax_node", None), "name", None)
+        element: dict[str, Any] = {
+            "node_name": getattr(node, "node_name", "") or "",
+            "attributes": dict(getattr(node, "attributes", None) or {}),
+            "ax_name": str(ax or label or "").strip(),
+            "backend_node_id": getattr(node, "backend_node_id", None),
+        }
+        try:
+            xpath = node.xpath
+        except Exception:  # noqa: BLE001 - xpath traversal is exactly what fails off-screen
+            xpath = None
+        if xpath:
+            element["x_path"] = xpath
+        return element
+    except Exception as exc:  # noqa: BLE001 - recording the target stays best-effort
+        logger.debug("find_by_text: manual element capture failed too: %s", exc)
+        return None
 
 
 def build_tools() -> Tools:
@@ -453,13 +459,33 @@ def build_tools() -> Tools:
                 logger.debug("find_by_text raw-DOM fallback failed: %s", exc)
             if raw and not raw.get("error") and raw.get("count"):
                 if raw.get("clicked"):
-                    msg = (f"find_by_text('{query}'): the target was not in the interactive "
-                           f"snapshot (a 0-size/off-screen control) — located it in the DOM and "
-                           f"clicked it directly: '{raw.get('name')}'. Verify the page responded "
-                           f"as expected before proceeding.")
+                    # Record the clicked element's identity + the fact that it was clicked
+                    # while INVISIBLE (hidden_click): replay's visibility-gated resolver
+                    # can never reach a hover-revealed/0-size control, so compile marks the
+                    # step hidden_ok and replay dispatches the click the same way.
+                    meta = None
+                    el = raw.get("element") or {}
+                    if el.get("tag"):
+                        meta = {"interacted_element": {
+                            "node_name": str(el.get("tag") or ""),
+                            "attributes": dict(el.get("attrs") or {}),
+                            "ax_name": str(raw.get("name") or "").strip(),
+                            "hidden_click": True,
+                        }}
+                    # The receipt must be UNMISTAKABLY "the click already happened": a model
+                    # that reads this as a find-result clicks a second time — observed live:
+                    # the follow-up click closed the panel the first click had just opened,
+                    # then the agent hunted the vanished icon for 18 steps.
+                    msg = (f"find_by_text('{query}'): ✅ ALREADY CLICKED '{raw.get('name')}' "
+                           f"for you (a 0-size/hover-revealed control outside the interactive "
+                           f"snapshot, clicked via its own handler). Do NOT click it again — "
+                           f"a second click can close what the first just opened. NEXT: wait "
+                           f"~2 seconds, then check whether the expected panel/content "
+                           f"appeared. Only if it truly did not, re-call "
+                           f"find_by_text('{query}', click_first=true) once.")
                     logger.info("🔎 %s", msg)
                     return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                        include_in_memory=True)
+                                        include_in_memory=True, metadata=meta)
                 names = ", ".join(f"'{n}'" for n in (raw.get("names") or []) if n)
                 msg = (f"find_by_text('{query}'): {raw['count']} match(es) exist in the DOM but "
                        f"are NOT clickable via index (0-size/virtualized): {names}. Re-call "
@@ -503,12 +529,8 @@ def build_tools() -> Tools:
             # Record WHAT we clicked so script_compile can turn this custom action into a real
             # click step (a custom action carries no index, so browser-use captures no
             # interacted_element for it). Same DOMInteractedElement shape a built-in click records.
-            meta: dict[str, Any] | None = None
-            try:
-                meta = {"interacted_element":
-                        DOMInteractedElement.load_from_enhanced_dom_tree(node).to_dict()}
-            except Exception as exc:  # noqa: BLE001 - recording the target is best-effort
-                logger.debug("find_by_text: could not capture interacted element: %s", exc)
+            captured = _captured_element(node, label)
+            meta = {"interacted_element": captured} if captured else None
             msg = f"find_by_text('{query}'): clicked the single match {_line(idx, node, label)}"
             logger.info("🔎 %s", msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg,

@@ -4,7 +4,6 @@ The failure that motivated this: Fluent UI icon buttons (`<button class="ms-Butt
 carry their meaning only in a child glyph, which browser-use serializes away — so the send,
 edit, and delete icons all reach the agent as a nameless `<button/>`. `_descendant_icon_hints`
 recovers that meaning from the child so nameless icon buttons become findable."""
-import pytest
 
 from automation.pipeline import agent_tools
 from automation.pipeline.agent_tools import _descendant_icon_hints, read_new_notifications
@@ -106,3 +105,29 @@ async def test_notifications_none_session_and_bad_result(monkeypatch):
         return "oops"
     monkeypatch.setattr(agent_tools, "_eval_js", not_a_list)
     assert await read_new_notifications(object()) == []
+
+
+# ------------------------------- element capture resilience -------------------------------
+
+
+def test_captured_element_manual_fallback_for_offscreen_nodes():
+    """The full DOMInteractedElement loader throws for off-screen/zero-size nodes (the
+    exact nodes find_by_text exists to reach); the capture must degrade to a manual
+    identity carrying the fields compile anchors on — never to None."""
+    from types import SimpleNamespace
+
+    from automation.pipeline.agent_tools import _captured_element
+
+    class _Node(SimpleNamespace):
+        @property
+        def xpath(self):  # traversal fails off-screen, exactly like 0.13.3
+            raise RuntimeError("no layout")
+
+    node = _Node(node_name="BUTTON", attributes={"title": "View all"},
+                 ax_node=None, backend_node_id=123)
+    el = _captured_element(node, "View all")
+    assert el is not None
+    assert el["node_name"] == "BUTTON"
+    assert el["attributes"] == {"title": "View all"}
+    assert el["ax_name"] == "View all"          # matched label fills in for the ax name
+    assert "x_path" not in el                   # unreachable xpath is simply omitted

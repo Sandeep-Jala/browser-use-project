@@ -1,8 +1,8 @@
 """hybrid engine tests: the subtask loop, gates, and library commit rules.
 
-The browser-facing surface (HybridSession) is faked — the same injected-seam style as
-test_suite — while the loop, the library commit rules (_author_segment), and the gate
-evaluation run for real against tmp_path-monkeypatched stores."""
+The browser-facing surface (HybridSession) is faked via an injected seam, while the loop,
+the library commit rules (_author_segment), and the gate evaluation run for real against
+tmp_path-monkeypatched stores."""
 import json
 from types import SimpleNamespace
 
@@ -56,15 +56,20 @@ def _skeleton_result(ground_truth=None):
 class FakeSession:
     """Scripted HybridSession: `replays` / `agents` queue the Segment each call returns.
     An agent call that receives a record_path writes a compilable fake recording there,
-    so the real _author_segment commit path runs end-to-end."""
+    so the real _author_segment commit path runs end-to-end. `findings_seen` records the
+    findings list each agent call received (the carry-over channel under test)."""
 
-    def __init__(self, runner, *, replays=None, agents=None, create_write_seen=True):
+    def __init__(self, runner, *, replays=None, agents=None, create_write_seen=True,
+                 recording=None):
         self.runner = runner
         self.replays = list(replays or [])
         self.agents = list(agents or [])
         self.create_write_seen = create_write_seen
+        self.recording = recording or FAKE_RECORDING
         self.replay_calls = 0
         self.agent_calls = 0
+        self.findings_seen = []
+        self.record_paths = []
 
     @classmethod
     def make_opener(cls, instance):
@@ -76,7 +81,7 @@ class FakeSession:
     async def current_url(self):
         return "http://app/section"
 
-    async def replay_segment(self, sub, sid, context, steps, gate):
+    async def replay_segment(self, sub, sid, context, skill, gate):
         self.replay_calls += 1
         seg = self.replays.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
@@ -84,15 +89,19 @@ class FakeSession:
         return seg
 
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
-                            dirty=False, prior_failure=None, record_path=None):
+                            dirty=False, prior_failure=None, record_path=None,
+                            findings=None):
         self.agent_calls += 1
+        self.findings_seen.append(list(findings or []))
+        self.record_paths.append(record_path)
         seg = self.agents.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
         seg.prompt = sub.instantiated_prompt
         seg.mode = "authored"
+        seg.kind = getattr(sub, "kind", "action")
         if record_path is not None:
             record_path.parent.mkdir(parents=True, exist_ok=True)
-            record_path.write_text(json.dumps(FAKE_RECORDING))
+            record_path.write_text(json.dumps(self.recording))
         return seg
 
     async def finalize(self, task, parent_marker):
@@ -103,9 +112,10 @@ class FakeSession:
         return _skeleton_result(ground_truth=gt)
 
 
-def _seg(ok, *, executed=0, error=None, mode="replay", write_step=None):
+def _seg(ok, *, executed=0, error=None, mode="replay", write_step=None, finding=None):
     return Segment(index=0, sid="", prompt="", context="", mode=mode, ok=ok,
-                   steps_executed=executed, error=error, write_step=write_step)
+                   steps_executed=executed, error=error, write_step=write_step,
+                   finding=finding)
 
 
 def _runner():
@@ -146,10 +156,11 @@ async def test_all_segments_authored_then_committed(stores, monkeypatch):
     for sid, entry in ss.load_manifest().items():
         assert ss.has_script(sid)
         assert entry["context"] and entry["end_context"]
-        steps = json.loads(ss.steps_path(sid).read_text())
-        # emit_start_goto=False: the recording's start URL goto is NOT emitted; only the
-        # explicit navigate action compiles.
-        assert steps == [{"action": "goto", "url": "http://app/section"}]
+        # The committed body is the tier-1 code skill; the steps file is subsumed by it
+        # and deleted (emit_start_goto=False: only the explicit navigate action compiles).
+        assert ss.code_path(sid).exists() and ss.anchors_path(sid).exists()
+        assert "await api.goto('http://app/section')" in ss.code_path(sid).read_text()
+        assert not ss.steps_path(sid).exists()
 
 
 async def test_library_hit_replays_without_agent(stores, monkeypatch):
@@ -205,11 +216,98 @@ async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
     result = await _run(fake)
 
     assert result.is_successful is True
-    # Failed before touching the page -> old entry archived, clean re-author committed.
+    # Failed before touching the page -> old entry archived, clean re-author committed
+    # (as a code skill; the fresh steps file is subsumed and deleted).
     archived = list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
     assert len(archived) == 1
-    assert json.loads(ss.steps_path(sid0).read_text()) == \
-        [{"action": "goto", "url": "http://app/section"}]
+    assert "await api.goto('http://app/section')" in ss.code_path(sid0).read_text()
+    assert not ss.steps_path(sid0).exists()
+
+
+# ------------------------------- judge nodes + findings (Phase 0) -------------------------------
+
+
+async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
+    """A verification subtask must run live even when a (legacy, hollow) library entry
+    exists for it, and nothing of it may be recorded or committed."""
+    prompt = "go to the section. verify the CC field matches the noted mail"
+    spec = TaskSpec(key="j", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt="verify the CC field matches the noted mail"),
+    ))
+    ctx = ss.normalize_context("http://app/section")
+    judge_sid = ss.subtask_id(spec.subtasks[1].prompt, ctx)
+    hollow = [{"action": "wait", "seconds": 1.0}]
+    _seed_entry(judge_sid, hollow)   # a hollow replay would fake-pass; must be ignored
+
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 0 and fake.agent_calls == 2
+    assert [s["kind"] for s in result.subtasks] == ["action", "judge"]
+    # The judge agent ran WITHOUT a recording path, and the hollow entry was not replaced.
+    assert fake.record_paths[1] is None
+    assert not ss.recording_path(judge_sid).exists()
+    assert json.loads(ss.steps_path(judge_sid).read_text()) == hollow
+
+
+async def test_routed_subtask_replays_canonical_entry(stores, monkeypatch):
+    """A wording with no direct entry that the router resolves must replay the CANONICAL
+    skill — and a routed failure must author under the ORIGINAL sid, never overwriting
+    the canonical entry."""
+    from automation.pipeline.router import Route
+
+    ctx = ss.normalize_context("http://app/section")
+    canon = ss.subtask_id("go to the section.", ctx)
+    _seed_entry(canon)
+    reworded = TaskSpec(
+        key="r", prompt="open the section area. add invoice for customer Suresh Gopi "
+                        "and click save",
+        marker="Invoices",
+        subtasks=(SubtaskDecl(prompt="open the section area."),
+                  SubtaskDecl(prompt="add invoice for customer {{customer}} and click "
+                                     "save", values={"customer": "Suresh Gopi"},
+                              marker="Invoices")),
+    )
+
+    async def fake_route(sub, alias_sid, context, llm, **kw):
+        if "open the section area" in sub.template_prompt:
+            return Route(sid=canon, values={}, via="alias")
+        return None
+
+    monkeypatch.setattr(hybrid.router, "route", fake_route)
+    fake = FakeSession(_runner(), replays=[_seg(True)],
+                       agents=[_seg(True, mode="authored")])
+    fake.runner = SimpleNamespace(
+        expander_llm=None,
+        config=SimpleNamespace(subtask_max_steps=25, semantic_router=True))
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner, reworded.prompt, spec=reworded,
+                                   marker="Invoices")
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 1                       # the routed wording REPLAYED
+    assert result.subtasks[0]["sid"] == canon
+    assert ss.load_meta(canon)["uses"] == 1
+
+
+async def test_findings_carry_into_later_agent_segments(stores, monkeypatch):
+    """A completed segment's finding (its distilled final result) must reach every later
+    agent segment — the note-then-verify data channel."""
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="CC mail = billing@acme.com"),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    assert result.is_successful is True
+    assert fake.findings_seen[0] == []                    # nothing observed yet
+    assert fake.findings_seen[1] == ["go to the section.: CC mail = billing@acme.com"]
+    assert result.subtasks[0]["finding"] == "CC mail = billing@acme.com"
 
 
 async def test_reauthor_forces_agent_only_for_named_subtask(stores, monkeypatch):
@@ -233,9 +331,9 @@ async def test_reauthor_forces_agent_only_for_named_subtask(stores, monkeypatch)
     assert fake.agent_calls == 1 and fake.replay_calls == 1
     assert result.subtasks[0]["mode"] == "authored"
     assert result.subtasks[1]["mode"] == "replay"
-    # The stale detour steps were replaced by the fresh recording's compiled steps.
-    assert json.loads(ss.steps_path(sid0).read_text()) == \
-        [{"action": "goto", "url": "http://app/section"}]
+    # The stale detour steps were replaced by the fresh recording's compiled code skill.
+    assert "await api.goto('http://app/section')" in ss.code_path(sid0).read_text()
+    assert not ss.steps_path(sid0).exists()
 
 
 async def test_reauthor_failure_keeps_old_entry(stores, monkeypatch):

@@ -123,8 +123,46 @@ def meta_path(sid: str) -> Path:
     return LIBRARY_DIR / f"{sid}.meta.json"
 
 
+def code_path(sid: str) -> Path:
+    """Tier-1 body: the generated skill function (skills/codegen.py)."""
+    return LIBRARY_DIR / f"{sid}.skill.py"
+
+
+def anchors_path(sid: str) -> Path:
+    """Tier-1 element identities: handle -> ranked selectors + fingerprint."""
+    return LIBRARY_DIR / f"{sid}.anchors.json"
+
+
+def aliases_path() -> Path:
+    """Semantic-router alias table: {alias_sid: {"sid": canonical, "slots": {...}}}."""
+    return LIBRARY_DIR / "aliases.json"
+
+
+def embeddings_path() -> Path:
+    """Semantic-router vector cache: {"model": name, "vectors": {sid: [floats]}}."""
+    return LIBRARY_DIR / "embeddings.json"
+
+
+def load_aliases() -> dict[str, Any]:
+    p = aliases_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:  # noqa: BLE001 - a corrupt alias table just means no aliases
+        return {}
+
+
+def save_alias(alias_sid: str, data: dict[str, Any]) -> None:
+    aliases = load_aliases()
+    aliases[alias_sid] = data
+    _atomic_write_json(aliases_path(), aliases)
+
+
 def has_script(sid: str) -> bool:
-    return steps_path(sid).exists()
+    """True when the entry has an executable body. Tier-1 code is the normal case; a steps
+    file exists only for entries the transpiler couldn't express (see codegen)."""
+    return code_path(sid).exists() or steps_path(sid).exists()
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -142,11 +180,12 @@ def archive_entry(sid: str) -> list[Path]:
     archive_dir = LIBRARY_DIR / "archive"
     moved: list[Path] = []
     for src, kind in ((steps_path(sid), "steps"), (template_path(sid), "template"),
-                      (recording_path(sid), "recording")):
+                      (recording_path(sid), "recording"), (code_path(sid), "skill"),
+                      (anchors_path(sid), "anchors")):
         if not src.exists():
             continue
         archive_dir.mkdir(parents=True, exist_ok=True)
-        dst = archive_dir / f"{sid}.{kind}.{stamp}.json"
+        dst = archive_dir / f"{sid}.{kind}.{stamp}{src.suffix}"
         os.replace(src, dst)
         moved.append(dst)
     meta_path(sid).unlink(missing_ok=True)

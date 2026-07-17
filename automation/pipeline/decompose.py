@@ -19,6 +19,7 @@ The cache is immutable per prompt hash; --redecompose regenerates it.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -36,6 +37,39 @@ logger = logging.getLogger("framework.decompose")
 _TOKEN = sstore.TOKEN_RE
 MAX_SUBTASKS = 15
 
+# Verification wording that marks a subtask as a JUDGE node: its success is a judgment call
+# (compare/observe values), which does not survive compilation into a selector script — a
+# replayed judge segment would walk the clicks with nobody looking and report a hollow pass.
+# Judge nodes therefore always run with the LLM and are never committed to the library
+# (see hybrid.run_hybrid_task). Wording is matched on the TEMPLATE prompt (values lifted);
+# bare "note"/"check" are avoided: "credit note" is a record type and "check the option"
+# is a click, so only their verification phrasings match.
+_JUDGE_RE = re.compile(
+    r"\b(verify|verifies|confirm|ensure|validate|compare)\b"
+    r"|\bcheck (that|whether|if|it)\b"
+    r"|\bnote (the|down|it)\b"
+    r"|\bremember\b"
+    r"|\bcapture the\b",
+    re.IGNORECASE,
+)
+
+
+def node_kind(template_prompt: str, marker: str | None,
+              declared: str | None = None) -> str:
+    """Resolve a subtask's node kind: "action" (replayable) or "judge" (cognitive).
+
+    An explicit declaration (spec/cache) wins; a marker-owning subtask is ALWAYS action —
+    its network gate is machine ground truth, so caching it is safe regardless of wording;
+    otherwise verification wording makes it a judge node. A false positive here only costs
+    caching (the segment authors every run); a false negative would cost correctness
+    (hollow replay), so the wording net is cast deliberately wide.
+    """
+    if declared in ("action", "judge"):
+        return declared
+    if marker:
+        return "action"
+    return "judge" if _JUDGE_RE.search(template_prompt) else "action"
+
 
 @dataclass
 class Subtask:
@@ -46,6 +80,9 @@ class Subtask:
     values: dict[str, str] = field(default_factory=dict)
     marker: str | None = None            # set on the save-owning subtask only
     postcondition: dict[str, Any] | None = None
+    # "action" (replayable from the library) | "judge" (cognitive: always LLM, never
+    # cached — see node_kind). Assigned by _build_subtasks after markers are settled.
+    kind: str = "action"
 
     @property
     def instantiated_prompt(self) -> str:
@@ -60,10 +97,12 @@ def _tokens_of(template_prompt: str) -> set[str]:
 
 
 def _build_subtasks(raw: list[dict[str, Any]], marker: str | None) -> list[Subtask]:
-    """Materialize Subtasks from cache/spec/LLM dicts and assign the save-owning marker.
+    """Materialize Subtasks from cache/spec/LLM dicts, assign the save-owning marker, and
+    settle each node's kind (action/judge — see node_kind).
 
     Exactly one subtask owns the parent marker: an explicitly-declared one wins, else the
-    last subtask (the save is the final act of a create flow).
+    last subtask (the save is the final act of a create flow). Kinds are resolved AFTER
+    markers so the save-owning subtask can never be classified as a judge node.
     """
     subs = [
         Subtask(
@@ -77,6 +116,8 @@ def _build_subtasks(raw: list[dict[str, Any]], marker: str | None) -> list[Subta
     ]
     if marker and not any(s.marker for s in subs):
         subs[-1].marker = marker
+    for s, d in zip(subs, raw):
+        s.kind = node_kind(s.template_prompt, s.marker, d.get("kind"))
     return subs
 
 
@@ -87,7 +128,7 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
         "created": datetime.now().isoformat(timespec="seconds"),
         "subtasks": [
             {"template_prompt": s.template_prompt, "values": s.values,
-             "marker": s.marker, "postcondition": s.postcondition}
+             "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind}
             for s in subs
         ],
     }
@@ -125,8 +166,12 @@ def _validate(raw: list[Any], prompt: str) -> str | None:
 
 def whole_prompt_fallback(prompt: str, marker: str | None) -> list[Subtask]:
     """A single subtask covering the entire prompt — hybrid degenerates safely to today's
-    whole-task behavior when decomposition is unavailable or invalid."""
-    return [Subtask(index=0, template_prompt=" ".join(prompt.split()), marker=marker)]
+    whole-task behavior when decomposition is unavailable or invalid. The kind heuristic
+    still applies: a markerless verification task falls back to ONE judge node, so it is
+    never hollow-replayed even in degenerate form."""
+    template = " ".join(prompt.split())
+    return [Subtask(index=0, template_prompt=template, marker=marker,
+                    kind=node_kind(template, marker))]
 
 
 # ------------------------------- derived matching (tier 3) -------------------------------
@@ -224,7 +269,8 @@ async def get_decomposition(
     if declared:
         raw = [
             {"template_prompt": d.prompt, "values": dict(d.values or {}),
-             "marker": d.marker, "postcondition": d.postcondition}
+             "marker": d.marker, "postcondition": d.postcondition,
+             "kind": getattr(d, "kind", None)}
             for d in declared
         ]
         problem = _validate(raw, prompt)

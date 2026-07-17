@@ -29,6 +29,15 @@ def build_llm(config: Config) -> BaseChatModel:
             base_url=config.azure_base_url,
             temperature=0.0,
             timeout=45.0,
+            # Reliability params pinned rather than inherited from browser-use defaults
+            # (these ARE 0.13.3's defaults — pinned so an upgrade can't silently move them).
+            # frequency_penalty is deliberately left at its 0.3 default: it exists to stop
+            # gpt-4.1-mini's runaway "\t" generation — do not zero it.
+            max_retries=5,
+            max_completion_tokens=4096,
+            # Best-effort determinism: at temperature 0, Azure still varies across backend
+            # replicas; a fixed seed narrows step-to-step decision flakiness.
+            seed=42,
         )
 
     if provider == "groq":
@@ -47,10 +56,14 @@ def build_expander_llm(config: Config) -> BaseChatModel | None:
     """
     if not config.azure_api_key:
         return None
+    # Same explicit reliability/determinism params as build_llm (see the comments there).
     return ChatOpenAI(
         model=config.expander_model,
         api_key=config.azure_api_key,
         base_url=config.azure_base_url,
         temperature=0.0,
         timeout=45.0,
+        max_retries=5,
+        max_completion_tokens=4096,
+        seed=42,
     )

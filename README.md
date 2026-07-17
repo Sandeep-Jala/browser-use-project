@@ -11,8 +11,12 @@ on the gaps — so recurring work costs seconds and near-zero tokens.
 ```
 browser/login.py     launch Chromium (CDP open) + log in   -> (browser, page, cdp_url)
 browser/session.py   attach a browser-use BrowserSession over CDP (no second login)
-pipeline/decompose.py split the task into subtasks (cached / derived / one LLM call)
-pipeline/hybrid.py   per subtask: replay it from library/ (no LLM), else author + record it
+pipeline/decompose.py split the task into typed subtasks (action|judge; cached / derived / LLM)
+pipeline/router.py   map a differently-worded subtask to an existing skill (alias ->
+                     local embeddings -> one LLM verify)
+pipeline/hybrid.py   per subtask: replay its skill (no LLM), else author + commit it
+skills/              the executable unit: generated skill.py over the api.* runtime,
+                     anchors for self-healing, deterministic transpiler + AST lint
 pipeline/runner.py   run ONE agent segment on the shared session; collectors via Playwright
 pipeline/report.py   compile the RunResult into report.html + report.json
 ```
@@ -20,25 +24,30 @@ pipeline/report.py   compile the RunResult into report.html + report.json
 ## Layout
 
 ```
+tasks.yaml             # THE task registry: prompt + optional marker/tags per task
 automation/
   __main__.py          # entry point: login -> hybrid engine -> report (python -m automation)
-  tasks.py             # declarative task registry: TaskSpec(prompt, marker, assertions, tags)
+  tasks.py             # loads tasks.yaml into TaskSpecs (resolve_task / select_tasks)
   config.py            # Config.from_env(): all settings in one place
   llm.py               # build the browser-use chat model (Azure OpenAI default / Groq)
   browser/
     login.py           # Playwright login, hands off via CDP
     error_capture.py   # failure screenshots
     session.py         # attach browser-use to the authenticated browser over CDP
+  skills/
+    base.py            # Skill loader/executor: code tier preferred, steps tier fallback
+    api.py             # SkillApi: the ONLY surface generated code touches (heals anchors)
+    codegen.py         # deterministic transpiler steps->code + the AST whitelist lint
   pipeline/
     runner.py          # Runner + RunResult; runs ONE agent segment (owns no lifecycle)
-    prompts.py         # all prompt text: agent rules, per-subtask prompt, decompose
-    report.py          # RunResult -> HTML + JSON (+ suite-level report)
-    script_compile.py  # compile a recording into a fast, no-LLM selector script; replay it
+    prompts.py         # all prompt text: agent rules, per-subtask prompt, decompose, router
+    report.py          # RunResult -> HTML + JSON
+    script_compile.py  # compile a recording into selector steps; replay + self-heal them
     assertions.py      # declarative telemetry assertions (no_5xx, no_console_errors, ...)
-    suite.py           # run many tasks on one login -> suite.json + suite.html
-    subtask_store.py   # task + subtask identity, and the SHARED subtask library (library/)
-    decompose.py       # split a task into subtasks (spec-declared / cached / derived / LLM)
-    hybrid.py          # THE execution engine: replay recorded subtasks, LLM only for the gaps
+    subtask_store.py   # task + subtask identity, and the SHARED skill library (library/)
+    decompose.py       # split a task into typed subtasks (action|judge)
+    router.py          # semantic router: alias table -> local embeddings -> LLM verify
+    hybrid.py          # THE execution engine: replay known skills, LLM only for the gaps
   collectors/
     base.py            # Collector ABC (attaches to a Playwright BrowserContext)
     network.py         # request/response/requestfailed via Playwright
@@ -83,22 +92,15 @@ TASK=purchase uv run python -m automation --fresh
 # Re-record only the subtasks you name; the rest still replay
 TASK=purchase uv run python -m automation --reauthor 2
 TASK=purchase uv run python -m automation --reauthor 'add invoice'
-
-# Run a whole suite on one login: every task, or a tag, or an explicit list
-uv run python -m automation --suite all
-uv run python -m automation --suite tag:sales
-uv run python -m automation --suite invoice,purchase,item
 ```
 
 | Flag / Env var | Effect |
 |---------|--------|
-| `TASK` / `--task` | which task to run: any key from `automation/tasks.py` (default `invoice`), or a full free-text prompt |
-| `SUITE` / `--suite` | run a task set instead: `all`, `tag:<tag>`, or `k1,k2,...`; writes `artifacts/suites/<id>/suite.html` + `suite.json` and exits non-zero unless every task passes |
-| `--fresh` | re-author **and re-record every subtask**, ignoring the library; each one that passes its gate is committed back (suite mode: only with an explicit task list) |
+| `TASK` / `--task` | which task to run: any key from `tasks.yaml` (default `invoice`), or a full free-text prompt |
+| `--fresh` | re-author **and re-record every subtask**, ignoring the library; each one that passes its gate is committed back |
 | `--reauthor` | re-record only the subtasks you name — comma-list of indexes and/or prompt substrings, e.g. `--reauthor 0` or `--reauthor 'add estimate'`. Others still replay, and an entry is replaced only if the new recording passes its gate. Use it when a recording works but wanders |
 | `--redecompose` | regenerate the task's cached subtask **split** (the cache is otherwise immutable per prompt) |
 | `--marker` | success-marker URL fragment; `none` disables the network ground-truth gate |
-| `--no-continue-on-failure` | suite mode: stop at the first task that doesn't pass |
 
 The exit code is CI-ready: `0` only when the flow completed (ground-truth gate) **and** the
 telemetry assertions passed.
@@ -106,32 +108,45 @@ telemetry assertions passed.
 ### Outputs
 
 - `artifacts/<run_id>/` — `network.json`, `console.json`, `report.html`, `report.json`
-- `artifacts/suites/<suite_id>/` — `suite.html` + `suite.json` (suite mode): per-task
-  status/mode/duration/assertions with links to each run's report
-- `library/` — **the** recording store: per subtask `<sid>.steps.json` (the compiled no-LLM
-  script), `.template.json` (values lifted into a `{{param}}` dictionary), `.recording.json`
-  (raw authoring trace), `.meta.json` (uses/failures), plus `manifest.json` and `archive/`
+- `library/` — **the** skill store, per subtask: `<sid>.skill.py` (the generated no-LLM
+  executable) + `.anchors.json` (its element identities — where self-healing writes),
+  `.template.json` (values lifted into a `{{param}}` dictionary), `.recording.json` (raw
+  authoring trace — the re-compile source), `.meta.json` (uses/failures). `.steps.json`
+  exists only for entries the transpiler can't express. Shared: `manifest.json`,
+  `aliases.json` + `embeddings.json` (semantic router), `archive/`
 - `decompositions/<task_id>.json` — cached subtask split per task prompt
 
 ### How record / replay works
 
-Every task is **decomposed** into subtasks (`pipeline/decompose.py`): a cached split if the
-prompt has been seen, a derived match (same task shape, different values — no LLM), or one
-LLM call, cached forever after. `--redecompose` regenerates it.
+Every task is **decomposed** into typed subtasks (`pipeline/decompose.py`): a cached split
+if the prompt has been seen, a derived match (same task shape, different values — no LLM),
+or one LLM call, cached forever after. `--redecompose` regenerates it. Nodes are
+`action` (replayable) or `judge` (verification wording — its success is a judgment that
+cannot survive compilation, so a judge node **always runs live with the LLM and is never
+cached**; the navigation around it still replays). Each passed segment's observation (its
+final result) flows into every later segment's prompt, so note-then-verify tasks compare
+against what was actually seen.
 
-Each subtask is keyed into a **global shared library** (`library/`) by its *parameterized*
-prompt plus the normalized URL context it starts from. That key is the whole trick: the
-"go to Bookkeeping, search and select {{business}}" prefix that a dozen tasks share is ONE
-library entry — authored once by whichever task ran first, replayed by all the others.
-Values are template-swapped at replay, so a different customer costs nothing.
+Each action subtask is keyed into a **global shared library** (`library/`) by its
+*parameterized* prompt plus the normalized URL context it starts from. That key is the
+whole trick: the "go to Bookkeeping, search and select {{business}}" prefix that a dozen
+tasks share is ONE library entry — authored once by whichever task ran first, replayed by
+all the others. Values are template-swapped at replay, so a different customer costs
+nothing. A wording with NO entry goes through the **semantic router**
+(`pipeline/router.py`): alias table (free) → local embeddings (fastembed, same-context
+candidates, floor + margin gates) → one LLM verify that maps the slots — then the wording
+is aliased and routes for free forever. Embeddings never decide alone.
 
 Then, per subtask, in order:
 
-- **Library hit** → the compiled selector script replays over Playwright. No LLM, seconds,
-  zero tokens, self-healing included.
+- **Library hit** → the entry's **generated code skill** (`skill.py`, produced by a
+  deterministic transpiler — no LLM writes code) executes over the `api.*` runtime: every
+  verb resolves through the entry's anchor bundle with ranked selectors + fingerprint
+  healing, so DOM drift heals in the anchors, never in the code. Entries the transpiler
+  can't express replay their compiled steps instead. No LLM, seconds, zero tokens.
 - **Miss** → the agent authors just that step, with a prompt scoped to it alone plus the
-  end-state its gate expects. On a passing gate the trace is compiled and committed to the
-  library, so it replays from then on.
+  end-state its gate expects. On a passing gate the trace is compiled, transpiled, and
+  committed to the library, so it replays from then on.
 
 All segments share ONE live browser session: replay and agent segments interleave on the
 same page with no teardown, so each picks up exactly where the previous left off. A task
@@ -173,11 +188,13 @@ flow verdict (`is_successful` — that's the ground-truth gate's job); they gate
 
 ### Adding a task
 
-One entry in `automation/tasks.py`: a `TaskSpec(key=..., prompt=..., marker=..., tags=(...))`.
-The `marker` is the URL fragment of the create-write that proves the record saved (the
-ground-truth gate). **Never edit an existing prompt's wording casually** — the prompt's hash
-is the task's identity, so a reworded prompt orphans its cached subtask split and forces a
-fresh decomposition, which may cut the task differently and miss the library entries the old
+One entry in `tasks.yaml`: a key, a `prompt` written the way a user would say it (no login
+steps — the framework logs in itself), and optionally a `marker` — the URL fragment of the
+create-write that proves the record saved (the ground-truth gate). **Omit the marker** for
+verification / read-only tasks: the gate is then disabled instead of force-failing an
+honest run. **Never edit an existing prompt's wording casually** — the prompt's hash is the
+task's identity, so a reworded prompt orphans its cached subtask split and forces a fresh
+decomposition, which may cut the task differently and miss the library entries the old
 split reused (`tests/test_tasks.py` pins every hash to catch this).
 
 Word shared steps **identically** across tasks. Subtask identity is the wording, so phrasing

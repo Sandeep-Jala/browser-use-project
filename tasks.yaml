@@ -1,0 +1,585 @@
+# Task registry — the single place tasks are defined (loaded by automation/tasks.py).
+# Run one with:  automation --task <key>     or a suite:  automation --suite tag:sales
+#
+# Each entry:
+#   prompt      (required) the task, written exactly as a user would type it. NO login steps:
+#               the framework logs in itself before the agent starts — say "go to Bookkeeping
+#               module", never "go to <url> and login using ...".
+#   marker      (optional) network ground-truth URL fragment: a successful POST/PUT/PATCH to a
+#               URL containing it proves the record saved. OMIT it when a task has no known
+#               create-write (verification / read-only flows) — the gate is then disabled and
+#               success comes from the segment gates + the judge. A missing marker is never an
+#               error.
+#   tags        (optional) suite selection groups (--suite tag:nps).
+#   assertions  (optional) per-task overrides for pipeline/assertions.py.
+#   subtasks    (optional) escape hatch: a declared subtask split (prompt/values/marker/
+#               postcondition per item), only for tasks the LLM decomposer keeps splitting
+#               wrongly.
+#
+# CRITICAL: prompt text is identity. subtask_store.task_id hashes the prompt to key its cached
+# decomposition, so rewording a prompt (words, not whitespace) orphans that cache and its
+# library reuse. tests/test_tasks.py pins every prompt's id for exactly this reason.
+
+# ============================================================ Bookkeeping — Sales
+invoice:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs
+    section,select sales,go to Invoices,add invoice,select a customer Suresh Gopi,select an
+    item bike, set product description 'buying a new bike', set Qty 5, Unit price 500 and
+    click on save
+  marker: Invoices
+  tags: [sales]
+
+credit_notes:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to inputs
+    section,select sales,go to Credit Notes,add credit note,select a customer Metthew,select
+    a invoice ref 011, and click on save.
+  marker: Refunds  # sales credit notes are committed via the /Refunds endpoint
+  tags: [sales]
+
+estimates:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select sales,go to Estimates,add estimate,select customer Mr Jones, select an
+    item from the dropdown and click on save.
+  marker: Invoices  # estimates are persisted via the /Invoices endpoint
+  tags: [sales]
+
+# UI issue while saving (source test doc). If receipts save in the app despite FAIL verdicts,
+# the marker is wrong: change to "Payments" (run 20260707_143005 fired only POST /Payments).
+receipt:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select sales,go to Receipts,add receipt,enter Suresh Gopi in receipts from
+    filed,enter amount 1000,save receipt.
+  marker: Receipts
+  tags: [sales, flaky-ui]
+
+item:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select sales,go to Item,add item,enter name Office Expences, set purchases
+    description to 'buying a new item', set sales description to 'selling a new item',enter
+    unit price purchase 100,enter unit price sell 150,create item.
+  marker: Items
+  tags: [sales]
+
+# ======================================================== Bookkeeping — Purchases
+purchase:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select purchases,add invoice,select customer Le Marche,select an item car from
+    dropdown, set Qty 5, Unit price 500,set vat to No VAT and click on save.
+  marker: Purchase
+  tags: [purchases]
+
+purchase_credit_notes:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select purchases,go to Credit Notes,add credit note,select a supplier Lina,set
+    invoice ref PUR-0071 and click on save.
+  marker: Purchase
+  tags: [purchases]
+
+purchase_po:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select purchases,go to Purchase Orders,add purchase order,select contact name
+    John,select an item furniture and click on save.
+  marker: PurchaseOrders
+  tags: [purchases]
+
+# UI issue while saving (source test doc).
+purchase_payment:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select purchases,go to Payments Section,add payment,enter Gabriel Dobson in Paid
+    to field,enter amount 500,save payment.
+  marker: Payment
+  tags: [purchases, flaky-ui]
+
+# =================================================== Bookkeeping — Expense Claims
+reimbursements:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select expense claims,go to Reimbursements Section,click add reimbursement,select
+    an user name in 'Reimbursed To' field, select an account, enter amount 200,and click on
+    save.
+  marker: Reimbursements
+  tags: [expense_claims]
+
+# Marker verified from run 20260708_161610: the commit is POST .../MileageClaims ("Mileages"
+# is NOT a substring of it and falsely failed a saved record).
+mileage:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select expense claims,go to Mileages Section,click add mileage,select a director
+    from user dropdown,enter 'Mileages Business Trip' in Remarks field,select engine type
+    Petrol,enter description mileage London to Manchester,enter mileage 200,select rate
+    45p,and click on save.
+  marker: MileageClaims
+  tags: [expense_claims]
+
+expense_claims:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select expense claims,click add expense button,select director,enter Office
+    Equipment in remarks field,enter bill no EXP123,enter description Buying New Desks,select
+    account Eu services - 3/4,enter base amount 1500,select vat 5% standard,and click on
+    save.
+  marker: ExpenseClaims
+  tags: [expense_claims]
+
+# UI issue while saving (source test doc).
+refund:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select expense claims,go to Refunds Section,click add refund,select a value in
+    refund from field,select an account,Enter amount 1000 and click on save.
+  marker: Refunds
+  tags: [expense_claims, flaky-ui]
+
+# ==================== Bookkeeping — Journals / Assets / Banking / Budget / Dividends
+# UI issue while saving (source test doc).
+journals:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select journals,click add journal button,enter JRN001 in journal reference
+    field,select an account,enter value in debit 1000,and click on save.
+  marker: Journals
+  tags: [journals, flaky-ui]
+
+fixed_asset:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select assets,click add Fixed assets,enter asset name MacBook Pro,select an
+    account,set purchase price 100,select supplier AO, enter rate 1200 and click on save.
+  marker: Assets
+  tags: [assets]
+
+disposed_asset:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select assets,go to disposed,add dispose asset,select an asset,enter sales
+    proceeds 800,select payment method Customer,select customer Suresh Raina and click on
+    save.
+  marker: Assets
+  tags: [assets]
+
+# Known issue with the IBAN field (source test doc).
+banking:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to banking
+    section,click add account,account type savings, select bank CAF, enter account no
+    126525678, enter sort code 77-26-89,enter IBAN RB003GSD, Make it as Primary account.and
+    click on save.
+  marker: Banking
+  tags: [banking]
+
+budget_manager:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to Budget
+    manager and click add budget.Enter name Q4 Marketing,date 5th Dec,2027.select Frequency
+    yearly,duration 1 year. and click on save.
+  marker: Budget
+  tags: [budget]
+
+dividend:
+  prompt: >-
+    go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs
+    section,select dividends section,click dividends,select an authorised director from
+    dropdown,select a type,enter dividend per share 10,enter payment date 10/10/2026,save
+    asset,save.
+  marker: Dividends
+  tags: [dividends]
+
+# ------------------ Full end-to-end sample with new contact and item creation.
+# NOTE: a create-record flow only replays while the record does not exist — vary the
+# contact/invoice values between runs or delete them in the app first.
+invoice_full_creation:
+  prompt: >-
+    go to Bookkeeping module.search for 290 CREW LIMITED business name and select it.go to
+    inputs section,select sales,go to Invoices,add invoice,create a new Contact name 'dpscvs'
+    in customer field. set address jodhpur, rajasthan, 342015. set supplier address barmer,
+    rajasthan, india, 325486. Supplier Set Due Date 01/01/2027. Set invoice no INV12345. set
+    p.o. reference abc123, create an item 'IT Services',set product description 'service
+    provider', set qty 10 and unit price 5000, set vat to No Vat, set discount 10% and click
+    on save.
+  marker: Invoices
+  tags: [sales, e2e]
+
+# ======================================================================== CRM
+crm_create_invoice:
+  prompt: >-
+    Go to clients section.Search for Zachary Spencer and select it. Go to "create invoice",
+    select a service. set amount to 5000 and set discount to 10%. create a discount
+    note.Select a collection method and click on save.
+  marker: Invoices
+  tags: [crm]
+
+# ================================================================ NPS survey tests
+# Verification flows on the admin side — no known create-write markers, so success comes
+# from the segment gates + the judge. (Test Case 1 in the source doc is empty and skipped.)
+nps_02_review_for_dropdown:
+  prompt: >-
+    Navigate to the user profile icon and click on setting and go to "Practice Profile" under
+    "Practice Config", then under the "basic info" go to "Practice Properties" to locate the
+    “Client Review” setting and note the currently selected option; Next go back to clients
+    section and select a business name randomly. In the Profile section, go to the Assignment
+    section and capture the names of both the Accountant and Account Manager, then go to the
+    Reviews section, click the “Send NPS Survey Request” icon, and verify that the “Review
+    for” dropdown value matches the correct user based on the selected Client Review setting;
+    finally, return to Practice Properties and click on the pencil icon of this section,
+    change the “Client Review” setting to a different option and save it, go back to the same
+    business’s Reviews section and click on “Send NPS Survey Request” icon and confirm that
+    the “Review for” dropdown updates correctly according to the new setting. Then Again
+    return to Practice Properties and click on the pencil icon of this section, change the
+    “Client Review” setting to a different option other than the previous ones and save it,
+    go back to the same business’s Reviews section and click on “Send NPS Survey Request”
+    icon. Confirm that the “Review for” dropdown updates correctly according to this new
+    setting.
+  tags: [nps]
+
+nps_03_mandatory_review_for:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to the "Reviews" section and click the "Send NPS survey request" icon and attempt to send
+    an NPS mail without selecting a 'Review for' option. Verify that the mail is not sent.
+  tags: [nps]
+
+nps_04_review_for_tag:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to the "Reviews" section and click the "Send NPS survey request" icon. select a name from
+    'Review for' dropdown and verify that the selection dropdown correctly updates name
+    dynamically in the email template.
+  tags: [nps]
+
+nps_05_cc_bcc:
+  prompt: >-
+    Navigate to the user profile icon and click on setting and go to "Practice Profile" under
+    "Practice Config", then under the "basic info" go to the Emails section. Find the "CCs"
+    field look for the mail in it and remember that mail.Find the "BCCs" field look for the
+    mail in it and remember that mail. Then go to the clients section and select a business
+    name randomly. Then in the Profile section go to the Reviews section and click the "Send
+    NPS survey request" icon. Check that the mail shown in "CC" and "BCC" fields matches
+    accordingly.
+  tags: [nps]
+
+nps_06_recipient_sync:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section check
+    the email id of the clicnt in the basic details section, then go to "Reviews" and click
+    the "Send NPS survey request" icon and verify that th email id appears in the 'To' field.
+    Then come back to the basic details section and Remove it and again go to "Reviews" and
+    click the "Send NPS survey request" icon and verify that th email id get removed in the
+    'To' field.
+  tags: [nps]
+
+# "Need to check" in the source test doc.
+nps_07_duplicate_requests:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and click the "Send NPS survey request" icon. Attempt to send an NPS mail
+    from 'Me' without a mail link. Verify the error message and close the modal. Come back to
+    the reviews section and ensure duplicate requests are not created when clicking 'Send
+    Anyways'.
+  tags: [nps]
+
+nps_08_pending_requests_tag:
+  prompt: >-
+    Navigate to the Clients section and select any business randomly, then go to the
+    "Profile" section and then to the "Reviews" section. Click on the "Send NPS survey
+    request" button and select "no reply" in from section and send the email. Once sent,
+    verify that a tag appears showing the pending request count, ensuring it includes only
+    pending requests and excludes submitted ones. Verify that a corresponding entry is
+    recorded in the history log indicating that the NPS survey request was sent.
+  tags: [nps]
+
+# "Need to check" in the source test doc.
+nps_09_drafts_sync:
+  prompt: >-
+    Go to clients section and select a business name randomly. Then in the "Profile" section,
+    go to "Reviews" and click "Send NPS survey request". Schedule an request and verify it's
+    saved in and sent from the Drafts section.
+  tags: [nps]
+
+# "Need to check" in the source test doc.
+nps_10_notification_options:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and click "Send NPS survey request". Verify all notification options in the
+    template correctly notify staff upon submission.
+  tags: [nps]
+
+nps_11_survey_details:
+  prompt: >-
+    Go to clients section and select a business name randomly. . In the "Profile" section, go
+    to "Reviews" and click "Send NPS survey request", select 'no reply" in from section and
+    send the mail. Then go to the "Reviews" section in the "Profile" area and click the "View
+    all" icon. Verify all survey details are displayed correctly.
+  tags: [nps]
+
+nps_12_review_conversion:
+  prompt: >-
+    Navigate directly to https://appuat.actingoffice.com/admin/clients/business/69bd2f62c00ef1d735ebc3df.
+    Go to the "Profile" section and scroll down to find the "Reviews" section.2. Click the
+    "Send NPS survey request" icon.3. In the email dialog, select "no-reply" in the From
+    field, then send the email.4. Wait 3 seconds, then click the "View all" icon inside the
+    Reviews section.5. A panel will open with "Review" and "Survey" sub-sections — scroll all
+    the way to the bottom of the "Survey" list to find the last NPS row. 6.then click the
+    "Open NPS survey" icon of that last row to open the NPS survey. It will redirect to a new
+    page. 7. On the feedback page, give a rating, enter a description, and submit the
+    feedback form. 8. After submission, navigate back to:
+    https://appuat.actingoffice.com/admin/clients/business/69bd2f62c00ef1d735ebc3df. 9. Wait
+    3 seconds, then click the "View all" icon inside the Reviews section. 10. A panel will
+    open with "Review" and "Survey" sub-sections. Verify that the newly submitted nps survey
+    details now appear in the reviews list.
+  tags: [nps]
+
+nps_13_name_logic:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and click the "View all" icon. In the list, verify the Reviewer name matches
+    the survey submitter and the 'Review for' field matches the recipient. Ensure names do
+    not switch.
+  tags: [nps]
+
+nps_14_expand_collapse:
+  prompt: >-
+    Go to clients section and select a business 290 CREW LIMITED. In the "Profile" section, go
+    to "Reviews" and click the "View all" icon. Verify if the expand/collapse icon in the
+    Review list functions correctly.
+  tags: [nps]
+
+nps_15_review_format:
+  prompt: >-
+    Go to clients section and select a business name randomly. . In the "Profile" section, go
+    to "Reviews" and click "Send NPS survey request" button, select no-reply from dropdown in
+    from section and send the mail.Then go to the "Reviews" section in the "Profile" area and
+    click the "View all" icon and go to the last req no in servey section and select the
+    "Open nps survey" redirect link and this will redirect to a new page. Give a rating of 8,
+    provide a description and remember it . Then submit the feedback form. and come back to
+    https://appuat.actingoffice.com/admin/clients/business/69bd2f62c00ef1d735ebc3df and hover
+    the "Reviews" section in the "Profile" area and click the "View all" icon and click the
+    expand icon in the Review list and Verify that reviews created via NPS have a blank title
+    and that the feedback correctly appears in the description field.
+  tags: [nps]
+
+nps_16_number_reference:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and click the "View all" icon. Verify that all reviews created through NPS
+    display their corresponding NPS number.
+  tags: [nps]
+
+nps_17_manual_review_visibility:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and Click on Add review button. Fill all the required details and submit
+    then click the "View all" icon verify the recent added manual review appears in the
+    Review list.
+  tags: [nps]
+
+nps_18_form_redirection:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to "Reviews" and click the "View all" icon. Verify that the redirection button next to
+    the NPS number in the list correctly opens the NPS form.
+  tags: [nps]
+
+nps_19_review_restriction:
+  prompt: >-
+    Go to clients section and select a business name randomly. Verify that reviews created
+    through NPS cannot be modified (edited or deleted) from the review table.
+  tags: [nps]
+
+nps_20_manual_review_management:
+  prompt: >-
+    Go to clients section and select a business name randomly. In the "Profile" section, go
+    to the "Reviews" section and click the "Add reviews" icon. Fill all the required details
+    and submit and check that manual review can be edited and deleted correctly in the review
+    section. Then go to history section near profile and verify its presence in the history
+    log.
+  tags: [nps]
+
+nps_21_review_for_name_sync:
+  prompt: >-
+    Go to clients and select a business name randomly. In the "Profile" section, go to the
+    "Reviews" section, click on "Send NPS survey request" icon, note the name shown in the
+    "Review for" field, select "no-reply" and click Send. Then click the "View All" icon on
+    the Reviews section, find the latest survey request and click "Open NPS Survey" to open
+    the form. On the NPS survey page, verify that the "Review for" name shown matches the
+    name noted previously.
+  tags: [nps]
+
+nps_22_mandatory_rating:
+  prompt: >-
+    Go to clients and select a business name randomly. Go to the "Profile" section and scroll
+    down to find the "Reviews" section and click the "View All" icon, find a pending survey
+    and click "Open NPS Survey". On the NPS form page, do not select any rating and click the
+    Submit button, then verify that an error message appears prompting the user to provide a
+    rating before submitting. Finally, select a rating of 8, click Submit, and verify the
+    submission completes successfully.
+  tags: [nps]
+
+nps_23_feedback_persistence:
+  prompt: >-
+    Go to clients and select a business name randomly. Go to the "Profile" and then to
+    "Reviews" section.Click the "Send NPS survey request" icon. Select "no-reply" in the From
+    field and send the email. Then click the "View all" icon inside the Reviews section. A
+    panel will open with "Review" and "Survey" sub-sections — scroll all the way to the
+    bottom of the "Survey" list to find the last NPS row. Then click the "Open NPS survey"
+    icon of that last row to open the NPS survey. It will redirect to a new page. enter a
+    short feedback text (e.g. 1-2 sentences), give a rating of 8, and submit. Come back to
+    the same business and then click the "View all" icon inside the Reviews section and
+    verify the short feedback is saved in the description of the review by clicking on the
+    expand icon of that review. Now repeat the same with a long description now. Come back to
+    home page and go to the reports section -> reports -> "Review Analysis" under client
+    based reports and check it is shown clearly under "Review Analysis Report".
+  tags: [nps]
+
+# Needs staff and manager credentials for the role-visibility half (source test doc).
+nps_24_feedback_privacy:
+  prompt: >-
+    Go to clients and select a business name randomly. Go to the "Profile" section and scroll
+    down to find the "Reviews" section.2. Click the "Send NPS survey request" icon. Select
+    "no-reply" in the From field, then send the email.4. Wait 3 seconds, then click the "View
+    all" icon inside the Reviews section.5. A panel will open with "Review" and "Survey"
+    sub-sections — scroll all the way to the bottom of the "Survey" list to find the last NPS
+    row. 6.then click the "Open NPS survey" icon of that last row to open the NPS survey. It
+    will redirect to a new page. Give a rating and enter a description, check the option "I'd
+    prefer my feedback not to be shared with my accountant" and submit. Go to View All and
+    verify the feedback/description is visible to Admin. Then log in as a Manager, go to the
+    same review, and verify the private feedback is hidden. Finally, log in as a Staff
+    member, go to the same review, and verify the private feedback is hidden.
+  tags: [nps]
+
+nps_25_client_name_sync:
+  prompt: >-
+    Go to clients and select a business name randomly.. Go to the "Profile" section and
+    scroll down to locate the "Reviews" section. Click the "Send NPS survey request" icon. In
+    the email dialog, select "no-reply" in the From field and send the email. Wait for 3
+    seconds, then click the "View all" icon inside the Reviews section. A panel will open
+    with "Review" and "Survey" sub-sections — scroll to the bottom of the "Survey" list and
+    locate the last NPS row. Click the "Open NPS survey" icon for that row to open the survey
+    in a new page. Enter a specific name (e.g. "Robert Johnson") in the "Enter Your Name"
+    field, provide a rating of 8, and submit the survey.Return to
+    https://appuat.actingoffice.com/admin/clients/business/63d93e001917e8efee8b70e2, click
+    the "View all" icon again in the Reviews section, locate the submitted review, and verify
+    that the reviewer name is displayed as "Robert Johnson" by expanding the review. Finally,
+    navigate to Reports → Reports → "Review Analysis" under client-based reports, and verify
+    that the same review appears in the "Review Analysis Report" with the Reviewer Name
+    column showing "Robert Johnson".
+  tags: [nps]
+
+nps_26_submission_loading:
+  prompt: >-
+    Go to clients and select a business name randomly. . Click the View All icon, find a
+    pending survey, and click "Open NPS Survey". Select a rating of 8, click the Submit
+    button, and immediately verify that a loading UI (indicator, spinner, disabled button, or
+    progress state) is shown correctly during submission.
+  tags: [nps]
+
+nps_27_report_structure:
+  prompt: >-
+    Navigate to Reports → Reports → "Review Analysis" under client-based reports.Verify that
+    there are two tabs available: "Review Analysis Report" and "NPS Survey Report". Click on
+    the "Review Analysis Report" tab and review the list of entries. Confirm that it includes
+    both manually added reviews and NPS-submitted reviews. For the NPS-submitted reviews,
+    verify that an NPS reference number (e.g. NPS-XXX) is displayed in the reference column.
+    Next, click on any review’s hyperlinked reference number from the Review analysis report
+    section and verify that it opens a side panel displaying the detailed information of that
+    review.
+  tags: [nps]
+
+nps_28_report_privacy_columns:
+  prompt: >-
+    Go to Reports → Review Analysis Report, use the download/export option to download the
+    report data. Open the downloaded file, check that the data appears correctly with all
+    expected columns, and verify there is a column for private feedback that shows "Yes" for
+    any review where the client gave private feedback. Verify that as Admin the private
+    feedback content is visible in the report, and as Manager or Staff, the private feedback
+    content is hidden but the "Yes" marker may show.
+  tags: [nps]
+
+nps_29_report_filters:
+  prompt: >-
+    Go to Reports → Review Analysis Report. Type a known reviewer name or reference number
+    into the search box and verify the results filter correctly to show only matching
+    entries. Apply a date range filter (e.g. last 30 days) and verify that only reviews
+    within that date range are shown. Apply any other available filters (e.g. rating, type,
+    assigned person) and verify each filter narrows results correctly.
+  tags: [nps]
+
+nps_30_report_columns:
+  prompt: >-
+    Go to Reports → Review Analysis Report. Click the "Choose Columns" icon/button and verify
+    that a list of selectable columns appears. Uncheck one of the currently visible columns
+    (e.g. "Description"), apply or close the selector, and verify that the column is no
+    longer shown in the report table. Re-open the Choose Columns selector, re-check the
+    column, and verify the column reappears in the report table.
+  tags: [nps]
+
+nps_31_report_pagination:
+  prompt: >-
+    Go to Reports → Review Analysis Report. Verify there are enough entries to trigger
+    pagination (multiple pages), click the "Next page" button and verify the next page of
+    results loads correctly, then click the "Previous page" button and verify it returns to
+    the previous page. If a page number selector is available, click a specific page number
+    and verify it loads that page. Check that entries do not repeat across pages and no
+    entries are skipped.
+  tags: [nps]
+
+nps_32_report_date_accuracy:
+  prompt: >-
+    Go to clients and select a business name randomly. and send an NPS survey, noting the
+    exact date and time it was sent. Go to Reports → Review Analysis Report → NPS Survey
+    Report tab, find the survey that was just sent, and verify the "Sent On" date matches the
+    noted date and time. Then, open the NPS survey link and submit a rating, noting the
+    submission date/time. Return to the NPS Survey Report, find the same entry, and verify
+    the "Submitted On" date now shows the correct submission date.
+  tags: [nps]
+
+nps_33_unsubmitted_status:
+  prompt: >-
+    Go to clients and select a business name randomly. and send an NPS survey but do not
+    submit it. Go to Reports → Review Analysis Report → NPS Survey Report tab, find the
+    unsubmitted survey, and verify its status is "Sent" (not "Submitted" or "Completed").
+    Check the "Submitted On" column for this entry and verify it is blank or empty.
+  tags: [nps]
+
+nps_34_report_open_form:
+  prompt: >-
+    Go to Reports → Review Analysis Report → NPS Survey Report tab. Locate any survey entry
+    in the list, find the button or icon to open the NPS form for that entry, click it, and
+    verify that the correct NPS survey form opens (matching the reference number of the
+    selected entry).
+  tags: [nps]
+
+nps_35_multi_year_collection:
+  prompt: >-
+    Go to clients and select a business name randomly. and send an NPS survey with "Review
+    for" set to a specific person (e.g. the Accountant). Open the survey form and submit a
+    rating of 8. After the first is submitted, send a second NPS survey to the same client
+    with "Review for" set to the same person. Open the new survey form, verify that the form
+    does NOT show a "survey already submitted" message or prevent submission. Submit the
+    second survey with a rating of 9, verify the submission is successful, and check the
+    Reviews list to confirm both surveys/reviews are present separately.
+  tags: [nps]
+
+nps_36_all_in_one_report:
+  prompt: >-
+    Go to Reports → Review Analysis Report. Under the "Review Analysis Report" tab, verify UI
+    controls one by one: click on a reference number to ensure the side panel opens and
+    closes correctly; click the Refresh button to ensure report data reloads; click
+    Download/Export to ensure a download triggers; enter a reference number or name in Search
+    to verify filtering; apply a From Date and To Date to verify date filtering; add a
+    "Criteria" → "Rating" filter to verify specific result filtering; and test the pagination
+    controls. Then, select the "NPS Survey Report" tab and verify the same set of UI controls
+    (reference number click, refresh, download, search, date filters, rating filter, and
+    pagination). Lastly, next to any NPS entry, click the "Open NPS Survey" button, select a
+    rating of 8 out of 10 on the new page, submit it, and verify the submission is
+    successful.
+  tags: [nps]

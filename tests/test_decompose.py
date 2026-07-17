@@ -173,3 +173,64 @@ async def test_no_llm_no_cache_gives_whole_prompt_fallback(library):
     assert len(subs) == 1
     assert subs[0].template_prompt == "just do the thing"
     assert subs[0].marker is None
+    assert subs[0].kind == "action"
+
+
+# ------------------------------- node kinds (action | judge) -------------------------------
+
+
+def test_node_kind_heuristic():
+    # Verification wording -> judge (cognitive: always LLM, never cached).
+    assert decompose.node_kind("verify the CC field matches", None) == "judge"
+    assert decompose.node_kind("Check that the mail is not sent", None) == "judge"
+    assert decompose.node_kind("note the currently selected option", None) == "judge"
+    assert decompose.node_kind("remember that mail", None) == "judge"
+    assert decompose.node_kind("capture the names of both users", None) == "judge"
+    assert decompose.node_kind("Confirm that the dropdown updates", None) == "judge"
+    # Record types and action wording never classify as judge: "credit note" is a noun,
+    # "check the option" is a click on a checkbox.
+    assert decompose.node_kind("add credit note,select a customer and click save",
+                               None) == "action"
+    assert decompose.node_kind('check the option "no sharing" and submit', None) == "action"
+    assert decompose.node_kind("go to inputs section,select sales", None) == "action"
+    # A marker-owning subtask is ALWAYS action — its network gate is machine ground truth.
+    assert decompose.node_kind("verify and save the record", "Invoices") == "action"
+    # An explicit declaration wins over the heuristic.
+    assert decompose.node_kind("go to the reviews section", None, declared="judge") == "judge"
+    assert decompose.node_kind("verify it worked", None, declared="action") == "action"
+
+
+JUDGE_PROMPT = "go to the reviews section. verify the mail is not sent"
+JUDGE_REPLY = json.dumps({"subtasks": [
+    {"template_prompt": "go to the reviews section", "values": {}, "is_save_step": False},
+    {"template_prompt": "verify the mail is not sent", "values": {}, "is_save_step": False},
+]})
+
+
+@pytest.mark.asyncio
+async def test_judge_kind_assigned_and_survives_the_cache(library):
+    subs = await decompose.get_decomposition(JUDGE_PROMPT, llm=StubLLM(JUDGE_REPLY),
+                                             marker=None)
+    assert [s.kind for s in subs] == ["action", "judge"]
+    cached = ss.load_decomposition(ss.task_id(JUDGE_PROMPT))
+    assert [d["kind"] for d in cached["subtasks"]] == ["action", "judge"]
+    # Tier-2 rebuild from the cache preserves the kinds.
+    again = await decompose.get_decomposition(JUDGE_PROMPT, llm=None, marker=None)
+    assert [s.kind for s in again] == ["action", "judge"]
+
+
+@pytest.mark.asyncio
+async def test_marker_overrides_judge_wording_on_the_save_subtask(library):
+    # With a parent marker and no declared save step, the LAST subtask becomes the save
+    # owner — and a marker-owning node is action even with verification wording.
+    subs = await decompose.get_decomposition(JUDGE_PROMPT, llm=StubLLM(JUDGE_REPLY),
+                                             marker="Reviews")
+    assert subs[1].marker == "Reviews"
+    assert [s.kind for s in subs] == ["action", "action"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_is_judge_for_markerless_verification_task(library):
+    subs = await decompose.get_decomposition(
+        "verify that the report shows the review", llm=None, marker=None)
+    assert len(subs) == 1 and subs[0].kind == "judge"

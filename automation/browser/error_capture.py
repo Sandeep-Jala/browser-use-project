@@ -32,6 +32,6 @@ async def save_login_error_screenshot(
         await page.screenshot(path=str(out_path), full_page=True)
         print(f"[!] Saved failure screenshot: {out_path}")
         return out_path
-    except Exception as exc:  # noqa: BLE001 - best-effort, must not raise
+    except Exception:  # noqa: BLE001 - best-effort, must not raise
         logger.exception("Failed to capture error screenshot (%s)", name)
         return None

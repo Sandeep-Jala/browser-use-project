@@ -11,6 +11,21 @@ of one site, so no per-app navigation map is needed.
 """
 from __future__ import annotations
 
+import re
+
+# Word-adjacent dots, as in "Locator.click" or "test.example.com". browser-use scans the
+# TASK TEXT for URL-looking tokens and NAVIGATES to the first one as an initial action —
+# observed live: a raw Playwright error embedded in a recovery prompt made the agent open
+# "https://Locator.click" and destroy the dirty page state it was meant to recover.
+_DOTTED = re.compile(r"(?<=\w)\.(?=\w)")
+
+
+def sanitize_failure(text: str) -> str:
+    """A prior-failure message made safe to embed in an agent task: one compact line,
+    capped, with word-adjacent dots spaced out so nothing in it looks like a URL."""
+    line = " ".join(str(text or "").split())[:220]
+    return _DOTTED.sub(" ", line)
+
 
 # --- Agent system rules (appended to the agent's system prompt every step) -------------------
 SPEED_OPTIMIZATION_PROMPT = """
@@ -20,7 +35,9 @@ SPEED_OPTIMIZATION_PROMPT = """
 
 SPEED & EFFICIENCY
 - Be concise and direct. Skip unnecessary narration.
-- Chain multiple safe actions in a single step whenever possible.
+- You can execute exactly ONE action per step — multi-action
+  chains will NOT run. Pick the single action that makes the
+  most progress.
 - Prefer the most direct path to the goal.
 
 ───────────────────────────────────────────────────────────
@@ -82,6 +99,36 @@ field, tab, row, client, file, section, or action target:
     as one failed attempt toward the 3–4 limit.
   • FIRST recovery approach: find_by_text("<the element's label>").
   • After exhausting meaningful approaches → use an escape-hatch tool.
+
+───────────────────────────────────────────────────────────
+LOOK BEFORE YOU CLICK — never click a guessed index
+───────────────────────────────────────────────────────────
+Before every click, check what the element list actually shows
+at the index you chose:
+  • If your target's label is clearly visible on that element →
+    click it directly. No extra discovery step needed.
+  • If the element shows NO matching label — a bare "<button/>",
+    a container "<div>", or a lookalike label near where you
+    expect the target — that click is a GUESS. Do NOT make it.
+    First call find_by_text("<your target's label>"), or
+    list_actions("<nearest heading or row text>") when the label
+    might be icon-only, and click the element THEY identify.
+One discovery call on an ambiguous target is far cheaper than a
+misclick: recovering costs go_back plus re-locating, and acting
+on the wrong element can corrupt the workflow entirely.
+
+───────────────────────────────────────────────────────────
+SETTLE AFTER NAVIGATION — one wait, then re-look
+───────────────────────────────────────────────────────────
+This app renders slowly. After a click that navigates or should
+open a menu/panel/form, the expected content may not be in the
+element list yet:
+  • wait 1–2 seconds ONCE, then re-read the page before hunting
+    elsewhere or concluding the content is missing.
+  • Never chain repeated waits — one settle, then act on what
+    you see (or apply the ELEMENT NOT FOUND POLICY).
+Deliberate waits are load-bearing: they also compile into the
+replay script (capped at 3s) so fast replays don't outrun the UI.
 
 ───────────────────────────────────────────────────────────
 SEARCH BOXES — ALWAYS press Enter after typing
@@ -418,6 +465,27 @@ get DIFFERENT names.
 """
 
 
+ROUTER_VERIFY_SYSTEM_PROMPT = """\
+You decide whether two browser-automation subtask instructions describe the SAME UI \
+procedure — the identical sequence of clicks/fills on the same screens — differing only \
+in wording and in the concrete values. You are the gate that stops a lookalike ("add a \
+credit note" vs "add an invoice"; "delete X" vs "create X") from replaying the wrong \
+recorded procedure, so when in doubt answer false.
+
+You get the CANONICAL instruction (with its named {{params}}) and a NEW instruction \
+(with its own {{tokens}} and their current values). Output ONLY strict JSON:
+  {"same": <true|false>, "slots": {"<new_token>": "<canonical_param>", ...}}
+
+Rules:
+- "same": true ONLY if every action in the canonical procedure is what the new \
+instruction asks for, in the same order, with nothing added or removed.
+- "slots" maps each NEW token to the canonical param playing the same role. EVERY \
+canonical param must be mapped from exactly one new token; if that is impossible, \
+answer {"same": false, "slots": {}}.
+- Never map two new tokens to one canonical param.\
+"""
+
+
 DECOMPOSE_SYSTEM_PROMPT = """\
 You split a browser-automation task into an ordered list of SUBTASKS for a hybrid \
 record/replay engine. Each subtask is a self-contained UI milestone that starts and ends in \
@@ -464,6 +532,8 @@ def scoped_subtask_prompt(
     prior_failure: str | None = None,
     expected_end: str | None = None,
     owns_save: bool = False,
+    findings: list[str] | None = None,
+    observe: bool = False,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
 
@@ -476,7 +546,10 @@ def scoped_subtask_prompt(
     Carries the per-action verification discipline inline (segments are not expanded into
     numbered plans), plus `expected_end` — a concrete done-condition read from the
     library entry's gate: the end state this segment reached in previous SUCCESSFUL runs.
-    `owns_save` marks the segment whose final action commits the record.
+    `owns_save` marks the segment whose final action commits the record. `findings` are
+    the observations earlier segments recorded ("prompt: outcome" lines) — the data a
+    verify step compares against. `observe` marks a judge node: its done message must
+    carry the observed facts, because later segments receive it as a finding.
     """
     lines = [
         "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
@@ -485,12 +558,18 @@ def scoped_subtask_prompt(
     if completed:
         lines.append("\nAlready done (do NOT redo, verify, or navigate back to these):")
         lines.extend(f"  - {c}" for c in completed)
+    if findings:
+        lines.append(
+            "\nOBSERVATIONS recorded by the completed steps — facts your step may need. "
+            "Trust these values; do NOT navigate back to re-check them:")
+        lines.extend(f"  - {f[:400]}" for f in findings)
     lines.append(
         "\nDo NOT navigate to the app root, re-select the business, or restart the flow."
     )
     lines.append(f"\nYOUR ONLY JOB: {subtask}")
     if dirty:
-        failure = f" It failed with: {prior_failure}." if prior_failure else ""
+        failure = (f" It failed with: {sanitize_failure(prior_failure)}."
+                   if prior_failure else "")
         lines.append(
             f"\nA previous automated attempt at THIS step partially completed it and then "
             f"stopped.{failure} Inspect the current page state FIRST — fields may already "
@@ -520,6 +599,16 @@ def scoped_subtask_prompt(
             "verify_save_registered; only report success after it returns CONFIRMED. NOT "
             "REGISTERED means validation blocked the save: find the error messages on the "
             "form, fix those exact fields, and save again."
+        )
+    if observe:
+        lines.append(
+            "\nThis is an OBSERVATION/VERIFICATION step. Your final done message is its "
+            "product: state exactly WHAT YOU OBSERVED — the concrete values, names, or "
+            "settings you read — and the verdict (e.g. 'Client Review setting = Account "
+            "Manager; Review for dropdown showed John Smith (the Account Manager) — "
+            "MATCH'). Later steps receive your message as recorded fact, so a bare "
+            "'done' or 'verified' without the observed values is a FAILED step. Report "
+            "honestly: if the check does NOT hold, say so and state what you saw instead."
         )
     if remaining:
         lines.append("\nStill ahead in this workflow (context only — each is handled "

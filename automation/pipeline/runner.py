@@ -11,6 +11,7 @@ replays on the same live page.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import signal
@@ -91,6 +92,82 @@ def _search_typed_text(last_action: dict[str, Any] | None) -> str | None:
     if any("search" in str(attrs.get(k) or "").lower() for k in _SEARCHY_ATTRS):
         return text
     return None
+
+
+# Read-only discovery actions: none of these change the page, so a long unbroken run of
+# them means the agent is hunting in circles instead of acting.
+_DISCOVERY_ACTIONS = {"list_actions", "search_page", "find_elements", "capped_scroll",
+                      "scroll", "find_by_text_lookup"}
+# Consecutive discovery actions before the loop nudge fires (and re-fires every multiple).
+_DISCOVERY_LOOP_AT = 4
+
+
+def _action_name(entry: dict[str, Any]) -> str:
+    """The action's name from a history.model_actions() entry ({name: params,
+    "interacted_element": ...})."""
+    return next((k for k in entry if k != "interacted_element"), "")
+
+
+def discovery_loop_notice(actions: list[dict[str, Any]]) -> str | None:
+    """A loop-breaking notice when the trailing actions are ALL read-only discovery, else
+    None. Observed live: after misreading a find_by_text click receipt, the agent spent 18
+    consecutive list/search/scroll steps hunting a control that had already been clicked —
+    this fires every _DISCOVERY_LOOP_AT-th consecutive discovery step to force a decision.
+
+    A find_by_text WITHOUT click_first counts as discovery; with click_first it acts on
+    the page and resets the streak (model_actions carries the raw params, so the caller
+    maps it to "find_by_text_lookup" before counting — see _nudge_if_discovery_loop)."""
+    streak = 0
+    for entry in reversed(actions):
+        if _action_name(entry) in _DISCOVERY_ACTIONS:
+            streak += 1
+        else:
+            break
+    if streak < _DISCOVERY_LOOP_AT or streak % _DISCOVERY_LOOP_AT:
+        return None
+    return (
+        f"⚠ DISCOVERY LOOP: your last {streak} actions were ALL read-only discovery "
+        "(scroll / list_actions / search_page / find_elements) — no clicks, no input. "
+        "More listing will not reveal anything new. Decide NOW:\n"
+        "  1. If an earlier find_by_text receipt said it ALREADY CLICKED your target, the "
+        "click happened — check for its EFFECT (did a panel/section open?) instead of "
+        "re-finding the control.\n"
+        "  2. Otherwise call find_by_text('<target label>', click_first=true) ONCE.\n"
+        "  3. If that fails, apply the ELEMENT NOT FOUND POLICY (skip_step or "
+        "fail_and_stop). Do NOT run another discovery action."
+    )
+
+
+def restore_result_metadata(history: Any, record_path: Path) -> bool:
+    """Re-inject ActionResult.metadata into a saved recording (True if anything landed).
+
+    browser-use's save_history serializes results WITHOUT their `metadata` field — which is
+    where find_by_text records the element it clicked (agent_tools). Without this pass,
+    every find_by_text click in a saved recording compiles to NOTHING and the committed
+    script silently loses its clicks (observed live: the Reviews "View all" segment
+    committed zero steps). The in-memory history still carries the metadata, so after
+    save_history we copy it into the JSON where compile_recording expects it.
+    """
+    try:
+        data = json.loads(record_path.read_text())
+        items = data.get("history", [])
+        changed = False
+        for i, item in enumerate(getattr(history, "history", None) or []):
+            if i >= len(items):
+                break
+            saved = items[i].get("result") or []
+            for j, res in enumerate(getattr(item, "result", None) or []):
+                md = getattr(res, "metadata", None)
+                if md and j < len(saved) and isinstance(saved[j], dict) \
+                        and not saved[j].get("metadata"):
+                    saved[j]["metadata"] = md
+                    changed = True
+        if changed:
+            record_path.write_text(json.dumps(data, indent=2))
+        return changed
+    except Exception as exc:  # noqa: BLE001 - enrichment must never lose the recording
+        logger.warning("could not restore result metadata into %s: %s", record_path, exc)
+        return False
 
 
 def _inject_context(agent: Any, notice: str) -> bool:
@@ -250,6 +327,9 @@ class Runner:
             max_actions_per_step=1,
             # plan_update echo in every step's output; redundant with the expanded task that is
             # resent each step. ENABLE_PLANNING=false in .env turns it off (default on).
+            # Worth an A/B off: scoped_subtask_prompt already restates the job every step, so
+            # the echo is redundant token weight a small model can drift on. Not flipped yet —
+            # measure before changing the default.
             enable_planning=self.config.enable_planning,
             extend_system_message=self.extend_system_message,
             # Custom actions the prompts rely on (skip_step, fail_and_stop, capped_scroll,
@@ -261,6 +341,9 @@ class Runner:
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop
             # override prompt on Ctrl+C, so disable browser-use's own signal handler.
             enable_signal_handler=False,
+            # Recovery headroom for consecutive step failures — the 0.13.3 default, pinned
+            # explicitly so a library upgrade can't silently move it.
+            max_failures=5,
         )
 
         # Stamp each captured telemetry event with the agent step it fired on, and service any
@@ -297,6 +380,23 @@ class Runner:
                 logger.info("⚠ unintended-navigation nudge injected (back to %s)", urls[-1])
             except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
                 logger.debug("navigation nudge skipped: %s", exc)
+
+        def _nudge_if_discovery_loop(_agent: "AgentType") -> None:
+            """Flail detector: inject a loop-breaking redirect when the agent has done
+            nothing but read-only discovery for several steps (see discovery_loop_notice)."""
+            try:
+                actions = []
+                for entry in _agent.history.model_actions() or []:
+                    name = _action_name(entry)
+                    if name == "find_by_text" and not (entry.get(name) or {}).get("click_first"):
+                        actions.append({"find_by_text_lookup": {}})  # lookup = discovery
+                    else:
+                        actions.append(entry)
+                notice = discovery_loop_notice(actions)
+                if notice and _inject_context(_agent, notice):
+                    logger.info("⚠ discovery-loop nudge injected")
+            except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
+                logger.debug("discovery-loop nudge skipped: %s", exc)
 
         def _nudge_if_search_typed(_agent: "AgentType") -> None:
             """Search-Enter enforcement: many lists in this app only run the search when Enter
@@ -363,6 +463,7 @@ class Runner:
                 collector.current_step = step_state["n"]
             _nudge_if_unintended_navigation(_agent)
             _nudge_if_search_typed(_agent)
+            _nudge_if_discovery_loop(_agent)
             await _surface_notifications(_agent)
             if pause_state["requested"]:
                 pause_state["requested"] = False
@@ -407,6 +508,9 @@ class Runner:
             try:
                 record_path.parent.mkdir(parents=True, exist_ok=True)
                 agent.save_history(str(record_path))
+                # save_history drops ActionResult.metadata (find_by_text's clicked-element
+                # record); put it back so those clicks compile into the golden script.
+                restore_result_metadata(history, record_path)
                 logger.info("recorded action trace -> %s", record_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not save recording: %s", exc)

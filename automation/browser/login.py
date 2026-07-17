@@ -92,7 +92,7 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
     # is charged on EVERY Playwright call here (~10s of dead time before the agent starts).
     browser = await playwright.chromium.launch(
         headless=config.headless,
-        args=[f"--remote-debugging-port={config.cdp_port}"],
+        args=[f"--remote-debugging-port={config.cdp_port}", "--window-size=1440,900"],
         # Don't let Playwright tear down the browser on Ctrl+C: the Runner installs its own
         # SIGINT handler for the human-in-the-loop pause (see runner._prompt_and_inject), and
         # the browser must survive the pause so the agent can resume against it.
@@ -100,7 +100,13 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
     )
     cdp_url = f"http://localhost:{config.cdp_port}"
 
-    context = await browser.new_context()
+    # This context is the one browser-use later attaches to over CDP, so ITS viewport owns
+    # the geometry of every screenshot the agent sees. Playwright's 1280×720 default crops
+    # this app's dense screens; 1440×900 keeps toolbars and table rows on-screen so element
+    # indexes map to what the model can actually read (fewer misclicks / "not found").
+    context = await browser.new_context(
+        viewport={"width": 1440, "height": 900}, device_scale_factor=1.0,
+    )
     page = await context.new_page()
 
     try:

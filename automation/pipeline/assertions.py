@@ -1,7 +1,7 @@
 """Declarative post-run assertions over the collected telemetry.
 
 Pure functions over RunResult-shaped data — no I/O, no Playwright. A spec is a small dict of
-rules (DEFAULT_SPEC suite-wide, overridable per task via TaskSpec.assertions); `evaluate`
+rules (DEFAULT_SPEC globally, overridable per task via TaskSpec.assertions); `evaluate`
 turns it into AssertionResults with the offending requests/console entries as evidence, and
 `apply` stamps them onto a RunResult.
 

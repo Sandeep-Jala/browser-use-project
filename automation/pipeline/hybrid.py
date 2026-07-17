@@ -16,25 +16,35 @@ This is the ONLY execution path: there is no whole-task replay tier above it. A 
 faster as its subtasks land in the library — and because the library is keyed on (tokenized
 prompt, page context) rather than the parent task, a subtask recorded by one task replays
 inside every other task that shares that wording.
+
+Composition nodes are TYPED (decompose.node_kind): "action" nodes replay from the library;
+"judge" nodes are cognitive — their success is a judgment (verify/compare/observe) that
+cannot survive compilation into a selector script, so they always run as agent segments and
+are never committed (a replayed judge would walk the clicks with nobody looking and report
+a hollow pass). Observations flow FORWARD: each completed segment's finding (its distilled
+final result) is handed to every later agent segment, so a note-then-verify task can compare
+against what was actually observed instead of guessing.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from playwright.async_api import Page
 
+from automation import skills
 from automation.pipeline import adapt
+from automation.pipeline import router
 from automation.pipeline import subtask_store as sstore
 from automation.pipeline.decompose import Subtask, get_decomposition
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
-from automation.pipeline.script_compile import promote_healed, run_steps, save_steps
+from automation.pipeline.script_compile import promote_healed, save_steps
 from automation.browser.session import attach_session
 
 logger = logging.getLogger("framework.hybrid")
@@ -177,6 +187,7 @@ class Segment:
     prompt: str                     # the instantiated (concrete) subtask prompt
     context: str
     mode: str                       # "replay" | "authored" | "replay_failed->authored"
+    kind: str = "action"            # composition node kind: "action" | "judge"
     ok: bool = False
     gate: dict[str, Any] = field(default_factory=dict)
     steps_executed: int = 0
@@ -187,14 +198,18 @@ class Segment:
     error: str | None = None
     replay: dict[str, Any] | None = None
     write_step: int | None = None   # agent-relative step the create-write fired on (rescue)
+    # Distilled observation from an agent segment (its final result) — carried forward into
+    # every later agent segment's context so note-then-verify flows can actually compare.
+    finding: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "index": self.index, "sid": self.sid, "prompt": self.prompt,
-            "context": self.context, "mode": self.mode, "ok": self.ok, "gate": self.gate,
-            "steps_executed": self.steps_executed,
+            "context": self.context, "mode": self.mode, "kind": self.kind, "ok": self.ok,
+            "gate": self.gate, "steps_executed": self.steps_executed,
             "duration_seconds": round(self.duration_seconds, 1),
             "healed_steps": self.healed_steps, "tokens": self.tokens, "error": self.error,
+            "finding": self.finding,
         }
 
 
@@ -328,9 +343,9 @@ class HybridSession:
     # ------------------------------- segment execution -------------------------------
 
     async def replay_segment(
-        self, sub: Subtask, sid: str, context: str, steps: list[dict[str, Any]], gate: Gate,
+        self, sub: Subtask, sid: str, context: str, skill: skills.Skill, gate: Gate,
     ) -> Segment:
-        """Replay a library entry's steps on the live page. No LLM."""
+        """Replay a library skill on the live page. No LLM."""
         started = datetime.now()
         watermark = self.network_watermark()
         page = self.current_page()
@@ -339,7 +354,7 @@ class HybridSession:
         if page is None:
             seg.error = "no open page to replay against"
             return seg
-        outcome = await run_steps(page, steps)
+        outcome = await skills.execute(skill, page)
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         seg.replay = outcome
@@ -360,17 +375,21 @@ class HybridSession:
         self, sub: Subtask, sid: str, context: str, gate: Gate, *,
         completed: list[str], remaining: list[str],
         dirty: bool = False, prior_failure: str | None = None,
-        record_path: Path | None = None,
+        record_path: Path | None = None, findings: list[str] | None = None,
     ) -> Segment:
-        """Run the LLM agent for ONE subtask on the shared live session."""
+        """Run the LLM agent for ONE subtask on the shared live session. `findings` are the
+        observations earlier segments recorded (each a "prompt: outcome" line) — the data
+        channel that lets a verify step compare against what a note step actually saw."""
         started = datetime.now()
         watermark = self.network_watermark()
+        kind = getattr(sub, "kind", "action")
         prompt = scoped_subtask_prompt(
             sub.instantiated_prompt, completed, remaining, dirty, prior_failure,
             expected_end=_describe_expected_end(gate),
-            owns_save=gate.kind == "marker")
+            owns_save=gate.kind == "marker",
+            findings=findings, observe=kind == "judge")
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
-                      context=context, mode="authored")
+                      context=context, mode="authored", kind=kind)
         try:
             out = await self.runner.run_agent_segment(
                 prompt, self.session, self.collectors,
@@ -406,50 +425,12 @@ class HybridSession:
                              f"(agent claimed success: {history.final_result()!r})")
             else:
                 seg.error = history.final_result() or f"segment gate failed: {seg.gate}"
+        else:
+            # The segment's distilled observation, carried into later segments' context.
+            final = " ".join(str(history.final_result() or "").split())
+            seg.finding = final[:300] or None
         seg.duration_seconds = (datetime.now() - started).total_seconds()
         return seg
-
-
-# ------------------------------- library instantiation -------------------------------
-
-
-def instantiate_library_entry(sid: str, sub: Subtask) -> list[dict[str, Any]] | None:
-    """The concrete steps to replay for `sub` from library entry `sid`, or None.
-
-    No params -> the committed steps replay as-is. With params, the entry's template is
-    aligned against the subtask's concrete prompt (adapt.match_template — deterministic
-    regex) and instantiated with the values read from the alignment; if the wording doesn't
-    align, fall back to the decomposition's own values by NAME, but only when they cover
-    EVERY template param — an uncovered param would silently replay a stale default value.
-    None means author instead: never replay wrong values.
-    """
-    entry = sstore.load_manifest().get(sid) or {}
-    params = entry.get("params") or {}
-    if not params or not sstore.template_path(sid).exists():
-        try:
-            return json.loads(sstore.steps_path(sid).read_text())
-        except Exception as exc:  # noqa: BLE001 - unreadable entry -> author
-            logger.warning("library entry %s unreadable: %s", sid, exc)
-            return None
-    try:
-        template = adapt.load_template(sstore.template_path(sid))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("library template %s unreadable: %s", sid, exc)
-        return None
-    match = adapt.match_template(sub.instantiated_prompt, [
-        {"id": sid, "prompt": template.get("source_prompt", ""),
-         "params": template.get("params") or {}},
-    ])
-    if match is not None:
-        return adapt.instantiate(template, match.values)
-    tmpl_params = set((template.get("params") or {}).keys())
-    by_name = {k: v for k, v in (sub.values or {}).items() if k in tmpl_params}
-    if set(by_name.keys()) != tmpl_params:
-        logger.info("library entry %s: prompt did not align and decomposition values do not "
-                    "cover template params %s; authoring instead",
-                    sid, sorted(tmpl_params - set(by_name)))
-        return None
-    return adapt.instantiate(template, by_name)
 
 
 # ------------------------------- commit / heal helpers -------------------------------
@@ -472,15 +453,22 @@ async def _save_segment_template(sid: str, prompt: str, steps: list[dict[str, An
 def _promote_segment_heals(sid: str, seg: Segment, *, from_template: bool) -> None:
     """Persist a PASSED replay's healings into the library entry. Skipped for
     template-instantiated replays (v1): the healed selectors would carry concrete values
-    into the tokenized steps. Concrete entries promote their healed selectors as-is."""
+    into the tokenized steps/anchors. Concrete entries promote as-is — into the ANCHOR
+    bundle when the replay ran the code tier (its log entries carry the anchor handle),
+    else into the steps file."""
     if from_template or not seg.healed_steps:
         return
     try:
-        promoted = promote_healed(sstore.steps_path(sid), (seg.replay or {}).get("log") or [])
+        log = (seg.replay or {}).get("log") or []
+        if any("handle" in e for e in log):
+            promoted: list[Any] = skills.promote_healed_anchors(
+                sstore.anchors_path(sid), log)
+        else:
+            promoted = promote_healed(sstore.steps_path(sid), log)
         if promoted:
             sstore.update_manifest(sid, "", healed_steps=promoted,
                                    healed=datetime.now().isoformat(timespec="seconds"))
-            logger.info("segment %s: promoted healed selectors into steps %s", sid, promoted)
+            logger.info("segment %s: promoted healed selectors into %s", sid, promoted)
     except Exception as exc:  # noqa: BLE001 - promotion is a bonus; the run already passed
         logger.warning("heal promotion failed for segment %s: %s", sid, exc)
 
@@ -489,6 +477,7 @@ async def _author_segment(
     hs: HybridSession, sub: Subtask, sid: str, context: str, gate: Gate, *,
     completed: list[str], remaining: list[str],
     dirty: bool = False, prior_failure: str | None = None,
+    findings: list[str] | None = None, commit: bool = True,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
 
@@ -497,13 +486,17 @@ async def _author_segment(
     "only a whole run can pass the gate honestly"). A clean author that passed its gate is
     compiled (no leading goto, truncated at the save when the gate was a marker),
     parameterized, and registered in the manifest with its start/end contexts.
+
+    `commit=False` (judge nodes) runs the agent without recording or committing anything:
+    a cognitive segment's success is a judgment, and a compiled replay of it would be a
+    hollow pass — so nothing of it may ever enter the library.
     """
     seg = await hs.agent_segment(
         sub, sid, context, gate, completed=completed, remaining=remaining,
-        dirty=dirty, prior_failure=prior_failure,
-        record_path=None if dirty else sstore.recording_path(sid),
+        dirty=dirty, prior_failure=prior_failure, findings=findings,
+        record_path=sstore.recording_path(sid) if commit and not dirty else None,
     )
-    if not seg.ok:
+    if not seg.ok or not commit:
         return seg
     if dirty:
         # Recovered in place, but the recording is not committable. A stale entry that keeps
@@ -519,6 +512,13 @@ async def _author_segment(
     try:
         steps = save_steps(sstore.recording_path(sid), sstore.steps_path(sid),
                            max_steps=truncate_at, emit_start_goto=False)
+        if not steps:
+            # A zero-step script would replay as a hollow no-op pass. Leave NO entry (the
+            # recording stays for diagnosis); the next run authors this segment again.
+            sstore.steps_path(sid).unlink(missing_ok=True)
+            logger.warning("segment %s: recording compiled to ZERO steps; not committing "
+                           "(agent likely acted only through tools the compiler drops)", sid)
+            return seg
         end_context = sstore.normalize_context(await hs.current_url())
         params = await _save_segment_template(
             sid, sub.instantiated_prompt, steps, hs.runner.expander_llm)
@@ -528,6 +528,10 @@ async def _author_segment(
             context=context, end_context=end_context,
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
+        # Tier-1 upgrade (best-effort): transpile the committed steps into a code skill
+        # (<sid>.skill.py + anchors). On any failure the steps stay authoritative and any
+        # stale code artifacts are removed (codegen.compile_code_skill owns that).
+        skills.compile_code_skill(sid)
         logger.info("segment %s: committed %d steps to the library", sid, len(steps))
     except Exception as exc:  # noqa: BLE001 - compile failure must not fail a passed segment
         logger.exception("segment %s compile/commit error: %s", sid, exc)
@@ -576,22 +580,48 @@ async def run_hybrid_task(
     hs = await HybridSession.open(runner)
     segments: list[Segment] = []
     completed: list[str] = []
+    findings: list[str] = []        # "prompt: observation" lines, fed to later segments
     try:
         for i, sub in enumerate(subtasks):
             context = sstore.normalize_context(await hs.current_url())
             sid = sstore.subtask_id(sub.template_prompt, context)
+            force_author = reauthor_match(reauthor, sub)
+            is_judge = getattr(sub, "kind", "action") == "judge"
+
+            # Semantic routing: a wording with NO direct entry may still be a known
+            # procedure (alias table -> local embeddings -> one LLM verify). A routed sid
+            # replays the canonical skill with values re-keyed to its params; authoring
+            # after a routed failure goes under the ORIGINAL sid so the canonical entry
+            # is never overwritten by a different wording's recording.
+            author_sid, route_values = sid, None
+            if (not fresh and not force_author and not is_judge
+                    and not sstore.has_script(sid)
+                    and getattr(runner.config, "semantic_router", False)):
+                routed = await router.route(
+                    sub, sid, context, runner.expander_llm,
+                    model_name=getattr(runner.config, "embedding_model",
+                                       router._DEFAULT_MODEL))
+                if routed is not None:
+                    print(f"[*] subtask {i}: wording routed to library entry "
+                          f"[{routed.sid}] via {routed.via}")
+                    sid, route_values = routed.sid, routed.values
+
             entry = sstore.load_manifest().get(sid)
             gate = segment_gate(sub, entry, context)
             remaining = [s.instantiated_prompt for s in subtasks[i + 1:]]
             seg: Segment | None = None
-            force_author = reauthor_match(reauthor, sub)
 
-            if not fresh and not force_author and sstore.has_script(sid):
-                steps = instantiate_library_entry(sid, sub)
-                if steps is not None:
+            # Judge nodes never touch the library in EITHER direction: a replayed judge
+            # would click through with nobody looking (hollow pass), and its recording
+            # must never be committed for the same reason.
+            if not fresh and not force_author and not is_judge and sstore.has_script(sid):
+                load_sub = sub if route_values is None else SimpleNamespace(
+                    instantiated_prompt=sub.instantiated_prompt, values=route_values)
+                skill = skills.load_skill(sid, load_sub)
+                if skill is not None:
                     print(f"[*] subtask {i} [{sid}]: library hit -> replay "
-                          f"({len(steps)} steps, no LLM)")
-                    seg = await hs.replay_segment(sub, sid, context, steps, gate)
+                          f"({len(skill)} steps, no LLM)")
+                    seg = await hs.replay_segment(sub, sid, context, skill, gate)
                     if seg.ok:
                         from_template = bool((entry or {}).get("params"))
                         _promote_segment_heals(sid, seg, from_template=from_template)
@@ -602,14 +632,17 @@ async def run_hybrid_task(
                         print(f"[*] subtask {i} [{sid}]: replay FAILED "
                               f"({seg.error}) -> agent takes over in place"
                               f"{' (dirty state)' if dirty else ''}")
-                        if not dirty:
+                        if not dirty and route_values is None:
                             # Failed before touching the page: the recovery run starts from
                             # the entry's declared context, so it IS a clean re-author.
+                            # (A ROUTED failure never archives the canonical entry — the
+                            # wording mapping may be at fault, not the recording.)
                             sstore.archive_entry(sid)
                         prior = seg.error
                         seg = await _author_segment(
-                            hs, sub, sid, context, gate, completed=completed,
-                            remaining=remaining, dirty=dirty, prior_failure=prior)
+                            hs, sub, author_sid, context, gate, completed=completed,
+                            remaining=remaining, dirty=dirty, prior_failure=prior,
+                            findings=findings)
                         seg.mode = "replay_failed->authored"
                 else:
                     print(f"[*] subtask {i} [{sid}]: library hit but values did not "
@@ -621,11 +654,15 @@ async def run_hybrid_task(
                     # only overwritten if the fresh authoring passes its gate.
                     print(f"[*] subtask {i} [{sid}]: --reauthor -> authoring with the "
                           f"agent (entry replaced only on success)")
+                elif is_judge:
+                    print(f"[*] subtask {i} [{sid}]: judge node (verification) -> agent "
+                          f"runs it live, never cached")
                 elif not sstore.has_script(sid):
                     print(f"[*] subtask {i} [{sid}]: no library entry -> authoring "
                           f"with the agent")
-                seg = await _author_segment(hs, sub, sid, context, gate,
-                                            completed=completed, remaining=remaining)
+                seg = await _author_segment(hs, sub, author_sid, context, gate,
+                                            completed=completed, remaining=remaining,
+                                            findings=findings, commit=not is_judge)
 
             segments.append(seg)
             if not seg.ok:
@@ -633,6 +670,8 @@ async def run_hybrid_task(
                       f"(later subtasks depend on this state)")
                 break
             completed.append(sub.instantiated_prompt)
+            if seg.finding:
+                findings.append(f"{sub.instantiated_prompt[:80]}: {seg.finding}")
     finally:
         result = await hs.finalize(task, marker)
 

@@ -9,8 +9,10 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Virtual environments (.venv is a symlink to .venv.nosync — the .nosync suffix keeps
+# iCloud Desktop sync away from the venv, which kept hiding its .pth files)
 .venv
+.venv.nosync/
 
 # Local environment variables / secrets (real secrets stay local; the sample is committed)
 .env

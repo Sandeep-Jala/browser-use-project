@@ -74,8 +74,10 @@ class Config:
     groq_api_key: str | None
     groq_model: str
     use_vision: bool
-    # Image detail sent to the model each step: "high" | "low" | "auto". "high" gives the model
-    # a sharper screenshot so it can actually read the page before acting (costs more tokens).
+    # Image detail sent to the model each step: "high" | "low" | "auto". Default "high": a
+    # sharper screenshot lets the model actually read icon/label text before acting —
+    # misread labels are a direct misclick source for a small model. Costs ~$0.01 extra per
+    # 25-step segment; set VISION_DETAIL_LEVEL=auto/low in .env to trade back.
     vision_detail_level: str
     artifacts_dir: Path
     # Cap on how many past steps the agent keeps in context (None = unlimited). Cuts per-step
@@ -89,6 +91,13 @@ class Config:
     # Agent step budget for ONE subtask segment: a subtask is ~a tenth of a task, so 25
     # leaves room to recover from missteps without runaway cost.
     subtask_max_steps: int
+    # Semantic subtask router (pipeline/router.py): maps a differently-worded subtask to
+    # an existing library skill via alias table -> local embeddings -> one LLM verify.
+    # SEMANTIC_ROUTER=false disables it; without the local model installed it silently
+    # degrades to alias-only.
+    semantic_router: bool
+    # Local embedding model for the router (fastembed name; downloaded once to its cache).
+    embedding_model: str
 
     @classmethod
     def from_env(cls, env_path: str | os.PathLike[str] | None = None) -> "Config":
@@ -112,12 +121,14 @@ class Config:
             groq_api_key=os.getenv("GROQ_API_KEY"),
             groq_model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
             use_vision=_env_bool("USE_VISION", default=True),
-            vision_detail_level=os.getenv("VISION_DETAIL_LEVEL", "auto").strip().lower(),
+            vision_detail_level=os.getenv("VISION_DETAIL_LEVEL", "high").strip().lower(),
             artifacts_dir=Path(os.getenv("ARTIFACTS_DIR", "artifacts")),
             max_history_items=_env_history_items("MAX_HISTORY_ITEMS", default=20),
             enable_planning=_env_bool("ENABLE_PLANNING", default=True),
             expander_model=os.getenv("EXPANDER_MODEL", DEFAULT_EXPANDER_MODEL),
             subtask_max_steps=int(os.getenv("SUBTASK_MAX_STEPS", "25")),
+            semantic_router=_env_bool("SEMANTIC_ROUTER", default=True),
+            embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
         )
 
     def ensure_dirs(self) -> None:

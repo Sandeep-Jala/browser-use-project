@@ -161,8 +161,9 @@ def _recover_fill_target(state_message: str, recorded_index: Any) -> dict[str, s
     the step's state_message, browser-use's serialized DOM listing, which names every editable
     element with its stable attributes. Scan a few lines below the container for the nearest
     <input>/<textarea> that is a data field (not a react-select combobox filter) and return its
-    attributes. The compiled selector this produces is replay-validated before any commit, so a
-    wrong recovery can never poison a golden script.
+    attributes. There is no pre-commit replay: the compiled selector is committed once the
+    authoring run passes its segment gate, then validated by the entry's first real replay —
+    a wrong recovery fails that replay and the entry self-evicts (subtask_store.archive_if_failing).
     """
     if not state_message or recorded_index is None:
         return None
@@ -407,7 +408,8 @@ def compile_recording(
                     md = results[i].get("metadata")
                     if isinstance(md, dict):
                         element = md.get("interacted_element")
-                if element:
+                query = str(params.get("text") or "").strip()
+                if element and not element.get("hidden_click"):
                     synth = _dropdown_option_steps(element, steps,
                                                    item.get("state_message") or "")
                     if synth is not None:
@@ -416,8 +418,17 @@ def compile_recording(
                     else:
                         sels = _selectors(element)
                         if sels:
+                            # hidden_ok: find_by_text can reach controls a re-render hides;
+                            # replay keeps the hover/dispatch recovery as a safety net.
                             _push_step(steps, _attach_fp(
-                                {"action": "click", "selectors": sels}, element))
+                                {"action": "click", "selectors": sels,
+                                 "hidden_ok": True}, element))
+                elif query:
+                    # The click went through the tool's hidden-control path (or the saved
+                    # history lacks the element entirely): no selector+pointer translation
+                    # is stable for such controls, so replay the INTENT — a find_click step
+                    # runs the exact same in-page algorithm the tool used (RAW_FIND_JS).
+                    _push_step(steps, {"action": "find_click", "text": query})
             elif name == "navigate" and params.get("url"):
                 _push_step(steps, {"action": "goto", "url": params["url"]})
             elif name == "click" and element:
@@ -472,6 +483,19 @@ def compile_recording(
                     _push_step(steps, step)
             elif name == "send_keys" and params.get("keys"):
                 _push_step(steps, {"action": "press", "keys": params["keys"]})
+            elif name in ("capped_scroll", "scroll"):
+                # Discovery scrolling is load-bearing: the target section must be scrolled
+                # into view before the following click can resolve (observed: the Reviews
+                # panel's "View all" icon). capped_scroll is our tool ({pages}); the
+                # built-in scroll uses {num_pages}.
+                pages = params.get("pages", params.get("num_pages", 0.5))
+                try:
+                    pages = float(pages)
+                except (TypeError, ValueError):
+                    pages = 0.5
+                _push_step(steps, {"action": "scroll",
+                                   "down": bool(params.get("down", True)),
+                                   "pages": min(pages, 1.0)})
             elif name == "wait":
                 # Keep the agent's deliberate pauses (capped). They are load-bearing on this
                 # slow React app: they let the invoice form and its react-select menus finish
@@ -504,6 +528,52 @@ def save_steps(
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 
+
+# The raw-DOM find+click algorithm, SHARED between find_by_text (authoring, agent_tools)
+# and the `find_click` replay step: token match over title/aria-label/name/text plus child
+# icon hints, visible-first ranking, scrollIntoView (which scrolls the CORRECT container —
+# unlike window.scrollBy, a no-op inside Fluent ScrollablePanes), then the element's own
+# click handler. Using the identical implementation at author and replay time is what makes
+# hover-revealed/0-size controls (the Reviews "View all" icon) replayable at all.
+# Placeholders: %s = JSON token list, %s = "true"/"false" for click.
+RAW_FIND_JS = r"""
+(function () {
+  try {
+    var TOKENS = %s, DOCLICK = %s;
+    var sel = 'button,a,[role=button],[role=menuitem],[role=tab],[role=link],' +
+              'input[type=button],input[type=submit],[data-is-focusable],[onclick]';
+    var out = [];
+    document.querySelectorAll(sel).forEach(function (e) {
+      var hay = [e.getAttribute('title'), e.getAttribute('aria-label'), e.getAttribute('name'),
+                 e.innerText].filter(Boolean).join(' ');
+      e.querySelectorAll('[data-icon-name],[title],[aria-label]').forEach(function (c) {
+        hay += ' ' + [c.getAttribute('data-icon-name'), c.getAttribute('title'),
+                      c.getAttribute('aria-label')].filter(Boolean).join(' ');
+      });
+      hay = hay.toLowerCase();
+      if (TOKENS.every(function (t) { return hay.indexOf(t) !== -1; })) {
+        var r = e.getBoundingClientRect();
+        var icon = e.querySelector('[data-icon-name]');
+        var name = e.getAttribute('title') || e.getAttribute('aria-label') ||
+                   e.getAttribute('name') || (e.innerText || '').trim() ||
+                   (icon && icon.getAttribute('data-icon-name')) || '';
+        out.push({ el: e, name: name.trim().slice(0, 80),
+                   visible: r.width > 0 && r.height > 0 });
+      }
+    });
+    if (!out.length) return { count: 0 };
+    out.sort(function (a, b) { return (b.visible ? 1 : 0) - (a.visible ? 1 : 0); });
+    var top = out[0], clicked = false;
+    if (DOCLICK) { try { top.el.scrollIntoView({ block: 'center' }); top.el.click(); clicked = true; } catch (e) {} }
+    var attrs = {};
+    ['id', 'aria-label', 'title', 'name', 'placeholder', 'data-testid', 'href', 'role']
+      .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
+    return { count: out.length, clicked: clicked, name: top.name,
+             names: out.slice(0, 8).map(function (o) { return o.name; }),
+             element: { tag: top.el.tagName.toLowerCase(), attrs: attrs } };
+  } catch (e) { return { error: String(e) }; }
+})()
+"""
 
 # After an interaction, give the slow React app a beat to open a menu / commit react-select
 # state / re-render before the next locator query, so replay doesn't outrun the UI.
@@ -660,11 +730,15 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
     to EXACTLY ONE visible element. `healed_winner` is None unless the self-healing fallback
     located the element (then it carries the winner's identity for promotion).
 
-    Refusing to act on an ambiguous match is what prevents "clicks somewhere else": rather than
-    silently taking `.first`, we require a unique hit. Non-final candidates get a short probe
-    budget; the last candidate gets the full timeout and, only then, a logged `.first` concession.
-    With `require_editable` (fill steps), a candidate that resolves to a non-editable node is
-    skipped so replay falls through to a candidate that hits the real input.
+    Refusing to act on an ambiguous match is what prevents "clicks somewhere else": rather
+    than silently taking `.first`, we require a unique hit — judged among VISIBLE matches
+    only. A hidden twin earlier in DOM order (Fluent keeps collapsed panels' header buttons
+    in the DOM — observed live: [title="View all"] resolving to an invisible header button
+    while the real icon sat at nth(1)) must neither shadow the real target nor make it
+    "ambiguous". Non-final candidates get a short probe budget; the last candidate gets the
+    full timeout and, only then, a logged first-visible concession. With `require_editable`
+    (fill steps), a candidate that resolves to a non-editable node is skipped so replay
+    falls through to a candidate that hits the real input.
     """
     sels = _step_selectors(step)
     if not sels:
@@ -676,18 +750,31 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
         loc = page.locator(sel)
         try:
             await loc.first.wait_for(state="visible", timeout=budget)
-        except Exception:  # noqa: BLE001 - try the next candidate
-            errors.append(f"{sel} -> not visible")
-            continue
+        except Exception:  # noqa: BLE001 - .first may be a hidden twin; scan the rest below
+            pass
         count = await loc.count()
-        if count == 1:
-            candidate = loc.first
+        if count == 0:
+            errors.append(f"{sel} -> no match")
+            continue
+        visible: list[int] = []
+        for n in range(min(count, 8)):
+            try:
+                if await loc.nth(n).is_visible():
+                    visible.append(n)
+            except Exception:  # noqa: BLE001 - node vanished mid-scan
+                continue
+        if not visible:
+            errors.append(f"{sel} -> {count} match(es), none visible")
+            continue
+        if len(visible) == 1:
+            candidate = loc.nth(visible[0])
         elif last:
-            # Exhausted durable candidates; act on the first visible match but record it.
-            logger.warning("ambiguous selector %r matched %d nodes; using .first", sel, count)
-            candidate = loc.first
+            # Exhausted durable candidates; act on the first VISIBLE match but record it.
+            logger.warning("ambiguous selector %r: %d visible matches; using the first",
+                           sel, len(visible))
+            candidate = loc.nth(visible[0])
         else:
-            errors.append(f"{sel} -> {count} matches (ambiguous)")
+            errors.append(f"{sel} -> {len(visible)} visible matches (ambiguous)")
             continue
         if require_editable:
             try:
@@ -728,12 +815,104 @@ _TRANSIENT = (
     "element is not stable",
     "detached",
     "element was detached",
+    # Resolved, then hidden by a re-render before the click landed: re-resolving picks the
+    # currently-visible instance (see _resolve's visible-match scan).
+    "is not visible",
 )
 
 
 def _is_transient(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(t in msg for t in _TRANSIENT)
+
+
+# How many progressive scroll rounds _reveal_hidden_click hunts before giving up: a Fluent
+# virtualized ScrollablePane renders a section's DOM only when the viewport nears it.
+_REVEAL_ROUNDS = 5
+
+# Center of the target's nearest VISIBLE ancestor (its section/card), scrolled into view —
+# the thing a user hovers to make a hover-revealed icon appear.
+_VISIBLE_ANCESTOR_JS = """
+(el) => {
+  let n = el.parentElement;
+  while (n) {
+    const r = n.getBoundingClientRect();
+    if (r.width > 4 && r.height > 4) {
+      n.scrollIntoView({block: 'center'});
+      const r2 = n.getBoundingClientRect();
+      return {x: r2.left + r2.width / 2, y: r2.top + Math.min(r2.height / 2, 40)};
+    }
+    n = n.parentElement;
+  }
+  return null;
+}
+"""
+
+
+async def _reveal_hidden_click(page: Page, step: dict[str, Any]) -> str | None:
+    """Recovery for hidden_ok steps (recorded through find_by_text's hidden-control path)
+    using the mechanics a USER would use on a hover-revealed control — observed live: the
+    Reviews "View all" icon exists 0-size until its section is hovered.
+
+      1. If no candidate selector matches yet, scroll down progressively: a virtualized
+         pane renders the section's DOM only near the viewport.
+      2. Scroll the target's nearest VISIBLE ancestor (its section) into view and HOVER it
+         with real mouse movement — the reveal trigger.
+      3. Real-click the now-visible target (a trusted, user-equivalent click).
+      4. Only if hovering never reveals it: dispatch the element's own click handler.
+
+    Unique-match rule throughout: hidden recovery never guesses among elements. Returns
+    the used selector label, or None."""
+    target, used_sel = None, None
+    for _ in range(_REVEAL_ROUNDS):
+        for sel in _step_selectors(step):
+            loc = page.locator(sel)
+            try:
+                if await loc.count() == 1:
+                    target, used_sel = loc.first, sel
+                    break
+            except Exception:  # noqa: BLE001 - try the next candidate
+                continue
+        if target is not None:
+            break
+        try:
+            await page.evaluate("() => window.scrollBy(0, 0.6 * window.innerHeight)")
+        except Exception:  # noqa: BLE001 - page gone; nothing to recover
+            return None
+        await page.wait_for_timeout(400)
+    if target is None:
+        return None
+    try:
+        point = await target.evaluate(_VISIBLE_ANCESTOR_JS)
+    except Exception:  # noqa: BLE001 - detached target
+        point = None
+    if point:
+        try:
+            await page.mouse.move(point["x"], point["y"], steps=6)
+            await page.wait_for_timeout(_SETTLE_MS)
+            if await target.is_visible():
+                await target.click(timeout=5000)
+                logger.info("↺ hover-revealed and clicked via %r", used_sel)
+                return f"{used_sel} (hover reveal)"
+            # The icon may appear adjacent to the hovered point; nudge onto the target's
+            # own position (it has a box once the section is hovered on some skins).
+            box = await target.bounding_box()
+            if box and box["width"] > 0:
+                await page.mouse.move(box["x"] + box["width"] / 2,
+                                      box["y"] + box["height"] / 2, steps=4)
+                await page.wait_for_timeout(_SETTLE_MS)
+                if await target.is_visible():
+                    await target.click(timeout=5000)
+                    logger.info("↺ hover-revealed and clicked via %r", used_sel)
+                    return f"{used_sel} (hover reveal)"
+        except Exception as exc:  # noqa: BLE001 - fall through to dispatch
+            logger.debug("hover-reveal attempt failed via %r: %s", used_sel, exc)
+    try:
+        await target.dispatch_event("click")
+        logger.info("↺ hidden-click dispatched via %r", used_sel)
+        return f"{used_sel} (hidden dispatch)"
+    except Exception:  # noqa: BLE001 - recovery failed; caller raises the original error
+        return None
 
 
 async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> tuple[str, dict[str, Any] | None]:
@@ -757,6 +936,10 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
                             exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
                 await page.wait_for_timeout(_SETTLE_MS * 2)
                 continue
+            if step.get("hidden_ok"):
+                used = await _reveal_hidden_click(page, step)
+                if used is not None:
+                    return used, None
             raise
     raise RuntimeError("unreachable")  # loop either returns or raises
 
@@ -779,6 +962,49 @@ async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) ->
                 continue
             raise
     raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+async def _wheel_scroll(page: Page, pages: float, down: bool = True) -> None:
+    """User-faithful scroll: real wheel input at the viewport center. window.scrollBy is a
+    NO-OP inside Fluent ScrollablePanes (the app scrolls an inner container, not the
+    window) — wheel events land on whatever is under the cursor, exactly like a user."""
+    size = page.viewport_size or {"width": 1280, "height": 800}
+    await page.mouse.move(size["width"] / 2, size["height"] / 2)
+    await page.mouse.wheel(0, (1 if down else -1) * float(pages) * size["height"])
+    await page.wait_for_timeout(_SETTLE_MS)
+
+
+# Wheel-scroll rounds find_click hunts before giving up: a virtualized pane renders a
+# section's DOM only once the viewport nears it.
+_FIND_CLICK_ROUNDS = 4
+
+
+async def _find_click(page: Page, text: str) -> str:
+    """Replay a find_by_text click SEMANTICALLY: run the same in-page algorithm the tool
+    used at record time (RAW_FIND_JS — token match, visible-first, scrollIntoView, direct
+    handler click), wheel-scrolling between rounds when nothing matches yet. Returns the
+    clicked element's reported name; raises when no round finds a match."""
+    import json as _json
+
+    tokens = [t for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
+    if not tokens:
+        raise RuntimeError(f"find_click: no searchable text in {text!r}")
+    expr = RAW_FIND_JS % (_json.dumps(tokens), "true")
+    for round_no in range(_FIND_CLICK_ROUNDS + 1):
+        try:
+            raw = await page.evaluate(expr)
+        except Exception as exc:  # noqa: BLE001 - page navigating; settle and retry
+            logger.debug("find_click eval failed (%s); settling", exc)
+            raw = None
+            await page.wait_for_timeout(_SETTLE_MS)
+        if raw and raw.get("clicked"):
+            name = str(raw.get("name") or text)
+            logger.info("🔎 find_click(%r): clicked %r (round %d)", text, name, round_no)
+            return name
+        if round_no < _FIND_CLICK_ROUNDS:
+            await _wheel_scroll(page, 0.6)
+    raise RuntimeError(f"find_click: no clickable match for {text!r} "
+                       f"after {_FIND_CLICK_ROUNDS} scroll rounds")
 
 
 # Budget for each click of the flyout-reopen recovery (predecessor + retried target). Shorter
@@ -857,6 +1083,13 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 # filter input owns focus. If focus is elsewhere the subsequent click-by-label
                 # times out and validation fails safely (no bad script is ever committed).
                 await page.keyboard.type(step["text"], delay=30)
+                await page.wait_for_timeout(_SETTLE_MS)
+            elif action == "scroll":
+                await _wheel_scroll(page, float(step.get("pages", 0.5)),
+                                    down=bool(step.get("down", True)))
+            elif action == "find_click":
+                name = await _find_click(page, step.get("text", ""))
+                log.append({"step": idx, "action": action, "used": f"find_click:{name}"})
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "wait":
                 await page.wait_for_timeout(int(step.get("seconds", 0) * 1000))
