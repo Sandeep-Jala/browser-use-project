@@ -337,7 +337,9 @@ async def test_reauthor_forces_agent_only_for_named_subtask(stores, monkeypatch)
 
 
 async def test_reauthor_failure_keeps_old_entry(stores, monkeypatch):
-    """A failed re-author must NOT clobber the working library entry."""
+    """A failed re-author must NOT clobber the working library entry — and its recording
+    is kept for diagnosis OFF the canonical path, so the canonical recording can never
+    mismatch the committed skill."""
     ctx = ss.normalize_context("http://app/section")
     sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
     stale = [{"action": "click", "selectors": ["text=Works"]}]
@@ -349,6 +351,9 @@ async def test_reauthor_failure_keeps_old_entry(stores, monkeypatch):
 
     assert result.is_successful is False
     assert json.loads(ss.steps_path(sid0).read_text()) == stale
+    assert not ss.recording_path(sid0).exists()
+    failed = ss.recording_path(sid0).with_suffix(".failed.json")
+    assert failed.exists()                       # the failed trace survives for diagnosis
 
 
 def test_reauthor_match_indexes_and_substrings():

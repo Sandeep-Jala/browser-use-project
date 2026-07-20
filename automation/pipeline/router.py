@@ -118,6 +118,32 @@ class Route:
     via: str                      # "alias" | "semantic"
 
 
+def _filled_values(slots: dict[str, str], sub: Any,
+                   canonical_params: dict[str, str]) -> dict[str, str] | None:
+    """Concrete values for EVERY canonical param, or None.
+
+    Slot-mapped params take the new wording's values. An UNMAPPED param may fall back to
+    its recorded default only when that default appears VERBATIM in the new instruction —
+    proof the new wording wants the same value (e.g. the canonical "click the {{label}}
+    icon" with default "View all" matched by a wording that just says "click the View all
+    icon"). A param that is neither tokenized nor stated stays uncovered -> no route:
+    never replay guessed values."""
+    values: dict[str, str] = {}
+    prompt_lower = str(getattr(sub, "instantiated_prompt", "") or "").lower()
+    for new, canon in slots.items():
+        if new not in (sub.values or {}):
+            return None
+        values[canon] = (sub.values or {})[new]
+    for name, default in (canonical_params or {}).items():
+        if name in values:
+            continue
+        if str(default).strip() and str(default).lower() in prompt_lower:
+            values[name] = str(default)
+        else:
+            return None
+    return values
+
+
 def _alias_route(alias_sid: str, sub: Any) -> Route | None:
     alias = sstore.load_aliases().get(alias_sid)
     if not alias or alias.get("same") is False:
@@ -125,19 +151,18 @@ def _alias_route(alias_sid: str, sub: Any) -> Route | None:
     target = alias.get("sid") or ""
     if not sstore.has_script(target):
         return None                       # canonical entry got archived; alias is stale
-    slots = alias.get("slots") or {}
-    values = {canon: (sub.values or {})[new]
-              for new, canon in slots.items() if new in (sub.values or {})}
-    canon_params = set((sstore.load_manifest().get(target) or {}).get("params") or {})
-    if canon_params - set(values):
+    canonical_params = (sstore.load_manifest().get(target) or {}).get("params") or {}
+    values = _filled_values(alias.get("slots") or {}, sub, canonical_params)
+    if values is None:
         return None                       # wording's values no longer cover the params
     return Route(sid=target, values=values, via="alias")
 
 
-async def _verify(llm: Any, canonical_prompt: str, canonical_params: list[str],
+async def _verify(llm: Any, canonical_prompt: str, canonical_params: dict[str, str],
                   sub: Any) -> dict[str, str] | None:
     """One LLM call: same procedure? Returns the slot mapping {new_token: canonical_param}
-    or None. The mapping must cover EVERY canonical param injectively."""
+    or None. The mapping must be injective and stay within the canonical params; full
+    coverage is then enforced by _filled_values (verbatim defaults may fill the gaps)."""
     result = await llm.ainvoke([
         SystemMessage(content=ROUTER_VERIFY_SYSTEM_PROMPT),
         UserMessage(content=(
@@ -149,12 +174,10 @@ async def _verify(llm: Any, canonical_prompt: str, canonical_params: list[str],
         return None
     slots = {str(k): str(v) for k, v in (data.get("slots") or {}).items()}
     mapped = list(slots.values())
-    if sorted(mapped) != sorted(set(mapped)) or set(mapped) != set(canonical_params):
-        logger.info("router verify: slot mapping %s does not cover params %s injectively",
-                    slots, canonical_params)
+    if sorted(mapped) != sorted(set(mapped)) or set(mapped) - set(canonical_params):
+        logger.info("router verify: slot mapping %s is not injective into params %s",
+                    slots, list(canonical_params))
         return None
-    if any(new not in (sub.values or {}) for new in slots):
-        return None                       # a mapped token has no value to carry over
     return slots
 
 
@@ -197,15 +220,15 @@ async def route(sub: Any, alias_sid: str, context: str, llm: Any, *,
         return None                       # embeddings never decide alone
 
     entry = manifest.get(best_sid) or {}
-    slots = await _verify(llm, entry.get("template_prompt") or "",
-                          list((entry.get("params") or {}).keys()), sub)
-    if slots is None:
+    canonical_params = entry.get("params") or {}
+    slots = await _verify(llm, entry.get("template_prompt") or "", canonical_params, sub)
+    values = None if slots is None else _filled_values(slots, sub, canonical_params)
+    if values is None:
         # Negative verdicts are cached too: this wording never pays the verify call again.
         sstore.save_alias(alias_sid, {"same": False, "sid": best_sid})
         return None
     sstore.save_alias(alias_sid, {"sid": best_sid, "slots": slots,
                                   "similarity": round(best_sim, 4)})
-    values = {canon: (sub.values or {})[new] for new, canon in slots.items()}
     logger.info("router: %r semantically routed to %s (sim %.3f); alias learned",
                 sub.template_prompt[:60], best_sid, best_sim)
     return Route(sid=best_sid, values=values, via="semantic")

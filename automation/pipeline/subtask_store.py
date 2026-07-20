@@ -180,8 +180,9 @@ def archive_entry(sid: str) -> list[Path]:
     archive_dir = LIBRARY_DIR / "archive"
     moved: list[Path] = []
     for src, kind in ((steps_path(sid), "steps"), (template_path(sid), "template"),
-                      (recording_path(sid), "recording"), (code_path(sid), "skill"),
-                      (anchors_path(sid), "anchors")):
+                      (recording_path(sid), "recording"),
+                      (recording_path(sid).with_suffix(".failed.json"), "recording-failed"),
+                      (code_path(sid), "skill"), (anchors_path(sid), "anchors")):
         if not src.exists():
             continue
         archive_dir.mkdir(parents=True, exist_ok=True)

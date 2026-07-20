@@ -479,10 +479,12 @@ You get the CANONICAL instruction (with its named {{params}}) and a NEW instruct
 Rules:
 - "same": true ONLY if every action in the canonical procedure is what the new \
 instruction asks for, in the same order, with nothing added or removed.
-- "slots" maps each NEW token to the canonical param playing the same role. EVERY \
-canonical param must be mapped from exactly one new token; if that is impossible, \
-answer {"same": false, "slots": {}}.
-- Never map two new tokens to one canonical param.\
+- "slots" maps each NEW token to the canonical param playing the same role. Never map \
+two new tokens to one canonical param.
+- A canonical param with no corresponding new token may be OMITTED from slots when the \
+new instruction states that param's value as literal text (the runtime verifies this \
+verbatim). If a canonical param's value is neither tokenized nor stated in the new \
+instruction, answer {"same": false, "slots": {}}.\
 """
 
 

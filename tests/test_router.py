@@ -121,9 +121,29 @@ async def test_context_gate_and_no_embedder(stores, monkeypatch):
 
 async def test_bad_slot_mapping_rejected(stores):
     _seed_canonical()
-    # Mapping misses the canonical param entirely.
+    # Empty mapping AND the default ("Suresh Gopi") is nowhere in the new wording:
+    # the param is neither tokenized nor stated -> never replay guessed values.
     llm = StubLLM(json.dumps({"same": True, "slots": {}}))
     assert await route(_sub(), "a", CTX, llm, embedder=_embedder()) is None
+
+
+async def test_unmapped_param_fills_from_verbatim_default(stores):
+    """A canonical param (e.g. a parameterized find_click label "View all") needs no slot
+    when the new wording states the same value literally — the default fills it."""
+    sid = _seed_canonical(prompt='click the {{label}} icon in Reviews',
+                          params={"label": "View all"})
+    new = "clik the View all icon in the Reviews area"
+    emb = StubEmbedder({
+        router._routable_text('click the {{label}} icon in Reviews'): [1.0, 0.0, 0.0],
+        router._routable_text(new): [0.97, 0.24, 0.0],
+    })
+    llm = StubLLM(json.dumps({"same": True, "slots": {}}))
+    r = await route(Subtask(index=0, template_prompt=new), "a2", CTX, llm, embedder=emb)
+    assert r is not None and r.sid == sid
+    assert r.values == {"label": "View all"}
+    # The learned alias replays the same fill with zero LLM/embedding cost.
+    r2 = await route(Subtask(index=0, template_prompt=new), "a2", CTX, None, embedder=None)
+    assert r2 is not None and r2.via == "alias" and r2.values == {"label": "View all"}
 
 
 async def test_parameterless_canonical_routes_with_empty_values(stores):

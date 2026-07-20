@@ -187,6 +187,8 @@ def test_node_kind_heuristic():
     assert decompose.node_kind("remember that mail", None) == "judge"
     assert decompose.node_kind("capture the names of both users", None) == "judge"
     assert decompose.node_kind("Confirm that the dropdown updates", None) == "judge"
+    assert decompose.node_kind("make sure the panel opens", None) == "judge"
+    assert decompose.node_kind("see if the icon works", None) == "judge"
     # Record types and action wording never classify as judge: "credit note" is a noun,
     # "check the option" is a click on a checkbox.
     assert decompose.node_kind("add credit note,select a customer and click save",

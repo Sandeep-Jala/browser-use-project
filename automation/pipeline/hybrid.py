@@ -491,12 +491,29 @@ async def _author_segment(
     a cognitive segment's success is a judgment, and a compiled replay of it would be a
     hollow pass — so nothing of it may ever enter the library.
     """
+    segment_started = datetime.now().timestamp()
     seg = await hs.agent_segment(
         sub, sid, context, gate, completed=completed, remaining=remaining,
         dirty=dirty, prior_failure=prior_failure, findings=findings,
         record_path=sstore.recording_path(sid) if commit and not dirty else None,
     )
-    if not seg.ok or not commit:
+    if not seg.ok:
+        # Keep a FAILED authoring's trace for diagnosis, but OFF the canonical path: the
+        # canonical recording must always correspond to the COMMITTED skill (a failed
+        # --reauthor must not leave its trace under a passing entry's name). The mtime
+        # guard makes sure we only move a trace THIS segment wrote — not a previous
+        # successful run's recording when the agent crashed before saving.
+        rec = sstore.recording_path(sid)
+        try:
+            if commit and not dirty and rec.exists() \
+                    and rec.stat().st_mtime >= segment_started - 1:
+                rec.replace(rec.with_suffix(".failed.json"))
+                logger.info("segment %s: failed authoring trace kept at %s",
+                            sid, rec.with_suffix(".failed.json").name)
+        except OSError as exc:
+            logger.debug("could not set aside failed recording for %s: %s", sid, exc)
+        return seg
+    if not commit:
         return seg
     if dirty:
         # Recovered in place, but the recording is not committable. A stale entry that keeps

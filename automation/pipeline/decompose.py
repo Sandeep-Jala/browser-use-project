@@ -47,6 +47,8 @@ MAX_SUBTASKS = 15
 _JUDGE_RE = re.compile(
     r"\b(verify|verifies|confirm|ensure|validate|compare)\b"
     r"|\bcheck (that|whether|if|it)\b"
+    r"|\bmake sure\b"
+    r"|\bsee (if|whether|that)\b"
     r"|\bnote (the|down|it)\b"
     r"|\bremember\b"
     r"|\bcapture the\b",
