@@ -266,6 +266,12 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
     steps.append(step)
 
 
+def _mirror_enter(steps: list[dict[str, Any]], enter_after: bool) -> None:
+    """Mirror the auto-Enter input tool's Enter (agent_tools) as a replay `press` step."""
+    if enter_after:
+        _push_step(steps, {"action": "press", "keys": "Enter"})
+
+
 # The app's react-select "+ Create \"<name>\"" option. Its label embeds the (per-replay
 # changing) name, so replay clicks it via :has-text("Create") — the only option containing
 # that word in an open menu — with position as last resort.
@@ -334,7 +340,9 @@ def _dropdown_option_steps(
             f'css=[id$="-{part.group("part")}"]' if part else 'css=[id$="-option-0"]',
         ]}]
     ax_name = (element.get("ax_name") or "").strip()
-    prev = next((s for s in reversed(steps) if s.get("action") != "wait"), None)
+    # Skip wait AND press steps: the auto-Enter input tool interleaves `press` after fills,
+    # and the filter fill this option click belongs to may sit behind one.
+    prev = next((s for s in reversed(steps) if s.get("action") not in ("wait", "press")), None)
     typed = ""
     if prev is not None and prev.get("action") in ("fill", "type") and \
             prev.get("field_id") == match.group("instance"):
@@ -443,6 +451,14 @@ def compile_recording(
                     _push_step(steps, _attach_fp(
                         {"action": "click", "selectors": sels}, element))
             elif name == "input" and element:
+                # The auto-Enter `input` tool (agent_tools.py) presses Enter after typing
+                # into non-dropdown fields and flags it in its result metadata (put back
+                # into saved recordings by runner.restore_result_metadata). Mirror it with
+                # a `press` step; recordings without the flag — dropdown fills and those
+                # made with the old tool — compile exactly as they ran.
+                md = (results[i].get("metadata")
+                      if i < len(results) and isinstance(results[i], dict) else None)
+                enter_after = isinstance(md, dict) and bool(md.get("auto_enter"))
                 # Miscapture repair: a fill recorded against a non-editable container means the
                 # element identity is wrong (agent typed at a td/div index). Recover the real
                 # field from this step's state_message instead of compiling the container.
@@ -464,6 +480,7 @@ def compile_recording(
                                             "attrs": {k: v for k, v in rec.items()
                                                       if k in _FP_ATTRS}},
                         })
+                        _mirror_enter(steps, enter_after)
                         continue
                     logger.warning(
                         "fill %r recorded against non-editable <%s> and no recovery target "
@@ -481,6 +498,7 @@ def compile_recording(
                     if m:
                         step["field_id"] = m.group("instance")
                     _push_step(steps, step)
+                    _mirror_enter(steps, enter_after)
             elif name == "send_keys" and params.get("keys"):
                 _push_step(steps, {"action": "press", "keys": params["keys"]})
             elif name in ("capped_scroll", "scroll"):
@@ -531,10 +549,13 @@ def save_steps(
 
 # The raw-DOM find+click algorithm, SHARED between find_by_text (authoring, agent_tools)
 # and the `find_click` replay step: token match over title/aria-label/name/text plus child
-# icon hints, visible-first ranking, scrollIntoView (which scrolls the CORRECT container —
-# unlike window.scrollBy, a no-op inside Fluent ScrollablePanes), then the element's own
-# click handler. Using the identical implementation at author and replay time is what makes
-# hover-revealed/0-size controls (the Reviews "View all" icon) replayable at all.
+# icon hints, ranked visible-first then by NAME SPECIFICITY (exact > word-aligned prefix >
+# whole-phrase substring > scattered tokens — so a query 'Reviews' prefers an element NAMED
+# 'Reviews' over 'Add reviews', which the substring match alone blind-clicked in live runs),
+# scrollIntoView (which scrolls the CORRECT container — unlike window.scrollBy, a no-op
+# inside Fluent ScrollablePanes), then the element's own click handler. Using the identical
+# implementation at author and replay time is what makes hover-revealed/0-size controls
+# (the Reviews "View all" icon) replayable at all.
 # Placeholders: %s = JSON token list, %s = "true"/"false" for click.
 RAW_FIND_JS = r"""
 (function () {
@@ -562,7 +583,24 @@ RAW_FIND_JS = r"""
       }
     });
     if (!out.length) return { count: 0 };
-    out.sort(function (a, b) { return (b.visible ? 1 : 0) - (a.visible ? 1 : 0); });
+    // Rank by how specifically the accessible NAME matches the query phrase (normalized
+    // with the same token grammar the callers use). Visibility stays the primary key.
+    var PHRASE = TOKENS.join(' ');
+    var normName = function (s) {
+      return String(s || '').toLowerCase().split(/[^a-z0-9]+/)
+        .filter(function (t) { return t; }).join(' ');
+    };
+    out.forEach(function (o) {
+      var nm = normName(o.name);
+      o.rank = nm === PHRASE ? 0
+             : nm.indexOf(PHRASE + ' ') === 0 ? 1
+             : (' ' + nm + ' ').indexOf(' ' + PHRASE + ' ') !== -1 ? 2
+             : 3;
+    });
+    out.sort(function (a, b) {
+      var v = (b.visible ? 1 : 0) - (a.visible ? 1 : 0);
+      return v !== 0 ? v : a.rank - b.rank;
+    });
     var top = out[0], clicked = false;
     if (DOCLICK) { try { top.el.scrollIntoView({ block: 'center' }); top.el.click(); clicked = true; } catch (e) {} }
     var attrs = {};
@@ -574,6 +612,71 @@ RAW_FIND_JS = r"""
   } catch (e) { return { error: String(e) }; }
 })()
 """
+
+# Reveal stylesheet: the app hides several REAL controls until hover by collapsing their
+# wrappers to 0-size (the Reviews "Send NPS survey request" / "Add reviews" icons). Zero-
+# layout controls never enter browser-use's interactive snapshot (the agent cannot click
+# them by index) and fail replay _resolve's visibility gate — both drivers then depend on
+# the RAW_FIND_JS blind-click fallback, whose substring match has misfired in live runs.
+# Forcing the wrappers visible gives the controls layout, so both drivers act on them
+# natively; the fallbacks above stay untouched for old recordings. Class patterns are
+# app-specific and owner-supplied — keep verbatim. Every injection site is gated by
+# Config.reveal_hidden_controls.
+REVEAL_STYLE_ID = "__ao_reveal_css"
+
+REVEAL_CSS = """\
+.buttons-wrapper,
+[class*="headerButtonWrapper"],
+[class*="buttons-wrapper"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+[class*="headerButton"] {
+    display: inline-flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+.hover-item,
+[class*="hover-item"],
+.containerHover .hover-item {
+    display: inline !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+"""
+
+# Guarded installer: appends the <style> once per document, no-op when already present.
+# The guard is the element's presence (not a window flag) so a framework that rebuilds
+# <head> self-heals on the next injection pass. As a context init script this runs at
+# document start where <head> may not exist yet — then it retries on DOMContentLoaded.
+# Never throws: styling must not be able to break a step, a login, or a replay.
+# (%-formatted ONCE below; if the CSS ever gains a literal '%', escape it as '%%'.)
+_REVEAL_INSTALL_TEMPLATE = r"""
+(function () {
+  try {
+    var ID = %s, CSS = %s;
+    var install = function () {
+      try {
+        if (document.getElementById(ID)) return true;
+        var root = document.head || document.documentElement;
+        if (!root) return false;
+        var style = document.createElement('style');
+        style.id = ID;
+        style.textContent = CSS;
+        root.appendChild(style);
+        return true;
+      } catch (e) { return false; }
+    };
+    if (!install())
+      document.addEventListener('DOMContentLoaded', install, { once: true });
+  } catch (e) {}
+})()
+"""
+REVEAL_CSS_JS = _REVEAL_INSTALL_TEMPLATE % (json.dumps(REVEAL_STYLE_ID), json.dumps(REVEAL_CSS))
 
 # After an interaction, give the slow React app a beat to open a menu / commit react-select
 # state / re-render before the next locator query, so replay doesn't outrun the UI.

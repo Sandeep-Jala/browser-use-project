@@ -33,6 +33,25 @@ class StubLLM:
         return R()
 
 
+class SeqLLM:
+    """Returns queued completions in order (last one repeats); records received messages."""
+
+    def __init__(self, *replies: str):
+        self.replies = list(replies)
+        self.calls = 0
+        self.seen: list[list] = []
+
+    async def ainvoke(self, messages):
+        self.seen.append(list(messages))
+        reply = self.replies[min(self.calls, len(self.replies) - 1)]
+        self.calls += 1
+
+        class R:
+            completion = reply
+
+        return R()
+
+
 PROMPT = ("go to Bookkeeping module, search and select 290 CREW LIMITED business name. "
           "add invoice for customer Suresh Gopi with qty 5 and click save")
 
@@ -155,6 +174,28 @@ async def test_hallucinated_value_rejected_then_fallback(library):
     assert len(subs) == 1  # whole-prompt fallback
     assert subs[0].marker == "Invoices"
     assert ss.load_decomposition(ss.task_id(PROMPT)) is None  # garbage is never cached
+
+
+@pytest.mark.asyncio
+async def test_rejected_attempt_feeds_error_back_to_the_retry(library):
+    bad = json.dumps({"subtasks": [
+        {"template_prompt": "select {{business}}",
+         "values": {"business": "NOT IN THE PROMPT LLC"}, "is_save_step": True},
+    ]})
+    llm = SeqLLM(bad, GOOD_REPLY)
+    subs = await decompose.get_decomposition(PROMPT, llm=llm, marker="Invoices")
+
+    assert llm.calls == 2
+    assert len(subs) == 2  # the corrected retry was accepted, not the fallback
+    # Attempt 1 is clean; attempt 2's user message carries the specific rejection.
+    first_user = str(llm.seen[0][-1].content)
+    retry_user = str(llm.seen[1][-1].content)
+    assert "REJECTED" not in first_user
+    assert "REJECTED" in retry_user
+    assert "NOT IN THE PROMPT LLC" in retry_user
+    # The corrected split is cached like any tier-4 success.
+    cached = ss.load_decomposition(ss.task_id(PROMPT))
+    assert cached and cached["source"] == "llm"
 
 
 @pytest.mark.asyncio

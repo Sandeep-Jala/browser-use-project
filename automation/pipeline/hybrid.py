@@ -44,7 +44,7 @@ from automation.pipeline import subtask_store as sstore
 from automation.pipeline.decompose import Subtask, get_decomposition
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
-from automation.pipeline.script_compile import promote_healed, save_steps
+from automation.pipeline.script_compile import REVEAL_CSS_JS, promote_healed, save_steps
 from automation.browser.session import attach_session
 
 logger = logging.getLogger("framework.hybrid")
@@ -354,6 +354,15 @@ class HybridSession:
         if page is None:
             seg.error = "no open page to replay against"
             return seg
+        if self.runner.config.reveal_hidden_controls:
+            # Replay-only runs never execute an agent step, so re-assert the reveal
+            # stylesheet here (idempotent; normally a no-op — login.py's init script already
+            # covered this document). Keeps 0-size targets resolvable by _resolve's
+            # visibility gate even after a rare hard navigation mid-replay.
+            try:
+                await page.evaluate(REVEAL_CSS_JS)
+            except Exception as exc:  # noqa: BLE001 - best-effort; replay proceeds anyway
+                logger.debug("reveal css injection skipped: %s", exc)
         outcome = await skills.execute(skill, page)
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)

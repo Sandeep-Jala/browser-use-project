@@ -200,10 +200,9 @@ dividend:
 invoice_full_creation:
   prompt: >-
     go to Bookkeeping module.search for 290 CREW LIMITED business name and select it.go to
-    inputs section,select sales,go to Invoices,add invoice,create a new Contact name 'dpscvs'
-    in customer field. set address jodhpur, rajasthan, 342015. set supplier address barmer,
-    rajasthan, india, 325486. Supplier Set Due Date 01/01/2027. Set invoice no INV12345. set
-    p.o. reference abc123, create an item 'IT Services',set product description 'service
+    inputs section,select sales,go to Invoices,add invoice,create a new Contact name 'dpsbjhgfytvs'
+    in customer field. set address jodhpur, rajasthan, 342015. Set invoice no INV2345. set
+    p.o. reference abb123, create an item 'IT Services',set product description 'service
     provider', set qty 10 and unit price 5000, set vat to No Vat, set discount 10% and click
     on save.
   marker: Invoices
@@ -226,7 +225,7 @@ nps_02_review_for_dropdown:
     Navigate to the user profile icon and click on setting and go to "Practice Profile" under
     "Practice Config", then under the "basic info" go to "Practice Properties" to locate the
     “Client Review” setting and note the currently selected option; Next go back to clients
-    section and select a business name randomly. In the Profile section, go to the Assignment
+    section and select a 290 CREW LIMITED business name. In the Profile section, go to the Assignment
     section and capture the names of both the Accountant and Account Manager, then go to the
     Reviews section, click the “Send NPS Survey Request” icon, and verify that the “Review
     for” dropdown value matches the correct user based on the selected Client Review setting;

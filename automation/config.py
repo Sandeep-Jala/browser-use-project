@@ -98,6 +98,12 @@ class Config:
     semantic_router: bool
     # Local embedding model for the router (fastembed name; downloaded once to its cache).
     embedding_model: str
+    # Inject a stylesheet (script_compile.REVEAL_CSS) into every page that forces the app's
+    # hover-revealed / 0-size controls visible, so they enter the agent's snapshot and pass
+    # replay's visibility gate instead of relying on the RAW_FIND_JS blind-click fallback.
+    # Flip per-ENVIRONMENT, not per-run: recordings authored with it on compile to
+    # visibility-requiring click steps that fail replay with it off.
+    reveal_hidden_controls: bool
 
     @classmethod
     def from_env(cls, env_path: str | os.PathLike[str] | None = None) -> "Config":
@@ -129,6 +135,7 @@ class Config:
             subtask_max_steps=int(os.getenv("SUBTASK_MAX_STEPS", "25")),
             semantic_router=_env_bool("SEMANTIC_ROUTER", default=True),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
+            reveal_hidden_controls=_env_bool("REVEAL_HIDDEN_CONTROLS", default=True),
         )
 
     def ensure_dirs(self) -> None:

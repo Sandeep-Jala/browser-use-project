@@ -344,6 +344,12 @@ class Runner:
             # Recovery headroom for consecutive step failures — the 0.13.3 default, pinned
             # explicitly so a library upgrade can't silently move it.
             max_failures=5,
+            # Never let browser-use auto-navigate to a URL it thinks it sees in the task
+            # text. Every segment starts on an already-correct live page, and the extractor
+            # misreads prose as domains (observed live: the decomposer's "Bookkeeping
+            # module.search for..." wording became a navigate to https://module.search,
+            # ERR_NAME_NOT_RESOLVED, failing the whole run).
+            directly_open_url=False,
         )
 
         # Stamp each captured telemetry event with the agent step it fired on, and service any
@@ -412,10 +418,10 @@ class Runner:
                 if typed is None:
                     return
                 notice = (
-                    f"⚠ SEARCH CHECK: you typed '{typed[:60]}' into a search box. This app "
-                    "often only runs the search when Enter is pressed. Your NEXT action MUST "
-                    "be send_keys with 'Enter' (focus is already in the search field), then "
-                    "wait ~2 seconds before reading the result list."
+                    f"⚠ SEARCH CHECK: you typed '{typed[:60]}' into a search box. Enter was "
+                    "already pressed for you (the input tool does it automatically) — do NOT "
+                    "send Enter again. Wait ~2 seconds for the filtered results to load "
+                    "before reading the list."
                 )
                 if not _inject_context(_agent, notice):
                     return
@@ -464,6 +470,11 @@ class Runner:
             _nudge_if_unintended_navigation(_agent)
             _nudge_if_search_typed(_agent)
             _nudge_if_discovery_loop(_agent)
+            # Re-assert the reveal stylesheet on the current document each step (idempotent,
+            # one cheap CDP eval; on_step_start, so it lands BEFORE this step's snapshot):
+            # covers tabs created outside login.py's init-scripted context.
+            if self.config.reveal_hidden_controls:
+                await agent_tools.ensure_reveal_css(session)
             await _surface_notifications(_agent)
             if pause_state["requested"]:
                 pause_state["requested"] = False

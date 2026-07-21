@@ -21,6 +21,7 @@ from playwright.async_api import Browser, Page, Playwright, TimeoutError as Play
 
 from automation.config import Config
 from automation.browser.error_capture import save_login_error_screenshot
+from automation.pipeline.script_compile import REVEAL_CSS_JS
 
 
 class LoginError(RuntimeError):
@@ -107,6 +108,14 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
     context = await browser.new_context(
         viewport={"width": 1440, "height": 900}, device_scale_factor=1.0,
     )
+    if config.reveal_hidden_controls:
+        # Install the reveal stylesheet into EVERY document this context creates, from
+        # birth: hover-revealed/0-size controls otherwise never enter browser-use's
+        # snapshot and fail replay's visibility gate. The agent and the replay engine both
+        # drive pages of THIS context, so one init script covers authoring and replay
+        # across every navigation. (Per-step and per-segment re-asserts back this up for
+        # pages created outside the context — see agent_tools.ensure_reveal_css.)
+        await context.add_init_script(REVEAL_CSS_JS)
     page = await context.new_page()
 
     try:
@@ -119,7 +128,7 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
 
         email_selector = "#Input_Email, input[name='Input_Email'], input[id='Input_Email']"
         password_selector = "#Input_Password, input[name='Input_Password'], input[id='Input_Password']"
-        await page.wait_for_selector(email_selector, timeout=10000)
+        await page.wait_for_selector(email_selector, timeout=45000)
         # Let the login page finish hydrating BEFORE typing: values typed mid-hydration get
         # wiped and the form then submits empty. The login page is light enough to reach
         # network idle quickly (unlike the post-login dashboard, which never settles).

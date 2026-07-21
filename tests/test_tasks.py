@@ -35,7 +35,9 @@ FROZEN_TIDS = {
     "banking": "8f7bc65c2a411131",
     "budget_manager": "3a82e778d765ce63",
     "dividend": "53b429e5f90d0771",
-    "invoice_full_creation": "00a74cbcea4d9f17",
+    # Re-frozen 2026-07-20: prompt edited after the library/decomposition reset, so the
+    # orphaned old cache (00a74cbcea4d9f17) was already gone by design.
+    "invoice_full_creation": "a895eb5badb377c2",
     "crm_create_invoice": "c15b853adfd1c42d",
     "nps_02_review_for_dropdown": "a1bba1c849c557f8",
     "nps_03_mandatory_review_for": "69b65b3f3a938f6c",

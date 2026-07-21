@@ -131,24 +131,25 @@ Deliberate waits are load-bearing: they also compile into the
 replay script (capped at 3s) so fast replays don't outrun the UI.
 
 ───────────────────────────────────────────────────────────
-SEARCH BOXES — ALWAYS press Enter after typing
+SEARCH BOXES — Enter is pressed FOR you
 ───────────────────────────────────────────────────────────
 Many lists in this app only run the search when Enter is
-pressed; typing alone can silently do nothing.
-  • After typing a query into ANY search/filter box over a
-    list or table (e.g. placeholder "Search..."), your very
-    NEXT action MUST be send_keys with "Enter" — ALWAYS, even
-    if the list already looks filtered. Then wait ~2 seconds
-    for results to load.
+pressed. The `input` action presses Enter automatically
+after typing (its receipt says "pressed Enter"), so:
+  • Do NOT follow input with send_keys "Enter" — it already
+    happened. Just wait ~2 seconds for results to load.
   • EXCEPTION: dropdown/combobox filters (react-select) are
-    NOT search boxes. There, type and then CLICK the option
-    you want — NEVER press Enter (it selects whatever option
-    happens to be focused).
-  • Only after type + Enter + wait may you conclude a record
-    is "not found" — NEVER from typing alone.
+    NOT search boxes. The tool detects them and SUPPRESSES
+    Enter (the receipt says so); type and then CLICK the
+    option you want — never send Enter yourself either (it
+    selects whatever option happens to be focused).
+  • Only after typing (with its auto-Enter) + wait may you
+    conclude a record is "not found" — NEVER from typing
+    alone.
   • Do NOT loop on clearing and retyping the same query into
     the same box — that changes nothing. One retype maximum
-    (type + Enter + wait), then the ELEMENT NOT FOUND POLICY.
+    (type + auto-Enter + wait), then the ELEMENT NOT FOUND
+    POLICY.
 
 ───────────────────────────────────────────────────────────
 MISCLICK CHECK — verify every click receipt
@@ -513,11 +514,19 @@ span into a data-entry subtask — so its recording is reused across tasks.
 {{supplier}}, {{item}}, {{qty}}, {{unit_price}}, {{amount}}, {{date}}, {{remarks}}. Use \
 the SAME name for the same role in every task (e.g. always {{business}}, never \
 {{business_name}}).
-- Every literal value in the task (names, numbers, descriptions, references, dates) appears \
-in EXACTLY ONE subtask, replaced by a {{snake_case}} token named for the ROLE it plays \
-(customer, item, qty, unit_price, remarks, ...). Its verbatim value goes in that subtask's \
-"values". Words that are part of the procedure (module names, section names, button labels) \
-are NOT values — leave them literal.
+- Every literal value in the task (names, numbers, descriptions, reference numbers, dates) \
+appears in EXACTLY ONE subtask, replaced by a {{snake_case}} token named for the ROLE it \
+plays (customer, item, qty, unit_price, remarks, ...). Its verbatim value goes in that \
+subtask's "values". Words that are part of the procedure (module names, section names, \
+button labels) are NOT values — leave them literal.
+- ONLY tokenize concrete data the task text itself spells out. Every value must be an \
+EXACT substring of the task text — the split is mechanically REJECTED if any value is not.
+- Phrases that merely REFER to data the agent will discover on the page at runtime ("the \
+Account Manager", "the noted setting", "a business name randomly", "the same business") \
+are procedure words, NOT values — never tokenize them.
+- A task may contain NO literal values at all (everything discovered at runtime): then \
+every "values" is {} and no template contains a token. Never invent a token just to have \
+a parameter.
 - Substituting every subtask's values back into its template_prompt must reproduce the \
 task's original wording for that span. Do not reword, add, or drop actions.
 - Exactly ONE subtask has "is_save_step": true — the one whose final action commits the \

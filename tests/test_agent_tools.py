@@ -6,7 +6,11 @@ edit, and delete icons all reach the agent as a nameless `<button/>`. `_descenda
 recovers that meaning from the child so nameless icon buttons become findable."""
 
 from automation.pipeline import agent_tools
-from automation.pipeline.agent_tools import _descendant_icon_hints, read_new_notifications
+from automation.pipeline.agent_tools import (
+    _descendant_icon_hints,
+    ensure_reveal_css,
+    read_new_notifications,
+)
 
 
 class Node:
@@ -105,6 +109,36 @@ async def test_notifications_none_session_and_bad_result(monkeypatch):
         return "oops"
     monkeypatch.setattr(agent_tools, "_eval_js", not_a_list)
     assert await read_new_notifications(object()) == []
+
+
+# ------------------------------- ensure_reveal_css -------------------------------
+
+
+async def test_reveal_css_evals_the_shared_installer(monkeypatch):
+    """The helper must inject EXACTLY the shared script_compile constant — identity, not a
+    lookalike — so authoring and replay install one and the same stylesheet."""
+    calls = []
+
+    async def fake_eval(_session, expr):
+        calls.append(expr)
+    monkeypatch.setattr(agent_tools, "_eval_js", fake_eval)
+
+    await ensure_reveal_css(object())
+    assert calls == [agent_tools._REVEAL_CSS_JS]
+
+
+async def test_reveal_css_never_raises_and_skips_none_session(monkeypatch):
+    calls = []
+
+    async def boom(_s, _e):
+        calls.append(1)
+        raise RuntimeError("cdp down")
+    monkeypatch.setattr(agent_tools, "_eval_js", boom)
+
+    await ensure_reveal_css(object())  # swallowed
+    assert calls == [1]
+    await ensure_reveal_css(None)      # no session -> no eval
+    assert calls == [1]
 
 
 # ------------------------------- element capture resilience -------------------------------

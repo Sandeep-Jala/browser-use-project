@@ -12,8 +12,8 @@ from automation.pipeline.script_compile import compile_recording
 from automation.skills.codegen import lint_code, transpile
 
 
-def _item(action, url="http://app/x", result=None):
-    return {"state": {"url": url, "interacted_element": []},
+def _item(action, url="http://app/x", result=None, element=None):
+    return {"state": {"url": url, "interacted_element": [element] if element else []},
             "model_output": {"action": [action]},
             "result": result if result is not None else []}
 

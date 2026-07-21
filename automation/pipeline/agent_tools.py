@@ -19,6 +19,14 @@ NOT part of browser-use's built-in set:
 `evaluate` — see below, since `Tools()` starts from the default registry). The Runner passes
 it to `Agent(tools=...)`.
 
+The built-in `input` action is REPLACED (same name, same params) by a variant that presses
+Enter after typing: this app's search/filter boxes only apply on Enter, and agents regularly
+typed a query without submitting it. Dropdown/combobox filter inputs (react-select) are
+exempt — Enter there selects whatever option is focused (see the SEARCH BOXES prompt rule).
+The result's `metadata.auto_enter` flag says whether Enter was pressed (restored into saved
+recordings by runner.restore_result_metadata), and compile_recording mirrors it with a
+`press` step so replays match the live run.
+
 Two behaviours here exist to keep authored runs COMPILABLE into replay scripts
 (script_compile.py only translates click/input/navigate/wait/send_keys):
   * `evaluate` (built-in JS execution) is excluded from the registry. The agent used it to
@@ -43,10 +51,15 @@ from typing import Any
 from browser_use import Tools
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
-from browser_use.browser.events import ClickElementEvent
+from browser_use.browser.events import ClickElementEvent, SendKeysEvent, TypeTextEvent
 from browser_use.dom.views import DOMInteractedElement
+from browser_use.tools.views import InputTextAction
 
-from automation.pipeline.script_compile import RAW_FIND_JS as _RAW_FIND_JS
+from automation.pipeline.script_compile import (
+    RAW_FIND_JS as _RAW_FIND_JS,
+    REVEAL_CSS_JS as _REVEAL_CSS_JS,
+    _RS_FILTER_ID,
+)
 
 logger = logging.getLogger("framework.tools")
 
@@ -153,6 +166,38 @@ async def _eval_js(browser_session: BrowserSession | None, expression: str, *, a
 # so hover-revealed/0-size controls behave identically at author and replay time.
 
 
+def _norm_phrase(s: str) -> str:
+    """find_by_text's token grammar collapsed back to a phrase — the one normalization for
+    comparing a clicked element's name against the query that found it (and the same
+    normalization RAW_FIND_JS ranks candidates with)."""
+    return " ".join(t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t)
+
+
+def _hidden_click_receipt(query: str, clicked_name: str) -> str:
+    """Receipt for a raw-DOM hidden-path click. It must be UNMISTAKABLY "the click already
+    happened": a model that reads it as a find-result clicks a second time — observed live:
+    the follow-up click closed the panel the first had just opened, then the agent hunted
+    the vanished icon for 18 steps. And when the clicked NAME is neither the query nor a
+    prefix-extension of it, the generic "re-call once" advice looped the agent into
+    re-clicking the same wrong control (observed: 'Reviews' -> 'Add reviews', three times),
+    so that case warns and forbids the re-call instead."""
+    base = (f"find_by_text('{query}'): ✅ ALREADY CLICKED '{clicked_name}' for you "
+            f"(a 0-size/hover-revealed control outside the interactive snapshot, clicked "
+            f"via its own handler). Do NOT click it again — a second click can close what "
+            f"the first just opened. ")
+    name, phrase = _norm_phrase(clicked_name), _norm_phrase(query)
+    if name == phrase or name.startswith(phrase + " "):
+        return base + (f"NEXT: wait ~2 seconds, then check whether the expected "
+                       f"panel/content appeared. Only if it truly did not, re-call "
+                       f"find_by_text('{query}', click_first=true) once.")
+    return base + (f"⚠ NAME MISMATCH: '{clicked_name}' is not '{query}' — this may be the "
+                   f"WRONG control (nothing better-named exists in the DOM). NEXT: check "
+                   f"what changed on the page. If it is NOT what you wanted, close/undo it "
+                   f"and do NOT re-call find_by_text('{query}') — it would click this same "
+                   f"control again; reach your target differently (scroll to the section, "
+                   f"or use a more specific label).")
+
+
 # Page notifications (toasts / message bars) are how the app reports the OUTCOME of an action
 # — "saved", "validation failed", "permission denied", a 500. They are transient: they fade
 # in a few seconds, so by the time the agent finishes its LLM step and looks, they are gone.
@@ -225,6 +270,20 @@ async def read_new_notifications(browser_session: BrowserSession | None) -> list
             seen.add(t)
             out.append(t)
     return out
+
+
+async def ensure_reveal_css(browser_session: BrowserSession | None) -> None:
+    """Install the reveal stylesheet (script_compile.REVEAL_CSS_JS, idempotent) into the
+    agent's CURRENT document. login.py's context init script covers the main context from
+    birth; this per-step pass heals what it can't reach — a tab browser-use creates via CDP
+    outside that context, or a document whose <head> was rebuilt. Best-effort: never raises.
+    The caller gates on Config.reveal_hidden_controls."""
+    if browser_session is None:
+        return
+    try:
+        await _eval_js(browser_session, _REVEAL_CSS_JS)
+    except Exception as exc:  # noqa: BLE001 - styling must never break a step
+        logger.debug("ensure_reveal_css skipped: %s", exc)
 
 
 # --- Layout heuristic (runs entirely in the page) --------------------------------------------
@@ -320,10 +379,68 @@ def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
         return None
 
 
+# A dropdown/combobox filter input: Enter there commits the focused option instead of
+# submitting a search, so the auto-Enter `input` replacement must not fire it.
+def _is_dropdown_filter(node: Any) -> bool:
+    attrs = getattr(node, "attributes", None) or {}
+    if _RS_FILTER_ID.match(attrs.get("id") or ""):
+        return True
+    if (attrs.get("role") or "").strip().lower() == "combobox":
+        return True
+    return (attrs.get("aria-autocomplete") or "").strip().lower() not in ("", "none")
+
+
 def build_tools() -> Tools:
-    """Return a browser-use `Tools` registry with our custom actions added and `evaluate`
-    removed (JS form-fills are unrecordable — see module docstring)."""
+    """Return a browser-use `Tools` registry with our custom actions added, `evaluate`
+    removed (JS form-fills are unrecordable — see module docstring), and the built-in
+    `input` overridden by the auto-Enter variant."""
     tools = Tools(exclude_actions=["evaluate"])
+
+    # Same name/param model as the built-in: same-name registration OVERRIDES it (excluding
+    # "input" would drop this replacement too), and the recorder still captures the
+    # interacted element via the index param.
+    @tools.action(
+        'Input text into element by index, then press Enter automatically to submit/apply it '
+        '(Enter is suppressed for dropdown/combobox filters — click the option you want '
+        'instead). Clears existing text by default; pass text="" to clear only, or '
+        "clear=False to append.",
+        param_model=InputTextAction,
+    )
+    async def input(params: InputTextAction, browser_session=None) -> ActionResult:
+        node = await browser_session.get_element_by_index(params.index)
+        if node is None:
+            msg = (f"Element index {params.index} not available - page may have changed. "
+                   "Try refreshing browser state.")
+            logger.warning("⚠️ %s", msg)
+            return ActionResult(extracted_content=msg)
+        dropdown = _is_dropdown_filter(node)
+        try:
+            event = browser_session.event_bus.dispatch(
+                TypeTextEvent(node=node, text=params.text, clear=params.clear))
+            await event
+            input_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
+            if not dropdown:
+                enter = browser_session.event_bus.dispatch(SendKeysEvent(keys="Enter"))
+                await enter
+                await enter.event_result(raise_if_any=True, raise_if_none=False)
+        except Exception as exc:  # noqa: BLE001 - report; the agent recovers via its receipt
+            logger.error("input failed at index %s: %s", params.index, exc)
+            return ActionResult(error=f"Failed to type text into element {params.index}: {exc}")
+        meta = dict(input_metadata) if isinstance(input_metadata, dict) else {}
+        actual = meta.pop("actual_value", None)
+        # The compiler's signal to mirror the Enter as a replay `press` step; a structured
+        # flag, not the receipt text, so rewording the message can't change replays.
+        meta["auto_enter"] = not dropdown
+        if dropdown:
+            msg = (f"Typed '{params.text}' (dropdown filter — Enter suppressed; "
+                   "click the option you want)")
+        else:
+            msg = f"Typed '{params.text}' and pressed Enter"
+        if actual is not None and actual != params.text:
+            msg += (f". Note: the field's actual value '{actual}' differs from the typed "
+                    "text — the page may have reformatted or autocompleted it.")
+        logger.debug(msg)
+        return ActionResult(extracted_content=msg, long_term_memory=msg, metadata=meta)
 
     @tools.action(
         "Abandon the CURRENT objective/step and continue the run. Use when a step failed but "
@@ -472,17 +589,9 @@ def build_tools() -> Tools:
                             "ax_name": str(raw.get("name") or "").strip(),
                             "hidden_click": True,
                         }}
-                    # The receipt must be UNMISTAKABLY "the click already happened": a model
-                    # that reads this as a find-result clicks a second time — observed live:
-                    # the follow-up click closed the panel the first click had just opened,
-                    # then the agent hunted the vanished icon for 18 steps.
-                    msg = (f"find_by_text('{query}'): ✅ ALREADY CLICKED '{raw.get('name')}' "
-                           f"for you (a 0-size/hover-revealed control outside the interactive "
-                           f"snapshot, clicked via its own handler). Do NOT click it again — "
-                           f"a second click can close what the first just opened. NEXT: wait "
-                           f"~2 seconds, then check whether the expected panel/content "
-                           f"appeared. Only if it truly did not, re-call "
-                           f"find_by_text('{query}', click_first=true) once.")
+                    # Receipt semantics (why it must scream "already clicked", and the
+                    # wrong-control warning on a name mismatch) live in _hidden_click_receipt.
+                    msg = _hidden_click_receipt(query, str(raw.get("name") or "").strip())
                     logger.info("🔎 %s", msg)
                     return ActionResult(extracted_content=msg, long_term_memory=msg,
                                         include_in_memory=True, metadata=meta)

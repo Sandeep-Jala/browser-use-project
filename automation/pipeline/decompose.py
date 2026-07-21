@@ -11,8 +11,9 @@ Resolution order (get_decomposition):
   3. derived match (deterministic, NO LLM): a cached decomposition whose parent prompt equals
      this prompt with only values swapped is re-instantiated with the new values — "same task,
      different customer/qty" reuses the SAME library entries at zero token cost
-  4. one LLM call (DECOMPOSE_SYSTEM_PROMPT), validated against hallucination; on repeated
-     failure, a single whole-prompt subtask (the engine degenerates to whole-task behavior)
+  4. LLM (DECOMPOSE_SYSTEM_PROMPT), validated against hallucination; a rejected attempt is
+     retried ONCE with the rejection reason fed back; on repeated failure, a single
+     whole-prompt subtask (the engine degenerates to whole-task behavior)
 
 The cache is immutable per prompt hash; --redecompose regenerates it.
 """
@@ -225,18 +226,32 @@ def match_cached_decomposition(prompt: str) -> dict[str, Any] | None:
 # ------------------------------- LLM decomposition (tier 4) -------------------------------
 
 
-async def _llm_decompose(prompt: str, llm: Any) -> list[dict[str, Any]] | None:
-    """One DECOMPOSE_SYSTEM_PROMPT call -> validated raw subtask dicts, or None."""
+async def _llm_decompose(
+    prompt: str, llm: Any, feedback: str | None = None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """One DECOMPOSE_SYSTEM_PROMPT call -> (validated raw subtask dicts, rejection reason).
+
+    `feedback` is the rejection reason from the previous attempt, folded into the user
+    message so the retry corrects that specific mistake — a blind resample repeats it.
+    """
+    user = f"Split this task:\n\n{prompt}"
+    if feedback:
+        user += (
+            f"\n\nYour previous split was REJECTED: {feedback}\n"
+            "Produce a corrected split of the SAME task that fixes exactly this problem. "
+            "A value must be an exact substring of the task text; a phrase referring to "
+            "data discovered at runtime is procedure wording — keep it literal in "
+            'template_prompt, and use "values": {} when the task spells out no data.'
+        )
     result = await llm.ainvoke(
-        [SystemMessage(content=DECOMPOSE_SYSTEM_PROMPT),
-         UserMessage(content=f"Split this task:\n\n{prompt}")]
+        [SystemMessage(content=DECOMPOSE_SYSTEM_PROMPT), UserMessage(content=user)]
     )
     data = _parse_json_reply(result.completion or "")
     raw = (data or {}).get("subtasks")
     problem = _validate(raw, prompt) if raw else "no subtasks in reply"
     if problem:
         logger.warning("LLM decomposition rejected: %s", problem)
-        return None
+        return None, problem
     # Translate is_save_step into a marker slot (the caller substitutes the real marker).
     out: list[dict[str, Any]] = []
     for d in raw:
@@ -245,7 +260,7 @@ async def _llm_decompose(prompt: str, llm: Any) -> list[dict[str, Any]] | None:
             "values": {str(k): str(v) for k, v in (d.get("values") or {}).items()},
             "is_save_step": bool(d.get("is_save_step")),
         })
-    return out
+    return out, None
 
 
 # ------------------------------- resolution entry point -------------------------------
@@ -300,14 +315,15 @@ async def get_decomposition(
                 return _build_subtasks(derived["subtasks"], marker)
             logger.warning("derived decomposition invalid (%s); falling through", problem)
 
-    # Tier 4: LLM, once per novel prompt shape (retry once on validation failure).
+    # Tier 4: LLM, once per novel prompt shape (one retry, with the rejection fed back).
     if llm is not None:
+        problem: str | None = None
         for attempt in (1, 2):
             try:
-                raw = await _llm_decompose(prompt, llm)
+                raw, problem = await _llm_decompose(prompt, llm, feedback=problem)
             except Exception as exc:  # noqa: BLE001 - decomposition must never crash a run
                 logger.warning("LLM decomposition attempt %d failed: %s", attempt, exc)
-                raw = None
+                raw = None  # a transport error carries no feedback; keep any prior reason
             if raw:
                 save_owners = [d for d in raw if d.pop("is_save_step", False)]
                 if marker and len(save_owners) == 1:
