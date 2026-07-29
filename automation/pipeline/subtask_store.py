@@ -83,6 +83,34 @@ def normalize_context(url: str) -> str:
     return norm
 
 
+def normalize_aux_context(url: str) -> str:
+    """Page-state key for a helper-tab (aux) URL: normalize_context host-QUALIFIED.
+
+    normalize_context strips the origin (one-app assumption), but aux tabs are foreign
+    origins — without the host, google.com/ and bing.com/ would both key as '/'. Aux
+    contexts therefore start with a hostname while main contexts start with '/', a
+    self-describing discriminator (evaluate_gate picks its normalizer by that prefix).
+      https://www.google.com/search?q=x -> www.google.com/search
+    """
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url or "").hostname or "").lower()
+    return f"{host}{normalize_context(url)}"
+
+
+def is_absolute_http_url(url: Any) -> bool:
+    """True for an absolute http(s) URL with a dotted host — the only tab_url shape the
+    engine will open. Everything else (relative paths, invented pseudo-URLs like
+    'https://module.search') is rejected loud at declaration/validation time, never at
+    run time."""
+    if not isinstance(url, str):
+        return False
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return parts.scheme in ("http", "https") and "." in (parts.hostname or "")
+
+
 def task_id(prompt: str) -> str:
     """Stable short id for a PARENT task prompt (whitespace/case-insensitive).
 

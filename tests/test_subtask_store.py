@@ -63,6 +63,42 @@ def test_subtask_id_context_sensitive():
         ss.subtask_id(prompt, "/bookkeeping/*/inputs")
 
 
+# ------------------------------- aux-tab context + tab_url validation -------------------------------
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://www.google.com/search?q=x", "www.google.com/search"),
+    ("https://DuckDuckGo.com", "duckduckgo.com/"),
+    ("https://app.example.com/r/12345/edit", "app.example.com/r/*/edit"),  # still starred
+    ("", "/"),
+])
+def test_normalize_aux_context(url, expected):
+    assert ss.normalize_aux_context(url) == expected
+
+
+def test_aux_and_main_contexts_never_collide():
+    # Aux contexts start with a hostname, main contexts with "/" — the self-describing
+    # prefix evaluate_gate picks its normalizer by, and a sid discriminator for free.
+    assert ss.normalize_aux_context("https://google.com/x").startswith("google.com")
+    assert ss.normalize_context("https://google.com/x").startswith("/")
+    assert ss.subtask_id("search {{q}}", ss.normalize_aux_context("https://google.com")) \
+        != ss.subtask_id("search {{q}}", ss.normalize_context("https://google.com"))
+
+
+@pytest.mark.parametrize("url,ok", [
+    ("https://duckduckgo.com", True),
+    ("http://sub.example.co.uk/path?q=1", True),
+    ("duckduckgo.com", False),           # no scheme
+    ("https://localhost", False),        # dotless host
+    ("ftp://files.example.com", False),  # wrong scheme
+    ("https://", False),
+    (None, False),
+    (42, False),
+])
+def test_is_absolute_http_url(url, ok):
+    assert ss.is_absolute_http_url(url) is ok
+
+
 # ------------------------------- manifest + meta -------------------------------
 
 

@@ -25,8 +25,10 @@ from typing import Any, Awaitable, Callable
 from playwright.async_api import Page
 
 from automation.pipeline.script_compile import (_REOPEN_MS, _SETTLE_MS, _click_with_retry,
-                                                _esc, _fill_with_retry, _find_click,
-                                                _wheel_scroll)
+                                                _esc, _extract_value, _fill_with_retry,
+                                                _find_click, _select_with_retry,
+                                                _upload_with_retry, _wheel_scroll,
+                                                merge_extract)
 
 logger = logging.getLogger("framework.skills.api")
 
@@ -35,6 +37,10 @@ logger = logging.getLogger("framework.skills.api")
 # never baked into individual skills.
 InterruptHandler = Callable[[Page], Awaitable[bool]]
 interrupt_handlers: list[InterruptHandler] = []
+
+# The footprint of an OPEN custom dropdown menu (react-select listbox / option ids, ARIA
+# listboxes). Used by select_option to decide whether typing-to-filter has anywhere to go.
+_OPEN_MENU_CSS = '[id$="-listbox"], [role="listbox"], [id*="-option-"]'
 
 
 class SkillApi:
@@ -47,13 +53,19 @@ class SkillApi:
         self.timeout_ms = timeout_ms
         self.log: list[dict[str, Any]] = []
         self.executed = 0                      # completed api calls (the ledger position)
+        self.extracted: dict[str, str] = {}    # extract verb's output ({label: text})
         self._last_click: dict[str, Any] | None = None   # for flyout-reopen recovery
 
     # ------------------------------- internals -------------------------------
 
-    def _step_for(self, handle: str) -> dict[str, Any]:
+    def _step_for(self, handle: str, expect: bool = False) -> dict[str, Any]:
         """The anchor bundle as a script_compile-shaped step (selectors + fingerprint +
-        the hidden-dispatch permission when the recorded control was invisible)."""
+        the hidden-dispatch permission when the recorded control was invisible).
+
+        `expect` (clicks only) carries the anchor's `expect_text` — the substituted
+        param value naming the target — into the step so _resolve verifies every
+        acted-on candidate against it. Fills/selects/extracts leave it behind: their
+        value is what gets typed/picked, not the target's name."""
         anchor = self.anchors.get(handle)
         if not anchor:
             raise KeyError(f"unknown anchor handle {handle!r} "
@@ -62,6 +74,11 @@ class SkillApi:
                                 "fingerprint": anchor.get("fingerprint")}
         if anchor.get("hidden_ok"):
             step["hidden_ok"] = True
+        if anchor.get("query"):
+            # Extract anchors keep their recorded query as the semantic re-find fallback.
+            step["query"] = anchor["query"]
+        if expect and anchor.get("expect_text"):
+            step["expect_text"] = anchor["expect_text"]
         return step
 
     def _record(self, action: str, handle: str | None, used: str,
@@ -90,12 +107,26 @@ class SkillApi:
                 logger.debug("interrupt handler %s failed: %s", handler, exc)
         return cleared
 
+    async def _menu_open(self) -> bool | None:
+        """Is a custom dropdown menu open right now? None when the page cannot be probed
+        (select_option then keeps the legacy type-first behavior)."""
+        try:
+            loc = self.page.locator(_OPEN_MENU_CSS)
+            for n in range(min(await loc.count(), 6)):
+                if await loc.nth(n).is_visible():
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - probe-only; never let detection fail the verb
+            return None
+
     # ------------------------------- verbs -------------------------------
 
     async def click(self, handle: str) -> None:
         """Click the anchored element. Same recovery ladder as replay: ranked selectors ->
-        fingerprint heal -> interrupt reflexes -> flyout reopen via the previous click."""
-        step = self._step_for(handle)
+        fingerprint heal -> interrupt reflexes -> flyout reopen via the previous click.
+        A value-parameterized anchor carries expect_text: the click only lands on an
+        element actually NAMED that value (wrong-business-row guard)."""
+        step = self._step_for(handle, expect=True)
         try:
             sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
         except Exception as exc:  # noqa: BLE001 - recovery ladder before the failure is final
@@ -131,18 +162,78 @@ class SkillApi:
         self._record("fill", handle, sel, healed)
         await self.page.wait_for_timeout(_SETTLE_MS)
 
+    async def select(self, handle: str, label: Any) -> None:
+        """Pick an option on the anchored NATIVE <select> by visible label (option value
+        as fallback). select_option fires the change events the page's scripts listen
+        for; distinct from select_option below, which drives an already-open custom
+        (react-select) menu."""
+        step = self._step_for(handle)
+        step["value"] = str(label)
+        try:
+            sel, healed = await _select_with_retry(self.page, step, self.timeout_ms)
+        except Exception:  # noqa: BLE001 - one reflex pass before the failure is final
+            if not await self._run_interrupts():
+                raise
+            sel, healed = await _select_with_retry(self.page, step, self.timeout_ms)
+        self._record("select", handle, sel, healed)
+        await self.page.wait_for_timeout(_SETTLE_MS)
+
     async def select_option(self, label: Any) -> None:
         """Pick an option BY LABEL from the currently open dropdown menu: type the label
         into the menu's focused filter input, then click the matching option (first
         filtered option as last resort). This is exactly the pair compile synthesizes for
-        react-select picks — the value replays by VALUE, never by position."""
+        react-select picks — the value replays by VALUE, never by position.
+
+        Every candidate is scoped to an OPEN menu (listbox container, role=option, or a
+        react-select option id): a bare page-wide text match must never count, because a
+        row cell elsewhere carrying the same word (a status chip reading "Submitted")
+        would be picked when the menu failed to open (observed live). For the same
+        reason the type-to-filter is skipped when no menu is detectably open — a blind
+        type lands in whatever currently has focus. If the menu is closed, the opener
+        recorded by the previous click re-opens it, both before the pick and once more
+        as the final recovery ladder."""
         text = str(label)
-        await self.page.keyboard.type(text, delay=30)
-        await self.page.wait_for_timeout(_SETTLE_MS)
-        option = {"selectors": [f'role=option[name="{_esc(text)}"]',
-                                f'text="{_esc(text)}"',
-                                'css=[id$="-option-0"]']}
-        sel, healed = await _click_with_retry(self.page, option, self.timeout_ms)
+        # expect_text: the first-filtered-option fallback must still be NAMED the label —
+        # if the filter never applied, option-0 is an arbitrary option, not the value.
+        option = {"selectors": [f'css=[id$="-listbox"] >> text="{_esc(text)}"',
+                                f'role=option[name="{_esc(text)}"]',
+                                f'css=[class*="menu"] >> text="{_esc(text)}"',
+                                'css=[id$="-option-0"]'],
+                  "expect_text": text}
+
+        async def _type_filter() -> None:
+            if await self._menu_open() is False:
+                logger.info("select_option %r: no open menu; skipping the "
+                            "type-to-filter (a blind type would land in whatever "
+                            "has focus)", text)
+                return
+            await self.page.keyboard.type(text, delay=30)
+            await self.page.wait_for_timeout(_SETTLE_MS)
+
+        if await self._menu_open() is False and self._last_click is not None:
+            logger.info("select_option %r: menu not open yet; re-clicking the opener "
+                        "first", text)
+            try:
+                await _click_with_retry(self.page, self._last_click, _REOPEN_MS)
+                await self.page.wait_for_timeout(_SETTLE_MS)
+            except Exception as exc:  # noqa: BLE001 - the pick below reports the real failure
+                logger.info("select_option %r: opener pre-click failed (%s)",
+                            text, str(exc)[:120])
+        await _type_filter()
+        try:
+            sel, healed = await _click_with_retry(self.page, option, self.timeout_ms)
+        except Exception as exc:  # noqa: BLE001 - reopen the menu before the failure is final
+            if self._last_click is None:
+                raise
+            logger.info("select_option %r found no pickable option (%s); re-clicking "
+                        "the opener and retrying once", text, str(exc)[:120])
+            try:
+                await _click_with_retry(self.page, self._last_click, _REOPEN_MS)
+                await self.page.wait_for_timeout(_SETTLE_MS)
+                await _type_filter()
+                sel, healed = await _click_with_retry(self.page, option, _REOPEN_MS)
+            except Exception:  # noqa: BLE001 - surface the ORIGINAL failure
+                raise exc from None
         self._record("select_option", None, sel, healed)
         await self.page.wait_for_timeout(_SETTLE_MS)
 
@@ -175,6 +266,43 @@ class SkillApi:
         name = await _find_click(self.page, str(label))
         self._record("find_click", None, f"find_click:{name}", None)
         await self.page.wait_for_timeout(_SETTLE_MS)
+
+    async def upload(self, handle: str, name: Any) -> None:
+        """Attach files.UPLOADS_DIR/<name> to the anchored upload control via
+        set_input_files — the native dialog never opens, and a missing/empty file
+        raises before anything touches the page (a ghost upload crashes the tab at
+        save time — see _upload_with_retry)."""
+        step = self._step_for(handle)
+        step["value"] = str(name)
+        try:
+            sel, healed = await _upload_with_retry(self.page, step, self.timeout_ms)
+        except Exception:  # noqa: BLE001 - one reflex pass before the failure is final
+            if not await self._run_interrupts():
+                raise
+            sel, healed = await _upload_with_retry(self.page, step, self.timeout_ms)
+        self._record("upload", handle, sel, healed)
+        await self.page.wait_for_timeout(_SETTLE_MS)
+
+    async def extract(self, handle: str, label: str) -> str:
+        """Read the anchored element's CURRENT text into the `extracted` ledger — the
+        fresh data an aux-tab skill exists to fetch. Same ladder as the tier-0 extract
+        step (_extract_value): ranked selectors -> fingerprint heal -> semantic re-find
+        by the recorded query; an EMPTY read raises so the segment fails honestly instead
+        of replaying a hollow pass."""
+        step = self._step_for(handle)
+        step["label"] = label
+        try:
+            value, used, healed = await _extract_value(self.page, step, self.timeout_ms)
+        except Exception:  # noqa: BLE001 - one reflex pass before the failure is final
+            if not await self._run_interrupts():
+                raise
+            value, used, healed = await _extract_value(self.page, step, self.timeout_ms)
+        # Collision-safe: a second extract sharing this label keeps BOTH values
+        # (label_2, ...) instead of clobbering — see script_compile.merge_extract.
+        merge_extract(self.extracted, str(label), value)
+        self._record("extract", handle, used, healed)
+        self.log[-1]["value"] = value[:200]
+        return value
 
     async def goto(self, url: str) -> None:
         await self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)

@@ -18,8 +18,9 @@ import logging
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
 logger = logging.getLogger("framework.script")
 
@@ -151,6 +152,10 @@ _SM_ATTR = re.compile(r"([a-zA-Z][\w-]*)=([^\s>]+)")
 _RS_FILTER_ID = re.compile(r"^react-select-\d+-input$")
 # How many listing lines below the miscaptured container to search for the real field.
 _RECOVER_WINDOW = 8
+# How many listing lines below an element's own line may carry its child text.
+_SM_TEXT_LINES = 3
+# Listing lines that are page-edge markers, not element text.
+_SM_EDGE = re.compile(r"pixels? (above|below)|^\[?(Start|End) of page|^\.\.\.")
 
 
 def _recover_fill_target(state_message: str, recorded_index: Any) -> dict[str, str] | None:
@@ -203,6 +208,72 @@ def _recovered_selectors(attrs: dict[str, str]) -> list[str]:
 # weighs them at replay). `class`/`value` are deliberately excluded: they churn on this React
 # app and would drag the score toward the wrong element.
 _FP_ATTRS = ("id", "name", "aria-label", "placeholder", "title", "data-testid", "type", "href")
+
+
+def _sm_child_text(state_message: str, backend_id: Any) -> str:
+    """A recorded element's visible child text, recovered from browser-use's DOM listing.
+
+    browser-use leaves ax_name null on plain containers whose text the AX tree does not
+    NAME (observed live: the 'Sent' status-chip <span>), and the element dict carries no
+    innerText — so compile used to collapse such targets to a bare positional xpath,
+    which resolves to whatever sits at that path next run and clicks it silently. The
+    listing renders an element's child text on the line(s) directly below its
+    [backend_id] line; recover it so the step still gets a text= candidate, a text
+    fingerprint, and a name to verify the landed click against."""
+    if not state_message or backend_id is None:
+        return ""
+    lines = state_message.splitlines()
+    anchor = next((i for i, ln in enumerate(lines) if f"[{backend_id}]<" in ln), None)
+    if anchor is None:
+        return ""
+    elem_indent = len(lines[anchor]) - len(lines[anchor].lstrip())
+    parts: list[str] = []
+    for ln in lines[anchor + 1: anchor + 1 + _SM_TEXT_LINES]:
+        if _SM_LINE.search(ln):
+            break  # the next element's line — end of this element's own text
+        text = ln.strip()
+        # An element's OWN text is rendered strictly DEEPER than its line; same-or-
+        # shallower text belongs to a sibling (observed live: 'Select file' from the
+        # adjacent upload control, listed flat right under the Notes textarea).
+        if len(ln) - len(ln.lstrip()) <= elem_indent:
+            break
+        if _SM_EDGE.search(text):
+            break
+        if text:
+            parts.append(text)
+    text = " ".join(parts).strip()
+    # Same policy as ax_name: a long blob is a container/announcement, not a label.
+    return text if 0 < len(text) <= 60 else ""
+
+
+def _with_recovered_text(element: dict[str, Any] | None,
+                         state_message: str) -> dict[str, Any] | None:
+    """The recorded element, with ax_name recovered from the DOM listing when the
+    recorder left it empty (no-op otherwise). Feeds _selectors / _fingerprint /
+    _dropdown_option_steps, so a label-less capture still anchors semantically instead
+    of xpath-only. Editable elements are exempt: they have no text children of their
+    own — anything below their listing line is a label/placeholder or a sibling."""
+    if not element or (element.get("ax_name") or "").strip() \
+            or (element.get("node_name") or "").lower() in _EDITABLE_TAGS:
+        return element
+    text = _sm_child_text(state_message, element.get("backend_node_id"))
+    if not text:
+        return element
+    enriched = dict(element)
+    enriched["ax_name"] = text
+    return enriched
+
+
+def _ax_label(element: dict[str, Any]) -> str:
+    """The element's short accessible name for landed-click verification ('' when the
+    recorder captured none, or only a >60-char announcement blob). Editable elements
+    never qualify: the verifier reads inner_text/aria-label, and a field's name lives
+    in an external <label> the landed check cannot see — expecting it would refuse the
+    RIGHT field."""
+    if (element.get("node_name") or "").lower() in _EDITABLE_TAGS:
+        return ""
+    ax = (element.get("ax_name") or "").strip()
+    return ax if len(ax) <= 60 else ""
 
 
 def _fingerprint(element: dict[str, Any]) -> dict[str, Any]:
@@ -338,7 +409,7 @@ def _dropdown_option_steps(
         return [{"action": "click", "selectors": [
             'css=[id*="-option"]:has-text("Create")',
             f'css=[id$="-{part.group("part")}"]' if part else 'css=[id$="-option-0"]',
-        ]}]
+        ], "expect_text": "Create"}]
     ax_name = (element.get("ax_name") or "").strip()
     # Skip wait AND press steps: the auto-Enter input tool interleaves `press` after fills,
     # and the filter fill this option click belongs to may sit behind one.
@@ -357,6 +428,12 @@ def _dropdown_option_steps(
         f'text="{_esc(label)}"',
         positional if typed else 'css=[id$="-option-0"]',
     ]}
+    if ax_name:
+        # The pick must land on an option NAMED what was recorded — the positional
+        # fallback otherwise clicks whatever now sits at that index. Only the element's
+        # own name qualifies: a typed filter may be a partial label, and expecting it
+        # verbatim would refuse the legitimately-filtered option.
+        click_step["expect_text"] = ax_name
     if typed:
         # The filter is already a recorded fill step; just click the option it filtered to.
         return [click_step]
@@ -366,6 +443,27 @@ def _dropdown_option_steps(
         "field_id": match.group("instance"),
     }
     return [type_step, click_step]
+
+
+# Actions that only OBSERVE the page. They cannot have caused an off-site navigation, so
+# the site-boundary invariant never drops them: if the site redirected spontaneously around
+# one (an ad firing during the settle), dropping the read would not prevent the redirect at
+# replay — and it may carry an observation later steps need.
+_READ_ONLY_ACTIONS = {"extract_data", "capped_scroll", "scroll", "wait", "done"}
+
+
+def _reg_host(url: Any) -> str:
+    """Registrable-ish host for the site-boundary check: the last two labels, so
+    www.fakenamegenerator.com == fakenamegenerator.com but != accounts.google.com.
+    Non-http(s)/unparsable urls yield '' (the check disables itself)."""
+    u = str(url or "")
+    if not u.startswith("http"):
+        return ""
+    try:
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:  # noqa: BLE001 - malformed url in an old recording
+        return ""
+    return ".".join(host.split(".")[-2:]) if host else ""
 
 
 def compile_recording(
@@ -393,30 +491,60 @@ def compile_recording(
         start_url = ((history[0].get("state") or {}).get("url") if history else None)
         if start_url and start_url.startswith("http"):
             steps.append({"action": "goto", "url": start_url})
-    for item in history:
+    # Site-boundary invariant: a segment is single-site by construction (main segments live
+    # on the app, aux segments on their tab_url host — cross-site work is split into
+    # separate subtasks). So a recorded interaction whose CONSEQUENCE was leaving the
+    # segment's site is never load-bearing: it was a stray hit on an ad/SSO overlay, and the
+    # recording's own recovery (the explicit navigate back, which compiles to a goto) is the
+    # authoritative continuation. Compiling the exit click makes replay REQUIRE the overlay
+    # (observed live: a committed click on a "Reload"-named control that had bounced the
+    # helper tab to accounts.google.com; healthy replays then died hunting it). The
+    # recording itself stays untouched — only the compiled script skips the step.
+    seg_host = _reg_host((history[0].get("state") or {}).get("url") if history else "")
+    for item_idx, item in enumerate(history):
         actions = (item.get("model_output") or {}).get("action") or []
         elements = (item.get("state") or {}).get("interacted_element") or []
         # ActionResults for this step, aligned to actions (one action per step in this app).
         # find_by_text stashes the element it clicked here (agent_tools.py) since a custom
         # action gets no state.interacted_element.
         results = item.get("result") or []
+        exits_site = False
+        if seg_host and item_idx + 1 < len(history):
+            here = _reg_host((item.get("state") or {}).get("url"))
+            after = _reg_host((history[item_idx + 1].get("state") or {}).get("url"))
+            exits_site = here == seg_host and bool(after) and after != seg_host
         for i, action in enumerate(actions):
             if not action:
                 continue
             name = next(iter(action))
             params = action[name] or {}
+            if exits_site and name not in _READ_ONLY_ACTIONS:
+                logger.warning(
+                    "compile: dropping recorded %s at step %d — it navigated the tab off "
+                    "the segment's site (%s); the recorded recovery goto that follows is "
+                    "the replayable path", name, item_idx, seg_host)
+                continue
             element = elements[i] if i < len(elements) else None
             if name == "find_by_text" and params.get("click_first"):
                 # A navigation/click made via find_by_text: recover its target element from the
                 # recorded metadata and compile it exactly like a built-in click. Without this,
                 # every find_by_text click (menus, Sales, btnInvoice, Save, ...) is dropped and
                 # the replay skeleton collapses.
-                element = None
+                element, md = None, None
                 if i < len(results) and isinstance(results[i], dict):
                     md = results[i].get("metadata")
                     if isinstance(md, dict):
                         element = md.get("interacted_element")
+                if isinstance(md, dict) and md.get("no_click"):
+                    # The tool clicked NOTHING (a 0-match probe or a candidate listing).
+                    # Compiling it would bake a phantom click: a conditional guard's
+                    # closed-panel probe became find_click('save') and failed every
+                    # replay on the healthy page. Metadata-less results keep the legacy
+                    # semantic-find_click fallback (save_history used to drop metadata).
+                    continue
                 query = str(params.get("text") or "").strip()
+                element = _with_recovered_text(element,
+                                               item.get("state_message") or "")
                 if element and not element.get("hidden_click"):
                     synth = _dropdown_option_steps(element, steps,
                                                    item.get("state_message") or "")
@@ -428,18 +556,74 @@ def compile_recording(
                         if sels:
                             # hidden_ok: find_by_text can reach controls a re-render hides;
                             # replay keeps the hover/dispatch recovery as a safety net.
-                            _push_step(steps, _attach_fp(
-                                {"action": "click", "selectors": sels,
-                                 "hidden_ok": True}, element))
+                            step = {"action": "click", "selectors": sels,
+                                    "hidden_ok": True}
+                            # The landed element must carry the recorded name (or, for a
+                            # blob-named row, the query the tool matched on): an xpath or
+                            # stale-href fallback resolving into a DIFFERENT control must
+                            # refuse, not click (the wrong-row guard, now also for
+                            # unparameterized clicks).
+                            label = _ax_label(element) or query
+                            if label:
+                                step["expect_text"] = label
+                            _push_step(steps, _attach_fp(step, element))
                 elif query:
                     # The click went through the tool's hidden-control path (or the saved
                     # history lacks the element entirely): no selector+pointer translation
                     # is stable for such controls, so replay the INTENT — a find_click step
                     # runs the exact same in-page algorithm the tool used (RAW_FIND_JS).
                     _push_step(steps, {"action": "find_click", "text": query})
+            elif name == "extract_data":
+                # The tool records {label, value, query, interacted_element} in its result
+                # metadata (persisted by runner.restore_result_metadata); a valueless call
+                # records NO metadata and so compiles to nothing. The recorded value is
+                # provenance only — replay re-reads the element's CURRENT text, which is
+                # the whole point of an extract step (fresh data on every run).
+                md = (results[i].get("metadata")
+                      if i < len(results) and isinstance(results[i], dict) else None)
+                ext = md.get("extract") if isinstance(md, dict) else None
+                if not isinstance(ext, dict):
+                    continue
+                ext_label = str(ext.get("label") or "value")
+                ext_query = str(ext.get("query") or params.get("text") or "").strip()
+                ext_element = ext.get("interacted_element")
+                sels = _selectors(ext_element) if ext_element else []
+                if sels:
+                    step = _attach_fp({"action": "extract", "selectors": sels,
+                                       "label": ext_label}, ext_element)
+                    if ext_query:
+                        # Kept as the semantic fallback when every selector goes stale.
+                        step["query"] = ext_query
+                    _push_step(steps, step)
+                elif ext_query:
+                    # No stable element identity: replay re-finds the value by query with
+                    # the same in-page algorithm the tool used (RAW_FIND_JS, no click).
+                    _push_step(steps, {"action": "extract", "label": ext_label,
+                                       "query": ext_query})
+            elif name in ("select_dropdown", "select_dropdown_option"):
+                # A pick on a NATIVE <select> (helper/public pages — the app's react-selects
+                # go through click steps instead). Dropping these used to compile the
+                # surrounding flow WITHOUT the picks, so replay submitted the form with its
+                # defaults (observed live: fakenamegenerator replayed onto gen-random-us-us
+                # instead of gd-uk). Replay picks BY LABEL via select_option, which fires
+                # the change events the page's own scripts listen for.
+                option = str(params.get("text", ""))
+                if option and element and \
+                        (element.get("node_name") or "").lower() == "select":
+                    sels = _selectors(element)
+                    if sels:
+                        _push_step(steps, _attach_fp(
+                            {"action": "select", "selectors": sels, "value": option},
+                            element))
+                elif option:
+                    logger.warning(
+                        "select_dropdown %r recorded without a <select> element identity; "
+                        "step dropped (replay gate will catch a wrong end state)", option)
             elif name == "navigate" and params.get("url"):
                 _push_step(steps, {"action": "goto", "url": params["url"]})
             elif name == "click" and element:
+                element = _with_recovered_text(element,
+                                               item.get("state_message") or "")
                 synth = _dropdown_option_steps(element, steps,
                                                item.get("state_message") or "")
                 if synth is not None:
@@ -448,8 +632,13 @@ def compile_recording(
                     continue
                 sels = _selectors(element)
                 if sels:
-                    _push_step(steps, _attach_fp(
-                        {"action": "click", "selectors": sels}, element))
+                    step = {"action": "click", "selectors": sels}
+                    label = _ax_label(element)
+                    if label:
+                        # Landed-click verification: the acted-on element must be NAMED
+                        # what was recorded, whichever selector resolved it (see _resolve).
+                        step["expect_text"] = label
+                    _push_step(steps, _attach_fp(step, element))
             elif name == "input" and element:
                 # The auto-Enter `input` tool (agent_tools.py) presses Enter after typing
                 # into non-dropdown fields and flags it in its result metadata (put back
@@ -499,6 +688,19 @@ def compile_recording(
                         step["field_id"] = m.group("instance")
                     _push_step(steps, step)
                     _mirror_enter(steps, enter_after)
+            elif name == "upload_file" and element and params.get("path"):
+                # File attach (browser-use upload_file -> set files via CDP, no native
+                # dialog). Only the BASENAME is kept: task files live in
+                # files.UPLOADS_DIR by convention, which keeps the step portable and
+                # its value identical to the string the prompt spells (so parameterize's
+                # verbatim-in-prompt lift rule applies). hidden_ok: upload inputs are
+                # legitimately display:none behind styled drop zones.
+                sels = _selectors(element)
+                if sels:
+                    _push_step(steps, _attach_fp(
+                        {"action": "upload", "selectors": sels,
+                         "value": Path(str(params["path"])).name,
+                         "hidden_ok": True}, element))
             elif name == "send_keys" and params.get("keys"):
                 _push_step(steps, {"action": "press", "keys": params["keys"]})
             elif name in ("capped_scroll", "scroll"):
@@ -524,6 +726,29 @@ def compile_recording(
                     _push_step(steps, {"action": "wait", "seconds": min(float(secs), 3.0)})
             # `done` is intentionally dropped — Playwright auto-waits on locators.
     return steps
+
+
+def merge_extract(store: dict[str, str], label: str, value: str) -> str:
+    """Record an extract under `label` WITHOUT clobbering a different value already
+    there — a collision stores under `label_2`, `label_3`, … and a re-read of an
+    already-stored value is a no-op (agent retries must not multiply keys).
+
+    The clobbering this replaces lost real data (observed live: the generated NAME was
+    extracted as 'identity_block', then the ADDRESS extract reused the label and
+    silently overwrote it — replays then fed consumers a nameless identity and the
+    Add-Employee step failed honestly with 'missing generated name'). Returns the key
+    used. Shared by every aggregation point: SkillApi.extract (tier 1), run_steps
+    (tier 0), and hybrid._history_extracts (agent histories)."""
+    label, value = str(label), str(value)
+    for n in range(1, 10):
+        key = label if n == 1 else f"{label}_{n}"
+        if key not in store:
+            store[key] = value
+            return key
+        if str(store[key]).strip() == value.strip():
+            return key
+    store[key] = value  # pathological collision depth: last slot wins
+    return key
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -609,6 +834,94 @@ RAW_FIND_JS = r"""
     return { count: out.length, clicked: clicked, name: top.name,
              names: out.slice(0, 8).map(function (o) { return o.name; }),
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs } };
+  } catch (e) { return { error: String(e) }; }
+})()
+"""
+
+# Static-TEXT finder for extract_data and the `extract` replay step. RAW_FIND_JS above
+# deliberately scans only control-like elements (it exists to CLICK things); a value shown
+# in a plain <h3>/<div> — the generated identity on fakenamegenerator.com was the live
+# failure: 15+ extract_data attempts, all "nothing matched" — is invisible to it AND to the
+# interactive snapshot. This walks the whole DOM for the DEEPEST visible element whose text
+# contains every token and returns that element's rendered text as the value (shortest text
+# wins among several deepest matches, i.e. the tightest element around the value; for a
+# <select> the SELECTED option's label — its rendered text is every option concatenated,
+# which is never the value a user sees chosen). Read-only
+# by construction: it clicks nothing. Shared verbatim between authoring (agent_tools) and
+# replay (_extract_value) so a text-anchored extract re-reads identically on every run.
+#
+# The element identity INCLUDES the positional xpath. This is load-bearing for fresh-data
+# pages: the captured value's own text is often the ONLY text anchor (an attribute-less
+# <h3> holding a generated name), and a text="<old value>" selector can never re-find NEXT
+# run's value — the xpath re-reads whatever the same slot shows now (observed live: extract
+# anchors text="Kirsty Crawford" were dead on every later run).
+# Placeholder: %s = JSON token list.
+RAW_TEXT_FIND_JS = r"""
+(function () {
+  try {
+    var TOKENS = %s;
+    var body = document.body;
+    if (!body) return { count: 0 };
+    var whole = (body.textContent || '').toLowerCase();
+    if (!TOKENS.every(function (t) { return whole.indexOf(t) !== -1; })) return { count: 0 };
+    // OPTION/OPTGROUP are skipped so a <select> stays the DEEPEST match for its own
+    // option text (options are zero-rect while the menu is closed and would otherwise
+    // knock the select out of the deepest-only filter below, losing the match entirely).
+    var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, OPTION: 1, OPTGROUP: 1 };
+    var all = body.querySelectorAll('*');
+    var matches = [];
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      if (SKIP[e.tagName]) continue;
+      var t = (e.textContent || '').toLowerCase();
+      var ok = true;
+      for (var j = 0; j < TOKENS.length; j++) {
+        if (t.indexOf(TOKENS[j]) === -1) { ok = false; break; }
+      }
+      if (ok) matches.push(e);
+    }
+    if (!matches.length) return { count: 0 };
+    // Deepest only: every match's ancestors also match (their text is a superset), so drop
+    // any element that contains another match.
+    var deepest = matches.filter(function (e) {
+      return !matches.some(function (o) { return o !== e && e.contains(o); });
+    });
+    var scored = [];
+    deepest.forEach(function (e) {
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return;      // display:none / detached
+      var text = (e.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!text) return;                                // hidden by an ancestor
+      scored.push({ el: e, text: text });
+    });
+    if (!scored.length) return { count: 0 };
+    scored.sort(function (a, b) { return a.text.length - b.text.length; });
+    var top = scored[0];
+    // A <select>'s rendered text is its option labels concatenated — never the value a
+    // user sees chosen. Report the SELECTED option instead. (Inputs cannot reach here:
+    // their textContent is empty, so they never match the tokens.)
+    if (top.el.tagName === 'SELECT') {
+      var sel_opt = (top.el.selectedOptions && top.el.selectedOptions[0]) || null;
+      top = { el: top.el, text: (sel_opt && sel_opt.text) || top.el.value || top.text };
+    }
+    var attrs = {};
+    ['id', 'aria-label', 'title', 'name', 'placeholder', 'data-testid', 'href', 'role']
+      .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
+    var xp = function (e) {
+      if (!e || e === document.documentElement) return '/html';
+      var ix = 1, sib, n = 0;
+      for (sib = e.parentNode ? e.parentNode.firstElementChild : null; sib;
+           sib = sib.nextElementSibling) {
+        if (sib.tagName === e.tagName) { n++; if (sib === e) ix = n; }
+      }
+      return xp(e.parentElement) + '/' + e.tagName.toLowerCase() +
+             (n > 1 ? '[' + ix + ']' : '');
+    };
+    var xpath = '';
+    try { xpath = xp(top.el); } catch (e) {}
+    return { count: scored.length, name: top.text.slice(0, 500),
+             names: scored.slice(0, 5).map(function (o) { return o.text.slice(0, 80); }),
+             element: { tag: top.el.tagName.toLowerCase(), attrs: attrs, xpath: xpath } };
   } catch (e) { return { error: String(e) }; }
 })()
 """
@@ -827,6 +1140,38 @@ async def _heal_locate(page: Page, fingerprint: dict[str, Any], editable: bool):
     return loc.first, f"healed:{info.get('desc', '?')}", info.get("winner") or None
 
 
+def _names_value(text: str, value: str) -> bool:
+    """True when `text` NAMES `value`: the value's tokens appear as a CONSECUTIVE token
+    subsequence of the text's tokens (same token grammar as RAW_FIND_JS/_norm_phrase —
+    lowercase, split on non-alphanumerics).
+
+    'FUNFOOD LIMITED' does NOT name 'FOOD LIMITED' ('funfood' is not the token 'food' —
+    the live wrong-business click this guards), while 'FOOD LIMITED 0123 Monthly' does:
+    row links concatenate several cells' text, so plain equality would reject the RIGHT
+    row."""
+    want = [t for t in re.split(r"[^a-z0-9]+", (value or "").lower()) if t]
+    if not want:
+        return True
+    have = [t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
+    return any(have[i:i + len(want)] == want
+               for i in range(len(have) - len(want) + 1))
+
+
+async def _candidate_names_value(loc: Any, expect: str) -> bool:
+    """Does this resolved candidate visibly carry `expect` as its name? Checks rendered
+    text first, aria-label second (icon-ish controls); unreadable nodes fail closed —
+    a value-anchored click must never act on an element it cannot verify."""
+    for reader in ("inner_text", "aria"):
+        try:
+            text = (await loc.inner_text(timeout=1000) if reader == "inner_text"
+                    else (await loc.get_attribute("aria-label")) or "")
+        except Exception:  # noqa: BLE001 - unreadable this way; try the next reader
+            continue
+        if _names_value(text, expect):
+            return True
+    return False
+
+
 async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                    require_editable: bool = False):
     """Return (locator, selector_label, healed_winner) for the first candidate that resolves
@@ -842,10 +1187,19 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
     full timeout and, only then, a logged first-visible concession. With `require_editable`
     (fill steps), a candidate that resolves to a non-editable node is skipped so replay
     falls through to a candidate that hits the real input.
+
+    A step stamped `expect_text` (its selectors carried an instantiated {{param}}: "click
+    the element NAMED <value>") additionally requires every acted-on candidate to carry
+    that value as its name (_names_value) — whatever selector found it. This is what
+    keeps a value-swapped replay from clicking the wrong DATA ROW: substring collisions
+    (FUNFOOD LIMITED vs FOOD LIMITED), a stale recorded href uniquely matching the OLD
+    record's row, and the positional row anchor all resolve confidently to an element —
+    the wrong one — and only the name check can tell.
     """
     sels = _step_selectors(step)
     if not sels:
         raise RuntimeError("step has no selector")
+    expect = str(step.get("expect_text") or "")
     errors: list[str] = []
     for i, sel in enumerate(sels):
         last = i == len(sels) - 1
@@ -869,10 +1223,19 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
         if not visible:
             errors.append(f"{sel} -> {count} match(es), none visible")
             continue
+        if expect:
+            named = [n for n in visible
+                     if await _candidate_names_value(loc.nth(n), expect)]
+            if not named:
+                errors.append(f'{sel} -> {len(visible)} visible match(es), '
+                              f'none named "{expect}"')
+                continue
+            visible = named
         if len(visible) == 1:
             candidate = loc.nth(visible[0])
         elif last:
-            # Exhausted durable candidates; act on the first VISIBLE match but record it.
+            # Exhausted durable candidates; act on the first VISIBLE match (already
+            # name-filtered when the step is value-anchored) but record it.
             logger.warning("ambiguous selector %r: %d visible matches; using the first",
                            sel, len(visible))
             candidate = loc.nth(visible[0])
@@ -898,7 +1261,15 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
     if fingerprint:
         healed = await _heal_locate(page, fingerprint, require_editable)
         if healed is not None:
-            return healed
+            winner = healed[2] or {}
+            if expect and not _names_value(str(winner.get("text") or ""), expect):
+                # A fingerprint heal scores STRUCTURE, not the value — on a value-anchored
+                # step a confident structural match to the wrong-named row is exactly the
+                # wrong-business click this gate exists for.
+                errors.append(f'healed match {str(winner.get("text"))[:40]!r} is not '
+                              f'named "{expect}"')
+            else:
+                return healed
     raise RuntimeError("no unique candidate matched: " + " | ".join(errors))
 
 
@@ -1047,15 +1418,86 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
     raise RuntimeError("unreachable")  # loop either returns or raises
 
 
+# Non-digits a page may add when it reformats a value it accepted ("£5,000.00" for "5000").
+_NUM_NOISE_RE = re.compile(r"[^\d.\-]")
+
+
+def _as_number(s: str) -> float | None:
+    """`s` as a float once currency/grouping noise is stripped, else None."""
+    stripped = _NUM_NOISE_RE.sub("", s or "")
+    if not stripped or stripped in ("-", ".", "-."):
+        return None
+    try:
+        return float(stripped)
+    except ValueError:
+        return None
+
+
+def value_took(typed: str, actual: str) -> bool:
+    """Did the field accept `typed`? Tolerant of the page reformatting what we wrote
+    (amounts regrouped, an autocomplete completing it) but NOT of it keeping some other
+    value: two numbers must be EQUAL, which is what catches a cell that reverted.
+
+    Shared with the live agent tool (agent_tools.input) so an authored run and its replay
+    judge "did this fill take?" by the same rule."""
+    want, got = (typed or "").strip(), (actual or "").strip()
+    if want == got:
+        return True
+    if not want:
+        return not got
+    want_n, got_n = _as_number(want), _as_number(got)
+    if want_n is not None and got_n is not None:
+        return want_n == got_n
+    if want_n is not None or got_n is not None:
+        return False  # one side numeric, the other not — a real mismatch
+    return want.lower() in got.lower()  # autocompleted around what we wrote
+
+
+async def _keyboard_refill(loc: Locator, value: str, timeout_ms: int) -> None:
+    """Clear + retype the field with real keystrokes, for fields `fill()` can't move.
+
+    React re-renders its own state over a value the framework never saw change; a
+    select-all + Delete + character-by-character type is indistinguishable from a user
+    and survives that (same reasoning as agent_tools' stubborn-field notes)."""
+    await loc.click(timeout=timeout_ms)
+    await loc.press("ControlOrMeta+a", timeout=timeout_ms)
+    await loc.press("Delete", timeout=timeout_ms)
+    if value:
+        await loc.press_sequentially(value, delay=20, timeout=timeout_ms)
+
+
+async def _current_value(loc: Locator) -> str | None:
+    """The field's value as the page holds it now (None when it can't be read)."""
+    try:
+        return await loc.input_value(timeout=2000)
+    except Exception:  # noqa: BLE001 - contenteditable has no value; fall back to its text
+        try:
+            return await loc.inner_text(timeout=2000)
+        except Exception:  # noqa: BLE001 - unreadable: skip verification, don't fail the fill
+            return None
+
+
 async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> tuple[str, dict[str, Any] | None]:
     """Resolve + fill, re-resolving after a settle if the field detaches mid-render.
     Returns (selector_label, healed_winner_or_None)."""
     for attempt in range(_MAX_ATTEMPTS):
         try:
             loc, sel, healed = await _resolve(page, step, timeout_ms, require_editable=True)
+            value = step.get("value", "")
             if step.get("clear", True):
                 await loc.fill("", timeout=timeout_ms)
-            await loc.fill(step.get("value", ""), timeout=timeout_ms)
+            await loc.fill(value, timeout=timeout_ms)
+            # Verify and repair: a replayed fill that silently didn't take corrupts every
+            # step after it (a wrong amount saves just as happily as a right one).
+            actual = await _current_value(loc)
+            if actual is not None and not value_took(value, actual):
+                logger.warning("fill %r left the field reading %r; clearing and retyping "
+                               "with keystrokes", value, actual)
+                await _keyboard_refill(loc, value, timeout_ms)
+                actual = await _current_value(loc)
+                if actual is not None and not value_took(value, actual):
+                    raise RuntimeError(
+                        f"fill did not take: field still reads {actual!r}, expected {value!r}")
             return sel, healed
         except Exception as exc:  # noqa: BLE001
             if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
@@ -1065,6 +1507,21 @@ async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) ->
                 continue
             raise
     raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+async def _select_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
+                             ) -> tuple[str, dict[str, Any] | None]:
+    """Resolve a native <select> and pick the recorded option BY LABEL, falling back to
+    the option's value attribute when the visible label drifted. select_option fires the
+    input/change events the page's own scripts listen for — the reason a replayed pick
+    actually changes what the form submits. Returns (selector_label, healed_winner)."""
+    loc, sel, healed = await _resolve(page, step, timeout_ms)
+    option = str(step.get("value", ""))
+    try:
+        await loc.select_option(label=option, timeout=timeout_ms)
+    except Exception:  # noqa: BLE001 - label text changed; the value attr is the fallback
+        await loc.select_option(value=option, timeout=timeout_ms)
+    return sel, healed
 
 
 async def _wheel_scroll(page: Page, pages: float, down: bool = True) -> None:
@@ -1082,20 +1539,39 @@ async def _wheel_scroll(page: Page, pages: float, down: bool = True) -> None:
 _FIND_CLICK_ROUNDS = 4
 
 
-async def _find_click(page: Page, text: str) -> str:
+async def _find_click(page: Page, text: str, verify_name: bool = False) -> str:
     """Replay a find_by_text click SEMANTICALLY: run the same in-page algorithm the tool
     used at record time (RAW_FIND_JS — token match, visible-first, scrollIntoView, direct
     handler click), wheel-scrolling between rounds when nothing matches yet. Returns the
-    clicked element's reported name; raises when no round finds a match."""
+    clicked element's reported name; raises when no round finds a match.
+
+    `verify_name` (steps whose text is an instantiated {{param}}): probe first with the
+    click disabled and require the top candidate to be NAMED the text (_names_value)
+    before the real click fires — a hint-ranked near-miss must fail the step, never
+    click a wrong-named element. Plain find_click steps keep today's behavior (icon
+    hints legitimately click elements not named by the query)."""
     import json as _json
 
     tokens = [t for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
     if not tokens:
         raise RuntimeError(f"find_click: no searchable text in {text!r}")
     expr = RAW_FIND_JS % (_json.dumps(tokens), "true")
+    probe_expr = RAW_FIND_JS % (_json.dumps(tokens), "false")
     for round_no in range(_FIND_CLICK_ROUNDS + 1):
+        raw = None
         try:
-            raw = await page.evaluate(expr)
+            if verify_name:
+                probe = await page.evaluate(probe_expr)
+                if probe and probe.get("count"):
+                    if not _names_value(str(probe.get("name") or ""), str(text)):
+                        raise RuntimeError(
+                            f"find_click: best match {str(probe.get('name'))[:40]!r} is "
+                            f"not named {text!r}; refusing a wrong-named click")
+                    raw = await page.evaluate(expr)
+            else:
+                raw = await page.evaluate(expr)
+        except RuntimeError:
+            raise
         except Exception as exc:  # noqa: BLE001 - page navigating; settle and retry
             logger.debug("find_click eval failed (%s); settling", exc)
             raw = None
@@ -1108,6 +1584,71 @@ async def _find_click(page: Page, text: str) -> str:
             await _wheel_scroll(page, 0.6)
     raise RuntimeError(f"find_click: no clickable match for {text!r} "
                        f"after {_FIND_CLICK_ROUNDS} scroll rounds")
+
+
+async def _extract_value(page: Page, step: dict[str, Any], timeout_ms: int
+                         ) -> tuple[str, str, dict[str, Any] | None]:
+    """Read the CURRENT text of an extract step's target: (value, used_selector, healed).
+
+    Selector-anchored steps resolve through the full `_resolve` ladder (unique match,
+    fingerprint heal), so extract steps self-heal exactly like clicks; when every selector
+    fails and the step carries its recorded `query`, the value is re-found semantically
+    with the same in-page algorithms the authoring tool used (RAW_FIND_JS over controls,
+    then RAW_TEXT_FIND_JS over static text, click disabled) — that is also the whole path
+    for query-only steps. An EMPTY read raises: a valueless extraction means the page no
+    longer shows the data where the recording found it, and the segment must fail into the
+    agent-recovery path instead of reporting a hollow pass.
+    """
+    value, used, healed = "", "", None
+    if _step_selectors(step):
+        try:
+            loc, used, healed = await _resolve(page, step, timeout_ms)
+
+            # A form control's value first: a <select>'s inner_text is its option labels
+            # concatenated (never the chosen value), so the text readers below would
+            # report the blob. Non-controls return '' here and fall through unchanged.
+            async def _control_value() -> str:
+                return await loc.evaluate(
+                    "el => el.tagName === 'SELECT'"
+                    " ? ((el.selectedOptions[0] && el.selectedOptions[0].text)"
+                    "    || el.value || '')"
+                    " : (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')"
+                    " ? (el.value || '') : ''")
+
+            # inner_text is the honest read (what a user sees); text_content rescues
+            # 0-size/hover-revealed targets; input_value covers form fields.
+            for reader in (_control_value, loc.inner_text, loc.text_content,
+                           loc.input_value):
+                try:
+                    value = " ".join(str(await reader() or "").split())
+                except Exception:  # noqa: BLE001 - e.g. input_value on a non-input
+                    value = ""
+                if value:
+                    break
+        except Exception as exc:  # noqa: BLE001 - fall to the semantic re-find if possible
+            if not step.get("query"):
+                raise
+            logger.info("extract %r: selectors failed (%s); re-finding by query",
+                        step.get("label"), str(exc)[:120])
+    if not value and step.get("query"):
+        import json as _json
+
+        tokens = [t for t in re.split(r"[^a-z0-9]+", str(step["query"]).lower()) if t]
+        if tokens:
+            raw = await page.evaluate(RAW_FIND_JS % (_json.dumps(tokens), "false"))
+            if not (raw and not raw.get("error") and raw.get("count")):
+                # The value lives in plain text, not in a control (the authoring path
+                # that captured it) — re-find it with the same static-text algorithm.
+                raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(tokens))
+            if raw and not raw.get("error") and raw.get("count"):
+                value = " ".join(str(raw.get("name") or "").split())
+                used = used or f"find:{step['query']}"
+    if not value:
+        raise RuntimeError(f"extract {str(step.get('label') or 'value')!r}: no visible "
+                           f"text at the recorded location")
+    # Cap sized for BLOCK captures (one extract on the card showing several facts is the
+    # preferred authoring shape — the consuming agent parses the blob).
+    return value[:1000], used, healed
 
 
 # Budget for each click of the flyout-reopen recovery (predecessor + retried target). Shorter
@@ -1148,6 +1689,57 @@ async def _click_with_flyout_recovery(
         return sel, healed
 
 
+async def _upload_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
+                             ) -> tuple[str, dict[str, Any] | None]:
+    """Attach the step's file (files.UPLOADS_DIR/<value>) to its upload control.
+    Returns (used_selector, healed).
+
+    The file must exist NON-EMPTY or this raises before touching the page: a ghost
+    upload is worse than a failed segment — observed live, a nonexistent path attached
+    "successfully", then Save made the page READ it and Chrome killed the renderer
+    (RESULT_CODE_KILLED_BAD_MESSAGE). The CONTROL runs the normal _resolve ladder, then
+    walks to the real <input type=file>: the resolved element itself, a descendant, or
+    the page's file input — set_input_files works on display:none inputs, which is what
+    keeps the native dialog closed. An unresolvable recorded control falls through to
+    the page-wide input rather than failing: the recorded element was only ever a
+    pointer to the true target.
+    """
+    from automation.pipeline.files import UPLOADS_DIR, find_file
+
+    name = str(step.get("value") or "")
+    path = find_file(name)
+    if path is None:
+        raise RuntimeError(f"upload file {name!r} not found (or empty) in "
+                           f"{UPLOADS_DIR}/ — place it there")
+
+    loc, sel, healed = None, "", None
+    try:
+        loc, sel, healed = await _resolve(page, step, timeout_ms)
+    except Exception as exc:  # noqa: BLE001 - the file input is the true target
+        logger.info("upload control did not resolve (%s); falling back to the page's "
+                    "file input", str(exc)[:120])
+    target = None
+    if loc is not None:
+        try:
+            if await loc.evaluate("el => el.tagName === 'INPUT' && el.type === 'file'"):
+                target = loc
+        except Exception:  # noqa: BLE001 - fall through the ladder
+            target = None
+        if target is None:
+            inner = loc.locator("input[type=file]")
+            if await inner.count() > 0:
+                target = inner.first
+    if target is None:
+        page_wide = page.locator("input[type=file]")
+        if await page_wide.count() > 0:
+            target = page_wide.first
+            sel = sel or "input[type=file]"
+    if target is None:
+        raise RuntimeError("no <input type=file> found at or near the recorded control")
+    await target.set_input_files(str(path.resolve()))
+    return sel or "input[type=file]", healed
+
+
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
     """Execute compiled steps over a Playwright page. Returns {executed, failed_at, error, log}.
 
@@ -1160,6 +1752,7 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
     """
     executed = 0
     log: list[dict[str, Any]] = []
+    extracted: dict[str, str] = {}
     for idx, step in enumerate(steps):
         try:
             action = step["action"]
@@ -1179,6 +1772,13 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                     entry["healed"] = healed
                 log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
+            elif action == "select":
+                sel, healed = await _select_with_retry(page, step, timeout_ms)
+                entry = {"step": idx, "action": action, "used": sel}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
+                await page.wait_for_timeout(_SETTLE_MS)
             elif action == "press":
                 await page.keyboard.press(step["keys"])
             elif action == "type":
@@ -1191,8 +1791,24 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 await _wheel_scroll(page, float(step.get("pages", 0.5)),
                                     down=bool(step.get("down", True)))
             elif action == "find_click":
-                name = await _find_click(page, step.get("text", ""))
+                name = await _find_click(page, step.get("text", ""),
+                                         verify_name=bool(step.get("verify_name")))
                 log.append({"step": idx, "action": action, "used": f"find_click:{name}"})
+                await page.wait_for_timeout(_SETTLE_MS)
+            elif action == "extract":
+                value, used, healed = await _extract_value(page, step, timeout_ms)
+                merge_extract(extracted, str(step.get("label") or "value"), value)
+                entry = {"step": idx, "action": action, "used": used,
+                         "value": value[:200]}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
+            elif action == "upload":
+                sel, healed = await _upload_with_retry(page, step, timeout_ms)
+                entry = {"step": idx, "action": action, "used": sel}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "wait":
                 await page.wait_for_timeout(int(step.get("seconds", 0) * 1000))
@@ -1200,8 +1816,10 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
         except Exception as exc:  # noqa: BLE001 - report where the script broke (app changed?)
             logger.exception("script execution broke at step %d: %s", idx, exc)
             return {"executed": executed, "failed_at": idx,
-                    "error": f"{type(exc).__name__}: {exc}", "log": log}
-    return {"executed": executed, "failed_at": None, "error": None, "log": log}
+                    "error": f"{type(exc).__name__}: {exc}", "log": log,
+                    "extracted": extracted}
+    return {"executed": executed, "failed_at": None, "error": None, "log": log,
+            "extracted": extracted}
 
 
 # Ceiling for a step's candidate list after heal promotions, so repeated healings of a churny

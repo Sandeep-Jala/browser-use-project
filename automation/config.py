@@ -14,6 +14,7 @@ Two groups of settings live here:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,32 @@ def _env_history_items(name: str, default: int | None = None) -> int | None:
     return value if value > 5 else default
 
 
+def _env_video_size(name: str) -> tuple[int, int] | None:
+    """Parse RECORD_VIDEO_SIZE="1280x800" into (width, height); None when unset.
+
+    This is the cost lever for `--record`: the size becomes the screencast's
+    maxWidth/maxHeight, so Chrome downscales frames BEFORE sending them and each frame
+    costs less to decode and encode. Unset means "detect the real viewport"."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return None
+    match = re.fullmatch(r"(\d{2,5})\s*x\s*(\d{2,5})", raw)
+    if not match:
+        raise SystemExit(f"[!] {name}={raw!r} is invalid: use WIDTHxHEIGHT, e.g. 1280x800")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _env_vision_detail(name: str, default: str = "high") -> str:
+    """Parse VISION_DETAIL_LEVEL. browser-use accepts exactly 'auto' | 'low' | 'high';
+    anything else (e.g. the doc notation "auto/low" pasted verbatim) would otherwise crash
+    EVERY agent segment after login — die here at startup with the fix instead."""
+    raw = (os.getenv(name) or default).strip().lower()
+    if raw not in ("auto", "low", "high"):
+        raise SystemExit(f"[!] {name}={raw!r} is invalid: use exactly one of "
+                         f"auto, low, high")
+    return raw
+
+
 @dataclass
 class Config:
     """Resolved configuration for one run of the framework."""
@@ -77,7 +104,8 @@ class Config:
     # Image detail sent to the model each step: "high" | "low" | "auto". Default "high": a
     # sharper screenshot lets the model actually read icon/label text before acting —
     # misread labels are a direct misclick source for a small model. Costs ~$0.01 extra per
-    # 25-step segment; set VISION_DETAIL_LEVEL=auto/low in .env to trade back.
+    # 25-step segment; to trade back, set VISION_DETAIL_LEVEL=auto (or =low) in .env —
+    # exactly one word (a literal "auto/low" was once pasted in and crashed every run).
     vision_detail_level: str
     artifacts_dir: Path
     # Cap on how many past steps the agent keeps in context (None = unlimited). Cuts per-step
@@ -104,6 +132,15 @@ class Config:
     # Flip per-ENVIRONMENT, not per-run: recordings authored with it on compile to
     # visibility-requiring click steps that fail replay with it off.
     reveal_hidden_controls: bool
+    # Record an .mp4 of each run into its artifacts dir (browser/recording.py). Opt-in
+    # (--record / RECORD_VIDEO=true): every screencast frame is decoded and encoded ON the
+    # event loop, so it is not free. NOTE the capture is a TIME-LAPSE — CDP emits a frame
+    # only when the page changes, and frames are written at a fixed rate, so the seconds
+    # spent waiting on the LLM collapse to nothing.
+    record_video: bool
+    # Frame size for that recording as (width, height); None detects the real viewport.
+    # Smaller = cheaper, since Chrome downscales before sending (see _env_video_size).
+    record_video_size: tuple[int, int] | None
 
     @classmethod
     def from_env(cls, env_path: str | os.PathLike[str] | None = None) -> "Config":
@@ -127,7 +164,7 @@ class Config:
             groq_api_key=os.getenv("GROQ_API_KEY"),
             groq_model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
             use_vision=_env_bool("USE_VISION", default=True),
-            vision_detail_level=os.getenv("VISION_DETAIL_LEVEL", "high").strip().lower(),
+            vision_detail_level=_env_vision_detail("VISION_DETAIL_LEVEL", default="high"),
             artifacts_dir=Path(os.getenv("ARTIFACTS_DIR", "artifacts")),
             max_history_items=_env_history_items("MAX_HISTORY_ITEMS", default=20),
             enable_planning=_env_bool("ENABLE_PLANNING", default=True),
@@ -136,6 +173,8 @@ class Config:
             semantic_router=_env_bool("SEMANTIC_ROUTER", default=True),
             embedding_model=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
             reveal_hidden_controls=_env_bool("REVEAL_HIDDEN_CONTROLS", default=True),
+            record_video=_env_bool("RECORD_VIDEO", default=False),
+            record_video_size=_env_video_size("RECORD_VIDEO_SIZE"),
         )
 
     def ensure_dirs(self) -> None:

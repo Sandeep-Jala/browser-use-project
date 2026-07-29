@@ -23,6 +23,8 @@ from typing import Any
 
 import yaml
 
+from automation.pipeline.subtask_store import is_absolute_http_url
+
 
 @dataclass(frozen=True)
 class SubtaskDecl:
@@ -33,14 +35,18 @@ class SubtaskDecl:
     one library recording. `marker` marks the save-owning subtask (the parent's create-write
     fires here); `postcondition` is an optional cheap success check for subtasks with no
     write: {"url_contains": "..."} or {"visible": "<selector>"}. `kind` overrides the node
-    classification ("action" = replayable, "judge" = cognitive verification: always LLM,
-    never cached) — normally left None so decompose.node_kind decides.
+    classification ("action" = replayable, "judge" = cognitive verification, "loop" =
+    repeat-until action; judge and loop always run LLM-live and are never cached) —
+    normally left None so decompose.node_kind decides. `tab_url` runs the
+    subtask in a separate helper tab opened at that URL (same browser context) — the tab is
+    closed when the subtask ends and the main app page is never navigated.
     """
     prompt: str
     values: dict[str, str] | None = None
     marker: str | None = None
     postcondition: dict[str, Any] | None = None
     kind: str | None = None
+    tab_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,9 +76,14 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
         subtasks = tuple(
             SubtaskDecl(prompt=str(d["prompt"]), values=d.get("values"),
                         marker=d.get("marker"), postcondition=d.get("postcondition"),
-                        kind=d.get("kind"))
+                        kind=d.get("kind"), tab_url=d.get("tab_url"))
             for d in entry["subtasks"]
         )
+        for i, s in enumerate(subtasks):
+            if s.tab_url is not None and not is_absolute_http_url(s.tab_url):
+                raise ValueError(
+                    f"tasks.yaml entry {key!r} subtask {i}: tab_url must be an absolute "
+                    f"http(s) URL, got {s.tab_url!r}")
     return TaskSpec(
         key=key,
         # Collapse the YAML block-scalar line wrapping. task_id normalizes whitespace the

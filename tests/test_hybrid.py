@@ -11,8 +11,8 @@ import pytest
 from automation.pipeline import hybrid
 from automation.pipeline import subtask_store as ss
 from automation.pipeline.decompose import Subtask
-from automation.pipeline.hybrid import (Gate, Segment, evaluate_gate, reauthor_match,
-                                        run_hybrid_task, segment_gate)
+from automation.pipeline.hybrid import (Gate, Segment, _format_extracts, evaluate_gate,
+                                        reauthor_match, run_hybrid_task, segment_gate)
 from automation.pipeline.runner import RunResult
 from automation.tasks import SubtaskDecl, TaskSpec
 
@@ -70,6 +70,8 @@ class FakeSession:
         self.agent_calls = 0
         self.findings_seen = []
         self.record_paths = []
+        self.events = []              # ordered ("open", url)/("close",)/("replay",)/("agent",)
+        self.aux_open_error = None    # set to make open_aux_tab raise
 
     @classmethod
     def make_opener(cls, instance):
@@ -81,7 +83,16 @@ class FakeSession:
     async def current_url(self):
         return "http://app/section"
 
+    async def open_aux_tab(self, url):
+        if self.aux_open_error:
+            raise RuntimeError(self.aux_open_error)
+        self.events.append(("open", url))
+
+    async def close_aux_tab(self):
+        self.events.append(("close",))
+
     async def replay_segment(self, sub, sid, context, skill, gate):
+        self.events.append(("replay",))
         self.replay_calls += 1
         seg = self.replays.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
@@ -91,6 +102,7 @@ class FakeSession:
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
                             dirty=False, prior_failure=None, record_path=None,
                             findings=None):
+        self.events.append(("agent",))
         self.agent_calls += 1
         self.findings_seen.append(list(findings or []))
         self.record_paths.append(record_path)
@@ -254,6 +266,68 @@ async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
     assert json.loads(ss.steps_path(judge_sid).read_text()) == hollow
 
 
+async def test_loop_node_never_replays_never_commits(stores, monkeypatch):
+    """A repeat-until subtask must run live even when a stale library entry exists (a
+    replayed loop walks a FIXED number of iterations and lands on the wrong row — the
+    observed wrong-employee bug), and its recording must never be committed: the
+    iteration count is live page state."""
+    loop_line = ("process the employees one at a time by clicking Save and Next, and "
+                 "after each click check that the next employee has loaded, stopping "
+                 "as soon as Owen Millar is the employee shown")
+    prompt = "go to the section. " + loop_line
+    spec = TaskSpec(key="l", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt=loop_line),
+    ))
+    ctx = ss.normalize_context("http://app/section")
+    loop_sid = ss.subtask_id(loop_line, ctx)
+    stale = [{"action": "click", "selector": "#save-next"}] * 5   # the old row-jumper
+    _seed_entry(loop_sid, stale)
+
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 0 and fake.agent_calls == 2
+    assert [s["kind"] for s in result.subtasks] == ["action", "loop"]
+    # The loop agent ran WITHOUT a recording path, and the stale entry was not replaced.
+    assert fake.record_paths[1] is None
+    assert not ss.recording_path(loop_sid).exists()
+    assert json.loads(ss.steps_path(loop_sid).read_text()) == stale
+
+
+async def test_conditional_guard_never_replays_never_commits(stores, monkeypatch):
+    """A leading-"If" branch guard must run live even when a library entry exists (a
+    TRUE-branch recording would replay its branch unconditionally on every run), and a
+    TRUE-branch run must never commit one."""
+    cond_line = ("If you see an error about the minimum wage rate, click Add Payment, "
+                 "set Amount to 5000, and click Save and Next")
+    prompt = "go to the section. " + cond_line
+    spec = TaskSpec(key="c", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt=cond_line),
+    ))
+    ctx = ss.normalize_context("http://app/section")
+    cond_sid = ss.subtask_id(cond_line, ctx)
+    branch = [{"action": "click", "selector": "#add-payment"}]   # the TRUE branch, baked
+    _seed_entry(cond_sid, branch)
+
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 0 and fake.agent_calls == 2
+    # Conditionality is a routing predicate, not a node kind: the segment stays "action".
+    assert [s["kind"] for s in result.subtasks] == ["action", "action"]
+    assert fake.record_paths[1] is None
+    assert not ss.recording_path(cond_sid).exists()
+    assert json.loads(ss.steps_path(cond_sid).read_text()) == branch
+
+
 async def test_routed_subtask_replays_canonical_entry(stores, monkeypatch):
     """A wording with no direct entry that the router resolves must replay the CANONICAL
     skill — and a routed failure must author under the ORIGINAL sid, never overwriting
@@ -393,6 +467,383 @@ async def test_parent_marker_gate_still_required(stores, monkeypatch):
     assert result.is_successful is False
 
 
+# ------------------------------- aux-tab subtasks -------------------------------
+
+
+AUX_PROMPT = ("go to the section. search DuckDuckGo for Acting Office and note the title "
+              "of the top result")
+AUX_SPEC = TaskSpec(
+    key="aux", prompt=AUX_PROMPT,
+    subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt="search DuckDuckGo for {{query}} and note the title of the "
+                           "top result", values={"query": "Acting Office"},
+                    tab_url="https://duckduckgo.com"),
+    ),
+)
+AUX_CTX = ss.normalize_aux_context("https://duckduckgo.com")
+
+
+async def _run_aux(fake, **kwargs):
+    return await run_hybrid_task(fake.runner or _runner(), AUX_PROMPT, spec=AUX_SPEC,
+                                 **kwargs)
+
+
+async def test_aux_subtask_opens_and_closes_tab_around_segment(stores, monkeypatch):
+    """The LOOP owns the helper tab: opened before the segment, closed in a finally — and
+    the plain subtask never touches tab machinery."""
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    assert result.is_successful is True
+    assert fake.events == [("agent",), ("open", "https://duckduckgo.com"),
+                           ("agent",), ("close",)]
+    # tab_url reclassifies the note-wording subtask as a cacheable ACTION node (the
+    # replayed extract step re-reads the live DOM, so its replay is not hollow).
+    assert [s["kind"] for s in result.subtasks] == ["action", "action"]
+
+
+async def test_aux_tab_closes_even_when_the_segment_fails(stores, monkeypatch):
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(False, error="lost", mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    assert result.is_successful is False
+    assert fake.events[-1] == ("close",)
+
+
+async def test_aux_sid_keyed_on_tab_url_context_and_manifest_records_it(stores, monkeypatch):
+    """Aux identity comes from the DECLARED tab URL (host-qualified), not the main page —
+    so the same helper procedure is ONE library entry across every hosting task."""
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    aux_sid = ss.subtask_id(AUX_SPEC.subtasks[1].prompt, AUX_CTX)
+    assert AUX_CTX == "duckduckgo.com/"
+    assert result.subtasks[1]["sid"] == aux_sid
+    assert result.subtasks[1]["context"] == AUX_CTX
+    entry = ss.load_manifest()[aux_sid]
+    assert entry["tab_url"] == "https://duckduckgo.com"
+    assert entry["context"] == AUX_CTX
+
+
+async def test_aux_replay_failure_reensures_tab_for_the_recovering_agent(stores, monkeypatch):
+    ctx0 = ss.normalize_context("http://app/section")
+    _seed_entry(ss.subtask_id(AUX_SPEC.subtasks[0].prompt, ctx0))
+    _seed_entry(ss.subtask_id(AUX_SPEC.subtasks[1].prompt, AUX_CTX))
+
+    fake = FakeSession(_runner(),
+                       replays=[_seg(True), _seg(False, executed=2, error="boom")],
+                       agents=[_seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    assert result.is_successful is True
+    assert result.subtasks[1]["mode"] == "replay_failed->authored"
+    # open -> replay fails -> defensive re-ensure (no-op on a live tab, recreate after a
+    # crash) -> recovery agent on the SAME dirty tab -> guaranteed close.
+    assert fake.events == [("replay",), ("open", "https://duckduckgo.com"), ("replay",),
+                           ("open", "https://duckduckgo.com"), ("agent",), ("close",)]
+
+
+async def test_aux_open_failure_fails_the_subtask_and_stops(stores, monkeypatch):
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")])
+    fake.aux_open_error = "net::ERR_NAME_NOT_RESOLVED"
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    assert result.is_successful is False
+    assert len(result.subtasks) == 2
+    assert result.subtasks[1]["ok"] is False
+    assert "could not open helper tab" in result.subtasks[1]["error"]
+
+
+async def test_router_skipped_for_aux_subtasks(stores, monkeypatch):
+    routed = []
+
+    async def fake_route(sub, alias_sid, context, llm, **kw):
+        routed.append(sub.template_prompt)
+        return None
+
+    monkeypatch.setattr(hybrid.router, "route", fake_route)
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    fake.runner = SimpleNamespace(
+        expander_llm=None,
+        config=SimpleNamespace(subtask_max_steps=25, semantic_router=True))
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run_aux(fake)
+
+    assert result.is_successful is True
+    # Only the plain subtask consulted the router; aux entries are direct-hit only (a
+    # routed canonical could have been recorded on a different site family).
+    assert routed == ["go to the section."]
+
+
+async def test_replay_finding_carries_into_later_agent_segments(stores, monkeypatch):
+    """A REPLAYED segment's finding (its fresh extraction) must reach later agent
+    segments exactly like an authored segment's observation does."""
+    ctx0 = ss.normalize_context("http://app/section")
+    _seed_entry(ss.subtask_id(SPEC.subtasks[0].prompt, ctx0))
+
+    fake = FakeSession(_runner(),
+                       replays=[_seg(True, finding="top_result_title = Fresh Value")],
+                       agents=[_seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    assert result.is_successful is True
+    assert fake.findings_seen == [["go to the section.: top_result_title = Fresh Value"]]
+
+
+# ------------------------------- noted-data consumers -------------------------------
+
+
+NOTED_PROMPT = ("open the generator and note the generated identity. "
+                "add employee using the noted generated name and save")
+NOTED_SPEC = TaskSpec(
+    key="noted", prompt=NOTED_PROMPT,
+    subtasks=(
+        SubtaskDecl(prompt="open the generator and note the generated identity."),
+        SubtaskDecl(prompt="add employee using the noted generated name and save"),
+    ),
+)
+
+
+async def test_noted_data_consumer_never_replays_and_retires_entry(stores, monkeypatch):
+    """A subtask that USES data noted by an earlier segment must not replay its cached
+    recording (it would type the AUTHORING run's stale values — the observed Add Employee
+    bug): the stale entry is retired, the agent runs the segment with this run's fresh
+    findings, and the fresh recording is never committed."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(NOTED_SPEC.subtasks[1].prompt, ctx)
+    _seed_entry(consumer_sid)   # concrete values baked by a previous authoring run
+
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="generated_name = Kerris McKay"),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), NOTED_PROMPT, spec=NOTED_SPEC)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 0 and fake.agent_calls == 2
+    # The consumer agent received the producer's fresh observation.
+    assert fake.findings_seen[1] == [
+        "open the generator and note the generated identity.: "
+        "generated_name = Kerris McKay"]
+    # Stale entry retired; the fresh run recorded nothing and committed nothing.
+    assert not ss.has_script(consumer_sid)
+    assert consumer_sid not in ss.load_manifest()
+    assert list((ss.LIBRARY_DIR / "archive").glob(f"{consumer_sid}.steps.*.json"))
+    assert fake.record_paths[1] is None
+    assert result.subtasks[1]["mode"] == "authored"
+
+
+async def test_noted_consumer_replays_when_nothing_was_noted_this_run(stores, monkeypatch):
+    """The dynamic gate is wording AND observations: with no upstream findings there is
+    nothing for the cached values to be stale against (and nothing the agent could
+    substitute either), so the zero-LLM replay stays."""
+    prompt = "go to the section. add employee using the noted generated name and save"
+    spec = TaskSpec(key="n2", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt="add employee using the noted generated name and save"),
+    ))
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(spec.subtasks[1].prompt, ctx)
+    _seed_entry(ss.subtask_id(spec.subtasks[0].prompt, ctx))
+    _seed_entry(consumer_sid)
+
+    fake = FakeSession(_runner(), replays=[_seg(True), _seg(True)])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 2 and fake.agent_calls == 0
+    assert ss.has_script(consumer_sid)
+    assert consumer_sid in ss.load_manifest()
+
+
+def test_findings_sourced_values_flags_runtime_data_only():
+    """The provenance rule that replaces wording-guessing: values traceable to the RUN'S
+    FINDINGS (not the prompt) mark a segment as runtime-consuming; prompt values and
+    agent-invented incidentals do not."""
+    from automation.pipeline.hybrid import _findings_sourced_values
+
+    prompt = ("Add Employee using the noted generated name, join date 06/04/2026, "
+              "NI category A, and save")
+    findings = ["...: Employee Alistair Allan has been successfully added, "
+                "DOB 21/06/1982"]
+    steps = [
+        {"action": "fill", "selectors": ["css=#first"], "value": "Alistair"},   # finding
+        {"action": "fill", "selectors": ["css=#join"], "value": "06/04/2026"},  # prompt
+        {"action": "fill", "selectors": ["css=#county"], "value": "Lanarkshire"},  # invented
+        {"action": "click", "selectors": ['text="Mr"',                          # invented pick
+                                          'css=[id="react-select-1-option-0"]']},
+        {"action": "click", "selectors": ['text="Alistair Allan"',              # finding pick
+                                          'css=[id="react-select-2-option-3"]']},
+        {"action": "click", "selectors": ['role=link[name="Employees"]']},      # not a pick
+    ]
+    assert _findings_sourced_values(steps, prompt, findings) == [
+        "Alistair", "Alistair Allan"]
+    # No findings this run -> nothing can be runtime-sourced.
+    assert _findings_sourced_values(steps, prompt, []) == []
+
+
+def test_findings_sourced_values_catches_clicked_run_created_identifiers():
+    """The live 2026-07-24 escape: subtask 6 ('click on the same ref. no. ...') was
+    committed with the ref the AUTHORING run created — find_click('PR/.../DR017') plus a
+    role=button[name=...] click — because the guard only scanned fills and option picks.
+    Clicked-element NAMES sourced from the run's findings are runtime data exactly like
+    typed values: the replay clicked the PREVIOUS run's real row."""
+    from automation.pipeline.hybrid import _findings_sourced_values
+
+    prompt = ("now click on the same ref. no. of the same Payroll data request, "
+              "select employee and click verify")
+    findings = [
+        "Go to data request, click add request: request created",
+        "Then click on status sent on the top sent request, select st: The status of "
+        "request PR/01797494/27/DR017 is now set to Submitted with note "
+        "“well done” and the changes have been saved.",
+    ]
+    steps = [
+        {"action": "find_click", "text": "PR/01797494/27/DR017"},
+        {"action": "click",
+         "selectors": ['role=button[name="PR/01797494/27/DR017"]',
+                       'text="PR/01797494/27/DR017"', "xpath=/html/body/div[1]/button"]},
+        {"action": "click", "selectors": ["xpath=/html/body/div[2]/div"],
+         "expect_text": "PR/01797494/27/DR017"},          # name via the landed guard only
+        {"action": "click", "selectors": ['role=button[name="Verify"]']},  # prompt word
+        {"action": "click", "selectors": ['text="OK"']},   # tiny name: chance collision
+    ]
+    assert _findings_sourced_values(steps, prompt, findings) == [
+        "PR/01797494/27/DR017"]
+
+    # A clicked name that matches only a PRIOR SUBTASK'S WORDING (the "prompt[:80]: "
+    # prefix, e.g. a nav menu named like the step that used it) is not runtime data —
+    # click names check the finding BODIES only. Typed values still check everything.
+    nav = [{"action": "click", "selectors": ['role=menu[name="Data Request"]']}]
+    assert _findings_sourced_values(nav, "open the request list", findings) == []
+    typed = [{"action": "fill", "selectors": ["css=#x"], "value": "status sent"}]
+    assert _findings_sourced_values(typed, "open the request list", findings) == [
+        "status sent"]
+
+
+async def test_commit_guard_blocks_findings_sourced_segments(stores, monkeypatch, capsys):
+    """A passed segment whose recording picked a findings-sourced value must NOT be
+    committed — the wording-free version of the noted-data consumer rule (the live case:
+    an employee-name pick got parameterized to the word 'download')."""
+    prompt = "go to the section. select the employee and save the request"
+    spec = TaskSpec(key="pv", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt="select the employee and save the request"),
+    ))
+    # Subtask 1's recording clicks a react-select option named from subtask 0's finding.
+    pick_recording = {"history": [{
+        "state": {"url": "http://app/section", "interacted_element": [
+            {"node_name": "div", "ax_name": "Alistair Allan",
+             "attributes": {"id": "react-select-9-option-2"},
+             "x_path": "//div[@id='react-select-9-option-2']"}]},
+        "model_output": {"action": [{"click": {"index": 5}}]},
+        "result": [],
+    }]}
+
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="added employee Alistair Allan"),
+        _seg(True, mode="authored"),
+    ])
+    fake.recording = pick_recording
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(spec.subtasks[1].prompt, ctx)
+    # Segment passed but was NOT cached: no steps, no manifest entry — and for the
+    # right reason (the provenance guard, not a zero-step compile).
+    assert not ss.has_script(consumer_sid)
+    assert consumer_sid not in ss.load_manifest()
+    out = capsys.readouterr().out
+    assert "used runtime data from earlier steps (Alistair Allan)" in out
+
+
+def test_history_extracts_label_collision_keeps_both_values():
+    """An authored aux run that labels two different facts identically must not lose
+    the first one — Segment.extracted feeds findings AND the binder's sources."""
+    from types import SimpleNamespace
+
+    from automation.pipeline.hybrid import _history_extracts
+
+    def _res(label, value):
+        return SimpleNamespace(metadata={"extract": {"label": label, "value": value}})
+
+    history = SimpleNamespace(history=[
+        SimpleNamespace(result=[_res("identity_block", "Haiden Christie")]),
+        SimpleNamespace(result=[_res("identity_block", "28 Caerfai Bay Road")]),
+        SimpleNamespace(result=[_res("identity_block", "Haiden Christie")]),  # retry
+        SimpleNamespace(result=[_res("date_of_birth", "April 23, 1963")]),
+    ])
+    assert _history_extracts(history) == {
+        "identity_block": "Haiden Christie",
+        "identity_block_2": "28 Caerfai Bay Road",
+        "date_of_birth": "April 23, 1963",
+    }
+
+
+def test_format_extracts_collapses_duplicate_blob_values():
+    """Several labels resolving to the SAME re-read DOM text (the address-blob case) must
+    fold into one entry — repeating the blob per label burns the findings budget and
+    presents it as a real per-label split."""
+    blob = "75 Monks Way TOMNAVEN AB54 1LP"
+    out = _format_extracts({"generated_name": "Kerris McKay", "street_address": blob,
+                            "city": blob, "postcode": blob})
+    assert out == ("generated_name = Kerris McKay; "
+                   f"street_address / city / postcode = {blob}")
+    assert _format_extracts({}) == ""
+
+
+def test_downloads_watermark_windows_segment_downloads():
+    """Downloads persist on the SESSION across segments; the watermark pair must yield
+    only the files a given segment triggered, as basenames."""
+    hs = hybrid.HybridSession(_runner())
+    hs.session = SimpleNamespace(downloaded_files=["/tmp/a/earlier.pdf"])
+    mark = hs.downloads_watermark()
+    assert mark == 1
+    hs.session.downloaded_files = ["/tmp/a/earlier.pdf",
+                                   "/tmp/a/Forecast report_27.pdf"]
+    assert hs.downloads_since(mark) == ["Forecast report_27.pdf"]
+    hs.session = None
+    assert hs.downloads_watermark() == 0 and hs.downloads_since(0) == []
+
+
+def test_segment_step_budget_marker_headroom():
+    """The save-owning segment gets fix-and-resave headroom; every other gate kind runs
+    on the flat configured budget."""
+    from automation.pipeline.hybrid import segment_step_budget
+
+    assert segment_step_budget(Gate(kind="marker", marker="Employees"), 25) == 35
+    assert segment_step_budget(Gate(kind="steps"), 25) == 25
+    assert segment_step_budget(Gate(kind="postcondition",
+                                    postcondition={"url_contains": "x"}), 25) == 25
+
+
+def test_segment_step_budget_loop_headroom():
+    """A loop segment's one budget must cover EVERY iteration (observed live: 17 Save &
+    Next advances to reach the named employee; a successful fully-live pass needed 35
+    steps). Judge and action nodes stay flat; marker and loop headroom stack."""
+    from automation.pipeline.hybrid import segment_step_budget
+
+    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") == 60
+    assert segment_step_budget(Gate(kind="steps"), 25, kind="judge") == 25
+    assert segment_step_budget(Gate(kind="marker", marker="Payroll"), 25,
+                               kind="loop") == 70
+
+
 # ------------------------------- unit: gates -------------------------------
 
 
@@ -439,6 +890,20 @@ async def test_end_context_postcondition(monkeypatch):
     assert ok is False and detail["reached"] == "/x/dashboard"
 
 
+async def test_download_gate_is_authoritative_both_directions():
+    """A file in the window passes even when the agent gave up (the download click's
+    timeout receipt poisons self-reports — observed live: 4 downloads, then an
+    honest-but-wrong failure report); no file fails even a claimed success."""
+    gate = Gate(kind="download")
+    ok, detail = await evaluate_gate(gate, steps_ok=False, page=None, requests_window=[],
+                                     downloads_window=["Forecast report_27.pdf"])
+    assert ok is True
+    assert detail == {"kind": "download", "files": ["Forecast report_27.pdf"]}
+    ok, detail = await evaluate_gate(gate, steps_ok=True, page=None, requests_window=[],
+                                     downloads_window=[])
+    assert ok is False and detail["files"] == []
+
+
 def test_segment_gate_resolution():
     sub_marker = Subtask(index=0, template_prompt="save it", marker="Invoices")
     assert segment_gate(sub_marker, None, "/a").kind == "marker"
@@ -446,6 +911,15 @@ def test_segment_gate_resolution():
     sub_post = Subtask(index=0, template_prompt="open flyout",
                        postcondition={"visible": "#flyout"})
     assert segment_gate(sub_post, None, "/a").kind == "postcondition"
+
+    # Download wording -> the download gate; marker and declared postcondition outrank it.
+    sub_dl = Subtask(index=0, template_prompt="select download, select PDF")
+    assert segment_gate(sub_dl, {"end_context": "/b"}, "/a").kind == "download"
+    assert segment_gate(Subtask(index=0, template_prompt="export and save",
+                                marker="Reports"), None, "/a").kind == "marker"
+    assert segment_gate(Subtask(index=0, template_prompt="download it",
+                                postcondition={"visible": "#x"}),
+                        None, "/a").kind == "postcondition"
 
     sub_plain = Subtask(index=0, template_prompt="navigate")
     # Library entry recorded that this segment ENDS somewhere else -> inherited postcondition.

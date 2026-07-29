@@ -23,6 +23,16 @@ Rule semantics (a rule set to None or False is disabled and not evaluated):
                               — at least one matching request succeeded (generalizes the
                                 ground-truth create-write gate to extra endpoints; opt-in
                                 per task so it never duplicates the marker check)
+  scope: {"hosts": [...]}     — NOT a rule: restricts what every rule above sees. Network
+                                records count only when the REQUEST url's host is one of
+                                the hosts (or a subdomain of one); console entries count
+                                only when the PAGE that produced them is in scope. The
+                                assertions judge the app under test, so helper-tab sites
+                                (fakenamegenerator + its ad stack: 312 failed requests,
+                                277 "console errors" in one live run) and third-party
+                                trackers must not fail a healthy run. The runner injects
+                                the app's own host by default (scope_hosts_for); a task
+                                may override or disable it (scope: None = everything).
 
 A malformed allowlist regex falls back to substring matching (surfaced in the assertion
 detail) — a spec typo must never crash a run.
@@ -32,6 +42,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 DEFAULT_SPEC: dict[str, Any] = {
     "no_5xx": True,
@@ -39,12 +50,33 @@ DEFAULT_SPEC: dict[str, Any] = {
     "no_console_errors": {"allow_patterns": []},
     "max_http_4xx": None,
     "response_ok": None,
+    "scope": None,
 }
+
+
+def scope_hosts_for(url: str) -> list[str]:
+    """The default assertion scope for a run against `url`: its registrable host.
+
+    For a 3+-label host (test.actingoffice.com) the parent domain is used, so sibling
+    subdomains (api., www.) stay in scope while everything else — helper-tab sites and
+    third-party trackers — drops out. A bare or unparsable url returns [] (= unscoped)."""
+    host = (urlparse(url or "").hostname or "").lower().strip(".")
+    if not host:
+        return []
+    labels = host.split(".")
+    if len(labels) >= 3:
+        return [".".join(labels[1:])]
+    return [host]
+
+
+def _host_in_scope(url: str, hosts: list[str]) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
 
 _EVIDENCE_CAP = 5
 # Request fields worth showing as evidence (headers etc. stay in the full network log).
-_REQ_FIELDS = ("step", "method", "status", "url", "errorText", "duration_ms")
-_CONSOLE_FIELDS = ("step", "severity", "type", "text", "source", "line")
+_REQ_FIELDS = ("step", "method", "status", "url", "page_url", "errorText", "duration_ms")
+_CONSOLE_FIELDS = ("step", "severity", "type", "text", "source", "page_url", "line")
 
 
 @dataclass
@@ -94,8 +126,23 @@ def evaluate(collector_results: dict[str, Any], spec: dict[str, Any]) -> list[As
     entries = console.get("entries") or []
     results: list[AssertionResult] = []
 
+    # Scope filter (see module docstring): every rule judges only in-scope telemetry.
+    # Network scopes on the REQUEST url (5xx from the app's servers matter; a blocked ad
+    # does not); console scopes on the PAGE that raised the entry (an app bundle may be
+    # served from a CDN, so the entry's script `source` would lie). Entries recorded
+    # before page_url existed count as in-scope rather than silently vanishing.
+    scope = spec.get("scope") if isinstance(spec.get("scope"), dict) else None
+    hosts = [str(h).lower().lstrip(".") for h in (scope or {}).get("hosts") or [] if h]
+    scope_note = ""
+    if hosts:
+        requests = [r for r in requests if _host_in_scope(str(r.get("url") or ""), hosts)]
+        entries = [e for e in entries
+                   if e.get("page_url") is None
+                   or _host_in_scope(str(e.get("page_url") or ""), hosts)]
+        scope_note = f" [scope: {', '.join(hosts)}]"
+
     for name, rule in spec.items():
-        if rule is None or rule is False:
+        if name == "scope" or rule is None or rule is False:
             continue
 
         if name == "no_5xx":
@@ -167,6 +214,13 @@ def evaluate(collector_results: dict[str, Any], spec: dict[str, Any]) -> list[As
 
         else:
             results.append(AssertionResult(name, None, "unknown assertion rule (typo in spec?)"))
+
+    if scope_note:
+        # Stamp what every evaluated verdict was judged against, so a report reader can
+        # see out-of-scope noise was excluded by design, not lost.
+        for r in results:
+            if r.passed is not None:
+                r.detail += scope_note
 
     return results
 

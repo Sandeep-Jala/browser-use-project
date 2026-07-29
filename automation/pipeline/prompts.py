@@ -196,7 +196,8 @@ After clicking Save on a create form:
     visible afterwards, the save was BLOCKED by validation.
   • Call verify_save_registered. NOT REGISTERED means the
     record never reached the server: find the validation error
-    messages on the form, fix those fields, save again.
+    messages on the form, fix those fields (one the task gave
+    no value for: see FORM VALIDATION HANDLING), save again.
   • NEVER call done with success=true for a create task while
     verify_save_registered has not returned CONFIRMED.
 
@@ -228,23 +229,28 @@ item, ...):
     NOT FOUND POLICY attempts → fail_and_stop(reason).
 
 ───────────────────────────────────────────────────────────
-INPUT VALUE MISMATCH — the text landed in the WRONG element
+INPUT VALUE MISMATCH — the value did not land
 ───────────────────────────────────────────────────────────
-After every input action, READ its result. If it contains a
-note that the field's ACTUAL value differs from what you
-typed (e.g. the value shows a dropdown announcement like
-"option ..., selected. Select is focused ..."), your text
-went into the WRONG element — usually a dropdown's filter
-box on a nearby cell, NOT the field you intended.
-  • Do NOT proceed. Do NOT report the field as set.
-  • Press Escape (send_keys) to close any open dropdown the
+The input tool READS THE FIELD BACK and reports what it
+actually holds. It also clears stubborn fields with real
+keystrokes and retypes on its own, so a receipt with no
+WARNING means the value IS in the field — trust it and move
+on; do NOT retype "to be safe".
+A receipt containing "WARNING: the field still reads ..."
+means the value is NOT set, from one of two causes:
+  • your text went into the WRONG element — usually a
+    dropdown's filter box on a nearby cell (the reported
+    value may be a dropdown announcement like "option ...,
+    selected. Select is focused ...");
+  • or the field itself refused the value.
+Either way: do NOT proceed, do NOT report the field as set.
+  • Press Escape (send_keys) to close any dropdown the
     stray typing opened.
   • Locate the intended field with find_by_text using its
     label or name (e.g. find_by_text("description")), then
-    type the value into THAT element and verify the result
-    shows the value you typed.
-  • A field whose result echoes your exact text is set; a
-    field whose result shows anything else is NOT.
+    type the value into THAT element and read the receipt.
+  • Only if it STILL warns: reload the page, navigate back
+    to the field, and redo the change.
 
 ───────────────────────────────────────────────────────────
 NO JS FORM FILL
@@ -337,17 +343,22 @@ NOT open by clicking the container div or indicator button.
   input element (step 1 above). Do NOT retry the button 3+ times.
 
 ───────────────────────────────────────────────────────────
-FORM VALIDATION HANDLING — Required fields after submit
+FORM VALIDATION HANDLING — Required fields the task omits
 ───────────────────────────────────────────────────────────
-When you click Submit/Send and a validation error appears
-(e.g. "Please select Review for", "Required field missing", "mandatory fields"):
+A form may require fields the task text never mentions. A
+required field with no task-given value is NOT a reason to
+fail_and_stop — supply a value and keep going. Two triggers:
+  • While filling: a field visibly marked required (*) is
+    still empty after you entered every task-given value →
+    fill it BEFORE clicking Save.
+  • After Submit/Send: a validation error names a field
+    (e.g. "Please select Review for", "Required field
+    missing", "mandatory fields") → fix exactly the named
+    fields, save again.
 
-  • Do NOT guess or fabricate values from other fields.
-    For example, if "To: Lizzyy Lettuce" is visible, do NOT
-    type "Lizzyy" into the "Review for" search — those are
-    different fields with different option lists.
+How to supply the value depends on the control:
 
-  • Instead, follow this sequence:
+DROPDOWNS — the option list is fixed; you cannot invent one:
     1. Click the required dropdown's combobox input to OPEN it.
     2. Look at what options are ACTUALLY LISTED in the dropdown.
     3. Select the first available option from the visible list.
@@ -360,9 +371,32 @@ When you click Submit/Send and a validation error appears
     click the combobox input again (don't type anything) and wait
     for the full option list to load before scrolling.
 
+  • Do NOT guess or fabricate dropdown values from other fields.
+    For example, if "To: Lizzyy Lettuce" is visible, do NOT
+    type "Lizzyy" into the "Review for" search — those are
+    different fields with different option lists.
+
   • Do NOT type random names into dropdown search fields.
     Only type a name if YOU ALREADY CONFIRMED it exists in that
     specific dropdown from a PREVIOUS step.
+
+FREE-INPUT FIELDS (text, number, date, email, phone) — INVENT
+a plausible dummy value matching the field's label and format,
+type it, and continue. Examples: email → "test.user@example.com";
+phone → "9876543210"; reference/code → "REF1234"; description or
+remarks → "auto test data"; qty/amount → "10"; date → today or a
+near date, entered via the date picker or in the exact format
+the field displays.
+  • Dummy values are ONLY for required fields the task gives
+    no value for — never replace a task-given value, and
+    leave optional empty fields alone.
+  • If the app rejects your value (duplicate, wrong format),
+    read the error and invent a DIFFERENT value that satisfies
+    it — never retry the same rejected value.
+  • NEVER invent credentials, OTPs, or card/bank numbers — a
+    form demanding those is a fail_and_stop.
+  • State every invented value in your done message so the
+    run report shows what was filled.
 
 ───────────────────────────────────────────────────────────
 PLACEHOLDER WORDS IN INSTRUCTIONS ("any", "a", "an")
@@ -501,11 +535,12 @@ Output ONLY strict JSON — no prose, no markdown fences:
   {"subtasks": [
      {"template_prompt": "<subtask with every literal value replaced by a {{snake_case}} token>",
       "values": {"<token>": "<the literal value, copied VERBATIM from the task>", ...},
-      "is_save_step": <true|false>},
+      "is_save_step": <true|false>,
+      "tab_url": "<OPTIONAL: absolute https URL of the OTHER website this subtask runs on>"},
      ...]}
 
 Rules:
-- 2 to 15 subtasks, preserving the task's original action order exactly.
+- 2 to 24 subtasks, preserving the task's original action order exactly.
 - Cut SHARED PREFIXES identically: many tasks open with the same navigation wording \
 ("go to <module>, search and select <business>...", "go to <section>..."). Split that \
 wording into the same standalone subtasks every time — never merge a shared navigation \
@@ -524,6 +559,11 @@ EXACT substring of the task text — the split is mechanically REJECTED if any v
 - Phrases that merely REFER to data the agent will discover on the page at runtime ("the \
 Account Manager", "the noted setting", "a business name randomly", "the same business") \
 are procedure words, NOT values — never tokenize them.
+- The same is true of an instruction to GENERATE a value rather than type a given one ("a \
+random 6 digit number", "should be AB followed by ... and end with C", "any unused \
+reference"): there is no literal to tokenize, so COPY THE INSTRUCTION LITERALLY into the \
+subtask that fills that field. Never drop it — a dropped generate-instruction leaves a \
+required field blank at run time.
 - A task may contain NO literal values at all (everything discovered at runtime): then \
 every "values" is {} and no template contains a token. Never invent a token just to have \
 a parameter.
@@ -531,6 +571,11 @@ a parameter.
 task's original wording for that span. Do not reword, add, or drop actions.
 - Exactly ONE subtask has "is_save_step": true — the one whose final action commits the \
 record (clicks Save/Submit). If the task saves nothing, every subtask has false.
+- "tab_url" ONLY when a subtask must be done on a DIFFERENT website than the app (e.g. \
+"search Google for X"): set it to that site's absolute https URL. The engine opens that \
+site in a separate helper tab and closes the tab when the subtask ends — the app page is \
+never left, so never add a navigate-back subtask. Omit "tab_url" entirely for normal \
+in-app subtasks, and NEVER invent a URL the task does not imply.
 - Do not invent steps the task does not mention (no login, no verification-only subtasks).\
 """
 
@@ -543,8 +588,11 @@ def scoped_subtask_prompt(
     prior_failure: str | None = None,
     expected_end: str | None = None,
     owns_save: bool = False,
+    downloads_file: bool = False,
     findings: list[str] | None = None,
     observe: bool = False,
+    loop: bool = False,
+    aux_tab: str | None = None,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
 
@@ -557,10 +605,19 @@ def scoped_subtask_prompt(
     Carries the per-action verification discipline inline (segments are not expanded into
     numbered plans), plus `expected_end` — a concrete done-condition read from the
     library entry's gate: the end state this segment reached in previous SUCCESSFUL runs.
-    `owns_save` marks the segment whose final action commits the record. `findings` are
+    `owns_save` marks the segment whose final action commits the record. `downloads_file`
+    marks a segment whose deliverable is a file download — its click receipt lies with a
+    timeout on every honest success, so the rule is click ONCE, then trust
+    verify_download, never the receipt. `findings` are
     the observations earlier segments recorded ("prompt: outcome" lines) — the data a
     verify step compares against. `observe` marks a judge node: its done message must
-    carry the observed facts, because later segments receive it as a finding.
+    carry the observed facts, because later segments receive it as a finding. `loop` marks
+    a loop node: the step repeats an action until its stated stop condition holds, so the
+    prompt carries the repeat-until contract and its generic done-condition (without it,
+    observation framing made the agent declare a loop done after one iteration). `aux_tab`
+    marks an aux-tab segment: the framework already opened and focused a helper tab at
+    that URL, all work happens there, and facts must be captured via extract_data so
+    future replays can re-read them fresh.
     """
     lines = [
         "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
@@ -572,12 +629,30 @@ def scoped_subtask_prompt(
     if findings:
         lines.append(
             "\nOBSERVATIONS recorded by the completed steps — facts your step may need. "
-            "Trust these values; do NOT navigate back to re-check them:")
-        lines.extend(f"  - {f[:400]}" for f in findings)
+            "Trust these values; do NOT navigate back to re-check them (a captured "
+            "block's text may hold several facts — read the ones you need out of it):")
+        lines.extend(f"  - {f[:1000]}" for f in findings)
     lines.append(
         "\nDo NOT navigate to the app root, re-select the business, or restart the flow."
     )
     lines.append(f"\nYOUR ONLY JOB: {subtask}")
+    if aux_tab:
+        lines.append(
+            f"\nThis step runs in a SEPARATE HELPER TAB, already open and focused at "
+            f"{aux_tab}. Do ALL of this step's work in this helper tab. Do NOT switch "
+            f"back to the app tab, do NOT open or close any tab, and do NOT touch the "
+            f"app — the framework closes this helper tab itself when your step ends."
+            f"\nNOTING FACTS: your done message must state every fact this step was "
+            f"asked to note. A value your instructions already specify (a setting you "
+            f"were told to pick) is just restated there — do NOT extract_data it and do "
+            f"NOT hunt the page for it. Facts the PAGE generated must ALSO be captured "
+            f"with extract_data so future replays can re-read them fresh: prefer ONE "
+            f"call on the block/card that shows them — the block's whole text is the "
+            f"value, later steps parse it — and per-fact calls only when values live in "
+            f"separate places. If one extract_data call keeps returning the wrong text, "
+            f"do not repeat it more than twice: capture the enclosing block instead and "
+            f"state the fact in your done message."
+        )
     if dirty:
         failure = (f" It failed with: {sanitize_failure(prior_failure)}."
                    if prior_failure else "")
@@ -609,7 +684,21 @@ def scoped_subtask_prompt(
             "\nThis step COMMITS the record. After clicking Save, call "
             "verify_save_registered; only report success after it returns CONFIRMED. NOT "
             "REGISTERED means validation blocked the save: find the error messages on the "
-            "form, fix those exact fields, and save again."
+            "form, fix those exact fields, and save again. A required field your "
+            "instructions give no value for is not a failure: dropdowns — open it and "
+            "pick a listed option; free-input fields — type a plausible dummy value "
+            "matching the field's label and format, and state every invented value in "
+            "your done message."
+        )
+    if downloads_file:
+        lines.append(
+            "\nThis step's deliverable is a FILE DOWNLOAD. Click the download control "
+            "ONCE. The click's receipt will usually show a TIMEOUT or error — for "
+            "downloads that is NORMAL and does NOT mean it failed. NEVER click the "
+            "control a second time because of a timeout alone. Instead call "
+            "verify_download: CONFIRMED naming your file means the step is COMPLETE — "
+            "call done with success=true immediately. Only if verify_download returns "
+            "NONE may you click the control once more."
         )
     if observe:
         lines.append(
@@ -620,6 +709,19 @@ def scoped_subtask_prompt(
             "MATCH'). Later steps receive your message as recorded fact, so a bare "
             "'done' or 'verified' without the observed values is a FAILED step. Report "
             "honestly: if the check does NOT hold, say so and state what you saw instead."
+        )
+    if loop:
+        lines.append(
+            "\nThis is a LOOP step: it REPEATS an action until the stop condition stated "
+            "in YOUR ONLY JOB holds. Perform ONE iteration at a time; after EVERY "
+            "iteration read the page and check the stop condition against what is "
+            "actually shown. If it does not hold yet, do the next iteration. Do NOT stop "
+            "early, and NEVER jump ahead (e.g. clicking a row, name, or list entry) to "
+            "force the end state — only the repeated action itself may advance it. DONE "
+            "CONDITION: this step is complete ONLY when the stop condition holds on the "
+            "page. Reaching it may take MANY iterations — a long repetition is expected, "
+            "not a sign of being stuck. Your done message must state the final observed "
+            "state (the value/name shown when you stopped)."
         )
     if remaining:
         lines.append("\nStill ahead in this workflow (context only — each is handled "

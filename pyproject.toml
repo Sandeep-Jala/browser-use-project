@@ -5,9 +5,15 @@ description = "Browser-use agent framework: authenticated login, task runs, tele
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "browser-use==0.13.3",
+    "browser-use==0.13.6",
     "fastembed>=0.8.0",
     "groq>=1.0.0",
+    # Encoder behind browser-use's CDP screencast recorder (--record). NOT the
+    # `browser-use[video]` extra: that pins numpy==2.4.1 exactly, which would downgrade the
+    # numpy fastembed's ONNX runtime uses. browser_use/browser/video_recorder.py needs only
+    # imageio + numpy + PIL, and the last two are already here. imageio-ffmpeg ships its own
+    # ffmpeg binary, so there is no system ffmpeg to install.
+    "imageio[ffmpeg]>=2.37.2",
     "playwright>=1.60.0",
     "psutil>=7.2.2",
     "python-dotenv>=1.2.2",

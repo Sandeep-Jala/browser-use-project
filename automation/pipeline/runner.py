@@ -38,6 +38,47 @@ logger = logging.getLogger("framework.runner")
 CollectorFactory = Callable[[BrowserContext, Path], Collector]
 
 
+# FileSystem-supported formats that survive a text round-trip; binary formats (xlsx,
+# images, real pdf/docx bytes) cannot be seeded into the workspace and ride the
+# available_file_paths allowlist instead.
+_WORKSPACE_TEXT_EXTS = {"csv", "txt", "json", "jsonl", "md", "xml", "html"}
+
+
+def _workspace_files_note(files: list[str]) -> str:
+    """The task-suffix telling the agent its upload files — the cloud-workspaces UX:
+    reference by NAME (the string the prompt itself spells), with the resolved absolute
+    paths as the accepted fallback for formats the workspace cannot hold."""
+    names = "; ".join(Path(f).name for f in files)
+    return ("\n\nWORKSPACE FILES available to the upload_file action — pass just the "
+            f"file NAME: {names}. (Absolute paths are also accepted: "
+            + "; ".join(files) + ")")
+
+
+async def _seed_workspace_files(agent: Any, files: list[str]) -> list[str]:
+    """Copy the run's upload files into the agent's FileSystem — the open-source analog
+    of cloud `workspaces.upload` (docs.browser-use.com/cloud/agent/workspaces). The agent
+    then references files by BASENAME and browser-use's upload_file resolves + validates
+    them natively (local sessions only — the inverted handoff is what makes this path
+    live; see browser/session.py). Non-text formats are skipped and stay covered by the
+    available_file_paths allowlist. Returns the seeded basenames."""
+    fs = getattr(agent, "file_system", None)
+    if fs is None or not files:
+        return []
+    seeded: list[str] = []
+    for path in files:
+        p = Path(path)
+        if p.suffix.lstrip(".").lower() not in _WORKSPACE_TEXT_EXTS:
+            continue
+        try:
+            await fs.write_file(p.name, p.read_text())
+            seeded.append(p.name)
+        except Exception as exc:  # noqa: BLE001 - the allowlist still covers this file
+            logger.debug("workspace seed failed for %s: %s", p.name, exc)
+    if seeded:
+        logger.info("🗂 workspace seeded: %s", ", ".join(seeded))
+    return seeded
+
+
 def _first_create_write(requests: list[dict[str, Any]], marker: str) -> dict[str, Any] | None:
     """The first successful create-write for this task in the network log, or None.
 
@@ -256,6 +297,8 @@ class Runner:
         judge_llm: Any | None = None,
         extend_system_message: str | None = None,
         tools: Any | None = None,
+        available_files: list[str] | None = None,
+        session: Any | None = None,
     ) -> None:
         self.cdp_url = cdp_url
         self.config = config
@@ -272,6 +315,16 @@ class Runner:
         self.expander_llm = expander_llm
         # Optional post-run QA judge (a strong LLM scoring the run); None disables verdicts.
         self.judge_llm = judge_llm
+        # Resolved absolute paths of the task's upload files (validated at startup by
+        # pipeline/files.py against automation/uploads/). Passed to every Agent as
+        # browser-use's upload_file allowlist. (Under the inverted handoff the session is
+        # LOCAL and browser-use validates too; the startup validation stays as the
+        # first, loudest line.)
+        self.available_files: list[str] = list(available_files or [])
+        # The browser-OWNING BrowserSession (launched in __main__, already started and
+        # logged in). The hybrid engine reuses it for every segment instead of attaching
+        # a fresh session — the browser and its authenticated state are process-scoped.
+        self.session = session
 
     def _new_run_dir(self) -> tuple[str, Path]:
         """Allocate a unique run id + artifacts directory."""
@@ -309,10 +362,13 @@ class Runner:
 
         Returns {"history", "screenshots", "steps", "usage", "judgement"}.
         """
+        if self.available_files:
+            agent_task += _workspace_files_note(self.available_files)
         agent = Agent(
             task=agent_task,
             llm=self.llm,
             browser_session=session,
+            available_file_paths=self.available_files or None,
             use_vision=self.config.use_vision,
             vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
@@ -351,6 +407,7 @@ class Runner:
             # ERR_NAME_NOT_RESOLVED, failing the whole run).
             directly_open_url=False,
         )
+        await _seed_workspace_files(agent, self.available_files)
 
         # Stamp each captured telemetry event with the agent step it fired on, and service any
         # queued human-in-the-loop pause — both at the START of each step, a safe boundary where
@@ -463,6 +520,37 @@ class Runner:
             if _inject_context(_agent, notice):
                 logger.info("⚠ page-notification surfaced: %s", joined[:80])
 
+        # Downloads persist on the SESSION across segments; baseline at this segment's
+        # start so only downloads the agent itself triggered get surfaced to it.
+        def _session_downloads() -> list[str]:
+            try:
+                return list(getattr(session, "downloaded_files", None) or [])
+            except Exception:  # noqa: BLE001 - download accounting is best-effort
+                return []
+
+        seen_downloads = {"n": len(_session_downloads())}
+
+        def _surface_downloads(_agent: "AgentType") -> None:
+            """A click that starts a download often returns a TIMEOUT receipt (the click
+            watchdog waits for a page consequence that never comes) — observed live: the
+            agent read the timeout as failure, re-clicked, and downloaded the file twice.
+            Surfacing the download as the step's authoritative outcome corrects the lie."""
+            files = _session_downloads()
+            new = files[seen_downloads["n"]:]
+            if not new:
+                return
+            seen_downloads["n"] = len(files)
+            names = ", ".join(Path(p).name for p in new)
+            notice = (
+                f"⚠ DOWNLOAD COMPLETED since your last action: {names}. The click that "
+                f"triggered it SUCCEEDED even if its receipt showed a timeout or error — "
+                f"the download WAS the click's outcome. Do NOT click the control again; "
+                f"that would download a duplicate. Confirm with verify_download if needed "
+                f"and move on."
+            )
+            if _inject_context(_agent, notice):
+                logger.info("📥 download surfaced to agent: %s", names[:100])
+
         async def _track_step(_agent: "AgentType") -> None:
             step_state["n"] += 1
             for collector in collectors:
@@ -476,6 +564,7 @@ class Runner:
             if self.config.reveal_hidden_controls:
                 await agent_tools.ensure_reveal_css(session)
             await _surface_notifications(_agent)
+            _surface_downloads(_agent)
             if pause_state["requested"]:
                 pause_state["requested"] = False
                 self._prompt_and_inject(_agent)

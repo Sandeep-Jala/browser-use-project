@@ -1,12 +1,12 @@
 """Login module.
 
-Wraps the original login automation (see git history of main.py) and exposes
-a single entry point: `login(playwright, config)`. It launches Chromium with
-its CDP (Chrome DevTools Protocol) debugging port open, logs in using plain
-Playwright actions, and hands back the `cdp_url`. Browser-Use's `Browser`
-then *attaches* to that same running Chromium via `cdp_url` instead of
-launching a second browser, so the navigation Agent continues from the
-authenticated session login produced.
+INVERTED handoff (2026-07-23): browser-use launches and OWNS the browser
+(browser/session.launch_session); `login(playwright, config, cdp_url)` CONNECTS to it
+over CDP with plain Playwright, authenticates in the session's own tab, and disconnects.
+The agent then continues from the authenticated session — same single-login guarantee as
+before, but the session classifies LOCAL to browser-use (see session.py for why that
+matters). Closing the Playwright CONNECTION never closes the browser; the session owner
+(main()) does that.
 
 Uses Playwright's *async* API (not sync) so the whole pipeline -- login,
 Groq calls, and the Browser-Use agent -- can share a single asyncio event
@@ -17,7 +17,7 @@ import asyncio
 import re
 import time
 
-from playwright.async_api import Browser, Page, Playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Page, Playwright, TimeoutError as PlaywrightTimeoutError
 
 from automation.config import Config
 from automation.browser.error_capture import save_login_error_screenshot
@@ -72,11 +72,13 @@ async def _dismiss_two_factor(page: Page) -> bool:
     return False
 
 
-async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, str]:
-    """Log in and return (browser, page, cdp_url).
+async def login(playwright: Playwright, config: Config, cdp_url: str) -> str:
+    """Authenticate the browser-use-owned browser at `cdp_url`; return the landing URL.
 
-    The caller is responsible for keeping `browser` open for as long as the
-    navigation Agent needs the session, and for closing it when done.
+    Connects over CDP, drives the session's OWN tab through the credential flow, and
+    disconnects. The browser stays untouched by this function's lifecycle — on failure
+    the connection is dropped and the caller (which owns the session) tears the browser
+    down.
     """
     if not config.login_email or config.login_email == "your_email_here@example.com":
         raise LoginError("LOGIN_EMAIL is not set in .env")
@@ -88,35 +90,24 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
     print(f"[*] Login Email: {config.login_email}")
     print(f"[*] Headless Mode: {config.headless}")
 
-    print("[*] Launching Chromium browser (with CDP enabled for handoff)...")
-    # No slow_mo: the login flow waits on explicit selectors/URLs below, and a slow_mo delay
-    # is charged on EVERY Playwright call here (~10s of dead time before the agent starts).
-    browser = await playwright.chromium.launch(
-        headless=config.headless,
-        args=[f"--remote-debugging-port={config.cdp_port}", "--window-size=1440,900"],
-        # Don't let Playwright tear down the browser on Ctrl+C: the Runner installs its own
-        # SIGINT handler for the human-in-the-loop pause (see runner._prompt_and_inject), and
-        # the browser must survive the pause so the agent can resume against it.
-        handle_sigint=False,
-    )
-    cdp_url = f"http://localhost:{config.cdp_port}"
-
-    # This context is the one browser-use later attaches to over CDP, so ITS viewport owns
-    # the geometry of every screenshot the agent sees. Playwright's 1280×720 default crops
-    # this app's dense screens; 1440×900 keeps toolbars and table rows on-screen so element
-    # indexes map to what the model can actually read (fewer misclicks / "not found").
-    context = await browser.new_context(
-        viewport={"width": 1440, "height": 900}, device_scale_factor=1.0,
-    )
+    print(f"[*] Connecting to the agent-owned browser over CDP ({cdp_url})...")
+    browser = await playwright.chromium.connect_over_cdp(cdp_url)
+    # Drive the session's existing tab (browser-use opens one at start) so the agent
+    # continues in the exact tab login authenticated; a fresh tab would leave the
+    # session's focus on an about:blank ghost.
+    page = next((p for ctx in browser.contexts for p in ctx.pages), None)
+    if page is None:
+        page = await browser.contexts[0].new_page() if browser.contexts else None
+    if page is None:
+        raise LoginError("the agent browser exposed no context to log in on")
     if config.reveal_hidden_controls:
-        # Install the reveal stylesheet into EVERY document this context creates, from
-        # birth: hover-revealed/0-size controls otherwise never enter browser-use's
-        # snapshot and fail replay's visibility gate. The agent and the replay engine both
-        # drive pages of THIS context, so one init script covers authoring and replay
-        # across every navigation. (Per-step and per-segment re-asserts back this up for
-        # pages created outside the context — see agent_tools.ensure_reveal_css.)
-        await context.add_init_script(REVEAL_CSS_JS)
-    page = await context.new_page()
+        # Best-effort while this connection lives; the durable installation happens on
+        # the hybrid engine's own long-lived connection (HybridSession.open) and the
+        # per-step/per-segment re-asserts (agent_tools.ensure_reveal_css).
+        try:
+            await page.context.add_init_script(REVEAL_CSS_JS)
+        except Exception:  # noqa: BLE001 - cosmetic here; re-asserts cover it
+            pass
 
     try:
         print(f"[*] Navigating to {config.login_url}...")
@@ -208,7 +199,11 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
                 print("[*] Did not observe the /admin redirect -- continuing after a short settle.")
                 await asyncio.sleep(2)
                 break
-            print("[!] Still on the login page after submit -- retrying with fresh fills.")
+            print("[!] Still on the login page after submit -- retrying in 5s with fresh fills.")
+            # Breather before the resubmit: an instant retry after a SERVER-side rejection
+            # feeds the app's failed-login counter (account got temporarily locked
+            # 2026-07-24). The hydration-wipe case this retry exists for loses nothing.
+            await asyncio.sleep(5)
         else:
             await save_login_error_screenshot(page, config.errors_dir, "login_rejected")
             raise LoginError(
@@ -217,12 +212,15 @@ async def login(playwright: Playwright, config: Config) -> tuple[Browser, Page, 
             )
         await asyncio.sleep(1)  # small buffer for the SPA to boot after the redirect
 
-        print(f"[+] Final URL after login: {page.url}")
+        final_url = page.url
+        print(f"[+] Final URL after login: {final_url}")
         print("[+] Login process completed successfully!")
-        return browser, page, cdp_url
+        await browser.close()   # the CDP CONNECTION only — the browser survives
+        return final_url
 
     except LoginError:
-        # Already screenshotted with a specific name; just release the browser.
+        # Already screenshotted with a specific name; drop the connection (the session
+        # owner tears the browser itself down).
         await browser.close()
         raise
     except PlaywrightTimeoutError as te:

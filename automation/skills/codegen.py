@@ -87,6 +87,14 @@ def _anchor(step: dict[str, Any]) -> dict[str, Any]:
         # The recorded click reached a legitimately-invisible control (hover-revealed /
         # 0-size); replay keeps the hidden-dispatch permission (script_compile).
         anchor["hidden_ok"] = True
+    if step.get("query"):
+        # Extract steps keep their recorded query as the semantic re-find fallback.
+        anchor["query"] = step["query"]
+    if step.get("expect_text"):
+        # Landed-click name guard travels with the anchor (api.click reads it via
+        # _step_for; value-parameterized anchors get it overwritten at instantiation —
+        # see base._substituted_anchors).
+        anchor["expect_text"] = step["expect_text"]
     return anchor
 
 
@@ -120,6 +128,11 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
             expr = _value_expr(str(step.get("value", "")), param_set)
             tail = "" if step.get("clear", True) else ", clear=False"
             lines.append(f"    await api.fill({handle!r}, {expr}{tail})")
+        elif action == "select":
+            handle = _handle_for(step, used)
+            anchors[handle] = _anchor(step)
+            expr = _value_expr(str(step.get("value", "")), param_set)
+            lines.append(f"    await api.select({handle!r}, {expr})")
         elif action == "type":
             lines.append(f"    await api.type_text("
                          f"{_value_expr(str(step.get('text', '')), param_set)})")
@@ -133,6 +146,20 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
         elif action == "find_click":
             expr = _value_expr(str(step.get("text", "")), param_set)
             lines.append(f"    await api.find_click({expr})")
+        elif action == "extract":
+            if not step.get("selectors"):
+                # Query-only extract: no element identity to anchor on — the entry stays
+                # tier-0, where run_steps owns the semantic re-find.
+                raise ValueError("cannot transpile query-only extract step")
+            handle = _handle_for(step, used)
+            anchors[handle] = _anchor(step)
+            lines.append(f"    await api.extract({handle!r}, "
+                         f"{str(step.get('label') or 'value')!r})")
+        elif action == "upload":
+            handle = _handle_for(step, used)
+            anchors[handle] = _anchor(step)
+            expr = _value_expr(str(step.get("value", "")), param_set)
+            lines.append(f"    await api.upload({handle!r}, {expr})")
         else:
             raise ValueError(f"cannot transpile step action {action!r}")
         i += 1

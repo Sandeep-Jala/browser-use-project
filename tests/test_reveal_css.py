@@ -112,6 +112,9 @@ class _FakePage:
     def __init__(self):
         self.evals: list[str] = []
 
+    def is_closed(self) -> bool:
+        return False
+
     async def evaluate(self, expr):
         self.evals.append(expr)
 

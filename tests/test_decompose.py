@@ -170,7 +170,7 @@ async def test_hallucinated_value_rejected_then_fallback(library):
     ]})
     llm = StubLLM(bad)
     subs = await decompose.get_decomposition(PROMPT, llm=llm, marker="Invoices")
-    assert llm.calls == 2  # one retry, then give up
+    assert llm.calls == 3  # two retries, then give up
     assert len(subs) == 1  # whole-prompt fallback
     assert subs[0].marker == "Invoices"
     assert ss.load_decomposition(ss.task_id(PROMPT)) is None  # garbage is never cached
@@ -208,6 +208,111 @@ async def test_token_value_mismatch_rejected(library):
     assert len(subs) == 1  # fallback
 
 
+# ------------------------------- the dropped-wording guard -------------------------------
+# Regression: the NI clause of the payroll add-employee task ("NI number should be AB followed
+# by a random 6 digit number and end with C") silently vanished from the split — a GENERATIVE
+# instruction is neither a tokenizable literal (the hallucination guard bars it) nor a button
+# label, so the LLM omitted it and the employee would have saved with a blank NI number.
+
+NI_PROMPT = ("add employee with join date 06/04/2026, NI number should be AB followed by a "
+             "random 6 digit number and end with C, NI category A, and save")
+
+NI_DROPPED = json.dumps({"subtasks": [
+    {"template_prompt": "add employee with join date {{join_date}}",
+     "values": {"join_date": "06/04/2026"}, "is_save_step": False},
+    {"template_prompt": "NI category {{ni_category}}, and save",
+     "values": {"ni_category": "A"}, "is_save_step": True},
+]})
+
+NI_KEPT = json.dumps({"subtasks": [
+    {"template_prompt": "add employee with join date {{join_date}}",
+     "values": {"join_date": "06/04/2026"}, "is_save_step": False},
+    {"template_prompt": "NI number should be AB followed by a random 6 digit number and end "
+                        "with C, NI category {{ni_category}}, and save",
+     "values": {"ni_category": "A"}, "is_save_step": True},
+]})
+
+
+def test_coverage_gap_spots_a_dropped_clause_and_passes_a_complete_split():
+    raw = json.loads(NI_DROPPED)["subtasks"]
+    gap = decompose.coverage_gap(raw, NI_PROMPT)
+    assert gap and "random 6 digit number" in gap
+    assert decompose.coverage_gap(json.loads(NI_KEPT)["subtasks"], NI_PROMPT) is None
+
+
+def test_coverage_gap_tolerates_reworded_connectives():
+    # The decomposer rewrites small joining words ("now" -> "Then"); only a long dropped run
+    # is a lost instruction, so this must NOT be rejected.
+    prompt = "click add request, now click save, and then click send"
+    raw = [{"template_prompt": "click add request", "values": {}},
+           {"template_prompt": "Then click save", "values": {}},
+           {"template_prompt": "and then click send", "values": {}}]
+    assert decompose.coverage_gap(raw, prompt) is None
+
+
+def test_coverage_gap_is_not_fooled_by_vocabulary_reuse():
+    # "number"/"date"/"end" all recur elsewhere in the prompt; a bag-of-words check would call
+    # the dropped clause covered by its own words appearing in other subtasks.
+    raw = json.loads(NI_DROPPED)["subtasks"] + [
+        {"template_prompt": "set end date and reference number and random digit", "values": {}}]
+    assert decompose.coverage_gap(raw, NI_PROMPT)
+
+
+@pytest.mark.asyncio
+async def test_dropped_wording_rejected_then_corrected_on_retry(library):
+    llm = SeqLLM(NI_DROPPED, NI_KEPT)
+    subs = await decompose.get_decomposition(NI_PROMPT, llm=llm, marker=None)
+
+    assert llm.calls == 2
+    assert "random 6 digit number" in subs[1].template_prompt
+    retry_user = str(llm.seen[1][-1].content)
+    assert "REJECTED" in retry_user and "dropped wording" in retry_user
+
+
+@pytest.mark.asyncio
+async def test_last_attempt_keeps_an_incomplete_split_over_whole_prompt_fallback(library):
+    # Both attempts drop the clause. A structurally sound 2-node split still runs the task far
+    # better than one giant whole-prompt node, so it is kept (loudly) rather than discarded.
+    llm = SeqLLM(NI_DROPPED)
+    subs = await decompose.get_decomposition(NI_PROMPT, llm=llm, marker=None)
+
+    assert llm.calls == 3  # strict on 1 and 2, advisory on the last
+    assert len(subs) == 2  # not the 1-node fallback
+
+
+def test_new_tab_wording_implies_tab_url_but_in_app_links_are_left_alone():
+    # Observed live: the fakenamegenerator subtask came back with tab_url omitted, which would
+    # have navigated the APP page to that site and stranded every later subtask.
+    assert decompose._implied_tab_url(
+        "Open a new tab, go to https://www.fakenamegenerator.com/ , click Generate"
+    ) == "https://www.fakenamegenerator.com/"
+    # In-app deep links carry no new-tab wording and must NOT become helper tabs.
+    assert decompose._implied_tab_url(
+        "Navigate directly to https://appuat.actingoffice.com/admin/clients/business/69bd") is None
+    assert decompose._implied_tab_url("open a new tab and check the totals") is None
+
+
+@pytest.mark.asyncio
+async def test_missing_tab_url_is_recovered_from_the_subtask_wording(library):
+    reply = json.dumps({"subtasks": [
+        {"template_prompt": "go to Bookkeeping module, search and select {{business}} "
+                            "business name",
+         "values": {"business": "290 CREW LIMITED"}, "is_save_step": False},
+        {"template_prompt": "Open a new tab, go to https://www.fakenamegenerator.com/ and "
+                            "note the identity",
+         "values": {}, "is_save_step": False},
+        {"template_prompt": "add invoice for customer {{customer}} with qty {{qty}} and "
+                            "click save",
+         "values": {"customer": "Suresh Gopi", "qty": "5"}, "is_save_step": True},
+    ]})
+    prompt = (PROMPT + " Open a new tab, go to https://www.fakenamegenerator.com/ and note "
+              "the identity")
+    subs = await decompose.get_decomposition(prompt, llm=StubLLM(reply), marker="Invoices")
+
+    assert subs[1].tab_url == "https://www.fakenamegenerator.com/"
+    assert subs[0].tab_url is None and subs[2].tab_url is None
+
+
 @pytest.mark.asyncio
 async def test_no_llm_no_cache_gives_whole_prompt_fallback(library):
     subs = await decompose.get_decomposition("just do the thing", llm=None, marker=None)
@@ -238,9 +343,110 @@ def test_node_kind_heuristic():
     assert decompose.node_kind("go to inputs section,select sales", None) == "action"
     # A marker-owning subtask is ALWAYS action — its network gate is machine ground truth.
     assert decompose.node_kind("verify and save the record", "Invoices") == "action"
+    # An aux-tab subtask is action even with observational wording: its replayed extract
+    # step re-reads the live DOM, so the observation stays fresh without the LLM.
+    assert decompose.node_kind("note the title of the top result", None,
+                               tab_url="https://duckduckgo.com") == "action"
     # An explicit declaration wins over the heuristic.
     assert decompose.node_kind("go to the reviews section", None, declared="judge") == "judge"
     assert decompose.node_kind("verify it worked", None, declared="action") == "action"
+    assert decompose.node_kind("note the top result", None, declared="judge",
+                               tab_url="https://duckduckgo.com") == "judge"
+
+
+# The two RTI employee loops, verbatim from the live decomposition: imperative actions
+# with the verification folded inside. Judge framing made the agent declare them done
+# after ONE Save & Next (the observed wrong-employee bug) — they must classify "loop".
+LOOP_OWEN = ("Process the existing employees one at a time by clicking Save & Next, and "
+             "after each click check that the next employee has loaded (never click an "
+             "employee's name in the list to jump ahead), stopping as soon as "
+             "{{employee}} is the employee shown")
+LOOP_STRUAN = ("Continue clicking Save & Next one employee at a time in the same way "
+               "(check that each save advances to the next employee, and never click a "
+               "name in the list) until {{employee}} is the employee shown")
+
+
+def test_node_kind_loop_detection():
+    # Judge phrase + iteration cues, with the judge phrase NOT the head directive -> loop.
+    assert decompose.node_kind(LOOP_OWEN, None) == "loop"
+    assert decompose.node_kind(LOOP_STRUAN, None) == "loop"
+    # A LEADING judge directive stays judge even when WHAT it checks iterates.
+    assert decompose.node_kind(
+        "Check that entries do not repeat across pages and each page loads",
+        None) == "judge"
+    assert decompose.node_kind("verify that each filter narrows the results",
+                               None) == "judge"
+    # Cue-free verification stays judge; judge-free iteration stays action.
+    assert decompose.node_kind("verify the CC field matches", None) == "judge"
+    assert decompose.node_kind(
+        "Then go to Payroll & RTI, change the date to next month, and click Save & Next "
+        "3 times", None) == "action"
+    # Marker precedence is unchanged: machine ground truth caches safely.
+    assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
+    # Explicit declarations still win in both directions.
+    assert decompose.node_kind("go to the reviews section", None,
+                               declared="loop") == "loop"
+    assert decompose.node_kind(LOOP_OWEN, None, declared="judge") == "judge"
+
+
+def test_conditional_guard_wording():
+    # Leading "If" = branch guard: whether its actions run at all depends on live page
+    # state, so hybrid runs it live and never caches it.
+    assert decompose.is_conditional_guard(
+        "If you see an error 'The employer pay is lower than the minimum wage rate', "
+        "click Add Payment, set Amount to {{amount}}, and click Save & Next")
+    assert decompose.is_conditional_guard("if a pop up appears, click Process")
+    assert decompose.is_conditional_guard("Then, if an error shows, dismiss it")
+    # An EMBEDDED conditional is a footnote to an unconditional procedure: cacheable.
+    assert not decompose.is_conditional_guard(
+        "go to Payroll & RTI, click Save & Next. If a pop up appears, select 'don't "
+        "show this again' and click Process")
+    assert not decompose.is_conditional_guard(
+        "add invoice for customer {{customer}} and click save")
+
+
+def test_downloads_file_wording():
+    assert decompose.downloads_file("select download, select PDF")
+    assert decompose.downloads_file("select download and select Excel")
+    assert decompose.downloads_file("Export the report to csv")
+    assert not decompose.downloads_file("go to employee section")
+    assert not decompose.downloads_file(
+        "note the generated identity; remember Name and Address")
+    assert not decompose.downloads_file("add invoice for customer {{customer}} and save")
+
+
+def test_consumes_noted_data_matches_consumers_not_producers():
+    # CONSUMER wording — the segment fills the app with run-noted values, so a cached
+    # replay would type the authoring run's stale ones (the observed Add Employee bug).
+    assert decompose.consumes_noted_data(
+        "Add Employee using the noted generated name and address, join date "
+        "{{join_date}}, NI number {{ni_number}}, and save")
+    assert decompose.consumes_noted_data("fill the form with the generated name")
+    assert decompose.consumes_noted_data("enter the id noted earlier into the search box")
+    assert decompose.consumes_noted_data("search for the title from the previous step")
+    assert decompose.consumes_noted_data("compare it with the remembered address")
+    # Relative-clause reference to a record an earlier segment created (the live case
+    # where the employee pick got parameterized to the word "download").
+    assert decompose.consumes_noted_data(
+        "Then go to pay forecast, search for employee which we added in the combobox "
+        "search employee, change pay from Dec-26 to {{pay}}, select download, select PDF")
+    assert decompose.consumes_noted_data("open the request that was created and verify")
+    assert decompose.consumes_noted_data("select the newly added employee")
+    # PRODUCER wording — its replayed extract re-reads the live DOM (never stale), so it
+    # must keep its zero-LLM replay.
+    assert not decompose.consumes_noted_data(
+        "Open a new tab, go to https://www.fakenamegenerator.com/ , set Name set to "
+        "{{name_set}} and Country to {{country}}, click Generate, and note the generated "
+        "identity; remember Name and Address")
+    assert not decompose.consumes_noted_data(
+        "search DuckDuckGo for {{query}} and note the title of the top result")
+    # Plain action wording and app-domain vocabulary stay replayable.
+    assert not decompose.consumes_noted_data(
+        "go to Payroll module, search and select {{business}} business name, "
+        "go to employee section")
+    assert not decompose.consumes_noted_data(
+        "add invoice for customer {{customer}} and click save")
+    assert not decompose.consumes_noted_data("open the recorded payment and click void")
 
 
 JUDGE_PROMPT = "go to the reviews section. verify the mail is not sent"
@@ -277,3 +483,105 @@ async def test_fallback_is_judge_for_markerless_verification_task(library):
     subs = await decompose.get_decomposition(
         "verify that the report shows the review", llm=None, marker=None)
     assert len(subs) == 1 and subs[0].kind == "judge"
+
+
+@pytest.mark.asyncio
+async def test_cached_kind_rederived_from_wording(library):
+    """A cached decomposition carries the CLASSIFIER'S old verdict, not an author's
+    declaration: tier 2 re-derives kinds from wording so a classifier fix reaches every
+    already-cached task without --redecompose (the live case: the RTI employee loops sat
+    in the cache as "judge" and kept running as one-shot observations)."""
+    prompt = "go to the section. " + LOOP_OWEN.replace("{{employee}}", "Owen Millar")
+    tid = ss.task_id(prompt)
+    ss.save_decomposition(tid, {
+        "parent_prompt": " ".join(prompt.split()),
+        "source": "llm",
+        "created": "2026-07-27T00:00:00",
+        "subtasks": [
+            {"template_prompt": "go to the section.", "values": {}, "marker": None,
+             "postcondition": None, "kind": "judge", "tab_url": None},
+            {"template_prompt": LOOP_OWEN, "values": {"employee": "Owen Millar"},
+             "marker": None, "postcondition": None, "kind": "judge", "tab_url": None},
+        ],
+    })
+    subs = await decompose.get_decomposition(prompt, llm=None, marker=None)
+    assert [s.kind for s in subs] == ["action", "loop"]
+
+
+@pytest.mark.asyncio
+async def test_spec_declared_kind_still_wins(library):
+    """Tier 1 is author-maintained: an explicit yaml `kind` is a real declaration and is
+    NOT re-derived — only cached (derived) kinds are advisory."""
+    prompt = "go to the archive area. archive the oldest record"
+    spec = TaskSpec(key="k", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the archive area."),
+        SubtaskDecl(prompt="archive the oldest record", kind="judge"),
+    ))
+    subs = await decompose.get_decomposition(prompt, llm=None, spec=spec)
+    assert [s.kind for s in subs] == ["action", "judge"]
+
+
+# ------------------------------- aux-tab subtasks (tab_url) -------------------------------
+
+
+AUX_PROMPT = ("go to Bookkeeping module, search and select 290 CREW LIMITED business "
+              "name. search DuckDuckGo for Acting Office and note the top result")
+AUX_REPLY = json.dumps({"subtasks": [
+    {"template_prompt": "go to Bookkeeping module, search and select {{business}} "
+                        "business name",
+     "values": {"business": "290 CREW LIMITED"}, "is_save_step": False},
+    {"template_prompt": "search DuckDuckGo for {{q}} and note the top result",
+     "values": {"q": "Acting Office"}, "is_save_step": False,
+     "tab_url": "https://duckduckgo.com"},
+]})
+
+
+@pytest.mark.asyncio
+async def test_tab_url_flows_llm_to_subtask_and_cache_roundtrip(library):
+    llm = StubLLM(AUX_REPLY)
+    subs = await decompose.get_decomposition(AUX_PROMPT, llm=llm, marker=None)
+    assert subs[1].tab_url == "https://duckduckgo.com"
+    # "note the ..." wording alone would make a judge node; tab_url keeps it cacheable.
+    assert [s.kind for s in subs] == ["action", "action"]
+    cached = ss.load_decomposition(ss.task_id(AUX_PROMPT))
+    assert cached["subtasks"][1]["tab_url"] == "https://duckduckgo.com"
+    # Tier-2 rebuild from the cache preserves it, zero LLM.
+    again = await decompose.get_decomposition(AUX_PROMPT, llm=None, marker=None)
+    assert again[1].tab_url == "https://duckduckgo.com"
+    assert again[1].kind == "action"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_old_cache_without_tab_url_still_loads(library):
+    """Decompositions cached before the field existed must build unchanged."""
+    data = {"parent_prompt": "do the legacy thing", "source": "llm",
+            "subtasks": [{"template_prompt": "do the legacy thing", "values": {},
+                          "marker": None, "postcondition": None, "kind": "action"}]}
+    ss.save_decomposition(ss.task_id("do the legacy thing"), data)
+    subs = await decompose.get_decomposition("do the legacy thing", llm=None)
+    assert subs[0].tab_url is None and subs[0].kind == "action"
+
+
+@pytest.mark.asyncio
+async def test_derived_match_keeps_tab_url(library):
+    await decompose.get_decomposition(AUX_PROMPT, llm=StubLLM(AUX_REPLY))
+    new_prompt = (AUX_PROMPT.replace("290 CREW LIMITED", "ACME LTD")
+                  .replace("Acting Office", "Best Beans"))
+    subs = await decompose.get_decomposition(new_prompt, llm=None)
+    assert subs[1].values == {"q": "Best Beans"}
+    assert subs[1].tab_url == "https://duckduckgo.com"
+
+
+@pytest.mark.asyncio
+async def test_malformed_tab_url_rejected_then_corrected(library):
+    """A structurally broken tab_url (no scheme) is mechanically rejected with the reason
+    fed back, exactly like a hallucinated value — a garbled URL must never silently run."""
+    prompt = "search DuckDuckGo for the business and note the top result"
+    sub = {"template_prompt": prompt, "values": {}, "is_save_step": False}
+    llm = SeqLLM(json.dumps({"subtasks": [{**sub, "tab_url": "duckduckgo.com"}]}),
+                 json.dumps({"subtasks": [{**sub, "tab_url": "https://duckduckgo.com"}]}))
+    subs = await decompose.get_decomposition(prompt, llm=llm)
+    assert llm.calls == 2
+    assert len(subs) == 1 and subs[0].tab_url == "https://duckduckgo.com"
+    assert "tab_url" in str(llm.seen[1][-1].content)

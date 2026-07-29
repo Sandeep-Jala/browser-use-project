@@ -36,7 +36,13 @@ logger = logging.getLogger("framework.decompose")
 # The token grammar is owned by subtask_store (library identity depends on it) — one
 # definition, so the decomposer and the id normalizer can never drift apart.
 _TOKEN = sstore.TOKEN_RE
-MAX_SUBTASKS = 15
+# Ceiling on a split, to catch a runaway/hallucinated decomposition. Raised 15 -> 24 on
+# 2026-07-27: combined end-to-end chains (a payroll e2e followed by the RTI payrun)
+# legitimately need ~20 nodes, and over the ceiling _validate rejects both LLM attempts and
+# the run degrades to whole_prompt_fallback — one giant node with no per-segment gates.
+# Keep in sync with the "2 to N subtasks" bullet in prompts.DECOMPOSE_SYSTEM_PROMPT: if the
+# prompt states a smaller number the LLM self-limits and raising this constant does nothing.
+MAX_SUBTASKS = 24
 
 # Verification wording that marks a subtask as a JUDGE node: its success is a judgment call
 # (compare/observe values), which does not survive compilation into a selector script — a
@@ -56,22 +62,133 @@ _JUDGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Iteration wording that, COMBINED with a judge phrase, marks a LOOP node instead: an
+# imperative action repeated until a stated stop condition holds ("process employees one
+# at a time ... check that the next employee has loaded ... stopping as soon as X is
+# shown"). "keep"/"continue" count only with a following gerund ("continue clicking"), so
+# verification prose like "values keep their order" never matches.
+_LOOP_CUE_RE = re.compile(
+    r"\b(?:one at a time|at a time|each|until|stopping|(?:keep|continue)\s+\w+ing)\b",
+    re.IGNORECASE,
+)
+
+# A judge phrase that IS the subtask's head directive ("Verify that each filter...", "Then
+# check that entries do not repeat...") keeps the node a judge even when iteration cues
+# appear in WHAT it checks — only a leading imperative action with verification folded
+# inside ("Process ... and after each click check that ...") makes a loop.
+_LEADING_JUDGE_RE = re.compile(
+    r"^\s*(?:(?:and|then|now|next|first|finally|also|please)[,\s]+)*"
+    r"(?:verify|verifies|confirm|ensure|validate|compare|check|make sure|"
+    r"see (?:if|whether|that)|note|remember|capture)\b",
+    re.IGNORECASE,
+)
+
 
 def node_kind(template_prompt: str, marker: str | None,
-              declared: str | None = None) -> str:
-    """Resolve a subtask's node kind: "action" (replayable) or "judge" (cognitive).
+              declared: str | None = None, tab_url: str | None = None) -> str:
+    """Resolve a subtask's node kind: "action" (replayable), "judge" (cognitive), or
+    "loop" (repeat-until: acts like an action, but always live and never cached).
 
     An explicit declaration (spec/cache) wins; a marker-owning subtask is ALWAYS action —
     its network gate is machine ground truth, so caching it is safe regardless of wording;
-    otherwise verification wording makes it a judge node. A false positive here only costs
-    caching (the segment authors every run); a false negative would cost correctness
-    (hollow replay), so the wording net is cast deliberately wide.
+    an aux-tab subtask (tab_url) is action too: its wording is usually observational
+    ("note the top result"), but its replay is not hollow — the compiled extract step
+    re-reads the live DOM every run, so the observation stays fresh without the LLM;
+    otherwise verification wording makes it a judge node — unless iteration cues say the
+    verification is folded INTO a repeated action ("Save & Next ... check that ... until X
+    is shown"): that is a loop node. A loop must ACT (observation framing made the agent
+    declare the loop done after one iteration), yet can never be cached: the iteration
+    count is live page state, so a replayed loop would walk a fixed number of steps and
+    land anywhere. A false positive here only costs caching (the segment authors every
+    run); a false negative would cost correctness (hollow replay), so the wording net is
+    cast deliberately wide.
     """
-    if declared in ("action", "judge"):
+    if declared in ("action", "judge", "loop"):
         return declared
-    if marker:
+    if marker or tab_url:
         return "action"
-    return "judge" if _JUDGE_RE.search(template_prompt) else "action"
+    if not _JUDGE_RE.search(template_prompt):
+        return "action"
+    if _LOOP_CUE_RE.search(template_prompt) \
+            and not _LEADING_JUDGE_RE.match(template_prompt):
+        return "loop"
+    return "judge"
+
+
+# Wording that CONSUMES data noted by an EARLIER subtask ("using the noted generated name
+# and address"). Such values exist only at run time, so a cached recording can only carry
+# the AUTHORING run's concrete ones (adapt.parameterize lifts only values the prompt spells
+# out) — replaying it types stale data into the app, and a marker gate would even bless the
+# save. The net is consumer-shaped on purpose: PRODUCER wording ("note the generated
+# identity; remember Name and Address") must NOT match, or the extract segments it labels
+# would lose their zero-LLM replay (replayed extracts re-read the live DOM — never stale).
+_NOTED_DATA_RE = re.compile(
+    # Determiner + participle: "the noted name", "these remembered values" — participles
+    # that unambiguously mean run-noted data. "generated"/"recorded"/"saved" are excluded
+    # here: "the generated identity" appears inside producer wording and "the recorded
+    # payment" is app-domain vocabulary.
+    r"\b(?:the|that|those|these|its|their)\s+"
+    r"(?:noted|remembered|captured|extracted|observed)\b"
+    # Usage word + determiner + participle: the ambiguous participles count only when the
+    # phrase says the data is being USED ("with the generated name", "enter the saved id").
+    r"|\b(?:using|use|with|from|for|enter|fill|add|type|paste|search)\s+"
+    r"(?:the|that|those|these)\s+"
+    r"(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)\b"
+    # Participle + back-reference adverb: "the name generated earlier", "values noted above".
+    r"|\b(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)\s+"
+    r"(?:earlier|previously|above|before)\b"
+    # Explicit cross-segment reference: "the title from the previous step/tab/search".
+    r"|\bfrom\s+the\s+(?:previous|prior|earlier|last)\s+"
+    r"(?:step|subtask|tab|page|site|search|result)s?\b"
+    # Relative-clause reference to a record an earlier segment made: "the employee which
+    # we added", "the request that was created" — its NAME/identity exists only at run
+    # time, so a cached pick can never carry it (observed live: the parameterizer bound
+    # the employee pick to the word "download", the only verbatim-checkable token left).
+    r"|\b(?:which|that|whom?)\s+(?:we|you|i|was|were)\s+(?:just\s+)?"
+    r"(?:added|created|generated|made|noted|saved)\b"
+    r"|\b(?:newly|just)[\s-](?:added|created|generated)\b",
+    re.IGNORECASE,
+)
+
+
+# Wording whose deliverable is a FILE DOWNLOAD ("select download, select PDF", "export to
+# Excel"). Such a subtask gets the authoritative download GATE (hybrid.segment_gate): the
+# segment passed iff a file actually arrived in its window — the click that triggers a
+# download reports a watchdog TIMEOUT on every honest success, so neither the agent's
+# self-report nor the steps floor can be trusted in either direction.
+_DOWNLOAD_RE = re.compile(r"\b(download|export)\b", re.IGNORECASE)
+
+
+def downloads_file(template_prompt: str) -> bool:
+    """True when the subtask's wording says it downloads/exports a file."""
+    return bool(_DOWNLOAD_RE.search(template_prompt))
+
+
+def consumes_noted_data(template_prompt: str) -> bool:
+    """True when the subtask's wording says it USES data noted by an earlier subtask.
+
+    The hybrid loop combines this with "did an earlier segment actually record findings
+    this run" to conclude that a library replay would type stale values: the segment then
+    runs with the agent (which receives the fresh observations) and is never committed.
+    Matched on the TEMPLATE prompt — the reference wording is procedure, not a value, so
+    the decomposer keeps it literal there.
+    """
+    return bool(_NOTED_DATA_RE.search(template_prompt))
+
+
+# Wording that opens with a conditional guard ("If you see an error ..., click Add
+# Payment"): whether its actions run AT ALL depends on live page state. A recording made
+# on a run where the guard was TRUE would replay the branch unconditionally on every run
+# (the FALSE branch already refuses commit via the zero-step compile rule), so hybrid runs
+# these with the agent and never commits them. Leading-"If" only: an embedded conditional
+# ("go to Payroll & RTI ... If a pop up appears, dismiss it") is a footnote to an
+# unconditional procedure, and stays cacheable.
+_CONDITIONAL_RE = re.compile(r"^\s*(?:(?:and|then|now)[,\s]+)*if\b", re.IGNORECASE)
+
+
+def is_conditional_guard(template_prompt: str) -> bool:
+    """True when the subtask's wording is a conditional branch guard (leading "If ...")."""
+    return bool(_CONDITIONAL_RE.match(template_prompt))
 
 
 @dataclass
@@ -83,8 +200,12 @@ class Subtask:
     values: dict[str, str] = field(default_factory=dict)
     marker: str | None = None            # set on the save-owning subtask only
     postcondition: dict[str, Any] | None = None
+    # Run this subtask in a separate helper tab opened at this URL (same browser context).
+    # The tab closes when the subtask ends; the main app page is never navigated.
+    tab_url: str | None = None
     # "action" (replayable from the library) | "judge" (cognitive: always LLM, never
-    # cached — see node_kind). Assigned by _build_subtasks after markers are settled.
+    # cached) | "loop" (repeat-until: action framing, always LLM, never cached — see
+    # node_kind). Assigned by _build_subtasks after markers are settled.
     kind: str = "action"
 
     @property
@@ -99,13 +220,37 @@ def _tokens_of(template_prompt: str) -> set[str]:
     return set(_TOKEN.findall(template_prompt))
 
 
-def _build_subtasks(raw: list[dict[str, Any]], marker: str | None) -> list[Subtask]:
+# A subtask that says to open a NEW TAB at an absolute URL is an aux-tab subtask, whether or
+# not the LLM remembered to emit "tab_url". Left unset, the helper-tab machinery never engages
+# and the agent navigates the APP page to that site — the one thing aux tabs exist to prevent
+# (there is no navigate-back subtask, so every later subtask runs on the wrong page). Keyed on
+# explicit new-tab wording so in-app deep links ("navigate directly to <app url>", "come back
+# to <app url>") are left alone.
+_NEW_TAB_RE = re.compile(r"\b(?:new|another|separate)\s+tab\b", re.I)
+_ABS_URL_RE = re.compile(r"https?://[^\s,;)'\"]+", re.I)
+
+
+def _implied_tab_url(template_prompt: str) -> str | None:
+    if not _NEW_TAB_RE.search(template_prompt):
+        return None
+    for candidate in _ABS_URL_RE.findall(template_prompt):
+        url = candidate.rstrip(".,;:")
+        if sstore.is_absolute_http_url(url):
+            return url
+    return None
+
+
+def _build_subtasks(raw: list[dict[str, Any]], marker: str | None,
+                    trust_kind: bool = True) -> list[Subtask]:
     """Materialize Subtasks from cache/spec/LLM dicts, assign the save-owning marker, and
-    settle each node's kind (action/judge — see node_kind).
+    settle each node's kind (action/judge/loop — see node_kind).
 
     Exactly one subtask owns the parent marker: an explicitly-declared one wins, else the
     last subtask (the save is the final act of a create flow). Kinds are resolved AFTER
-    markers so the save-owning subtask can never be classified as a judge node.
+    markers so the save-owning subtask can never be classified as a judge node. With
+    `trust_kind=False` a stored "kind" is advisory only and is re-derived from wording:
+    cached decompositions carry the CLASSIFIER'S old verdict, and re-deriving is what lets
+    a classifier fix reach every already-cached task without --redecompose.
     """
     subs = [
         Subtask(
@@ -114,13 +259,20 @@ def _build_subtasks(raw: list[dict[str, Any]], marker: str | None) -> list[Subta
             values={str(k): str(v) for k, v in (d.get("values") or {}).items()},
             marker=d.get("marker"),
             postcondition=d.get("postcondition"),
+            tab_url=d.get("tab_url"),
         )
         for i, d in enumerate(raw)
     ]
     if marker and not any(s.marker for s in subs):
         subs[-1].marker = marker
+    for s in subs:
+        if not s.tab_url and (implied := _implied_tab_url(s.template_prompt)):
+            logger.info("subtask %d: deriving tab_url %s from its new-tab wording", s.index,
+                        implied)
+            s.tab_url = implied
     for s, d in zip(subs, raw):
-        s.kind = node_kind(s.template_prompt, s.marker, d.get("kind"))
+        s.kind = node_kind(s.template_prompt, s.marker,
+                           d.get("kind") if trust_kind else None, s.tab_url)
     return subs
 
 
@@ -131,7 +283,8 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
         "created": datetime.now().isoformat(timespec="seconds"),
         "subtasks": [
             {"template_prompt": s.template_prompt, "values": s.values,
-             "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind}
+             "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind,
+             "tab_url": s.tab_url}
             for s in subs
         ],
     }
@@ -164,7 +317,59 @@ def _validate(raw: list[Any], prompt: str) -> str | None:
             if str(value).lower() not in prompt_lower:
                 return (f"subtask {i}: value {value!r} for {{{{{name}}}}} does not appear "
                         f"in the task prompt (hallucination guard)")
+        tab_url = d.get("tab_url")
+        if tab_url is not None and not sstore.is_absolute_http_url(tab_url):
+            # An invented/garbled helper-tab URL must never silently run.
+            return f"subtask {i}: tab_url {tab_url!r} is not an absolute http(s) URL"
     return None
+
+
+# A dropped span this long is a lost instruction, not a reworded connective. DECOMPOSE_SYSTEM_
+# PROMPT already forbids dropping ("Substituting every subtask's values back into its
+# template_prompt must reproduce the task's original wording ... Do not reword, add, or drop
+# actions"), but every OTHER rule there is also enforced mechanically by _validate — this one
+# was not, so a silently dropped clause reached the run. Observed live: "NI number should be AB
+# followed by a random 6 digit number and end with C" vanished from the add-employee subtask
+# because a GENERATIVE instruction is neither a literal value (the hallucination guard bars
+# tokenizing it) nor a button label, so the LLM simply omitted it and the employee would have
+# saved with a blank NI number.
+_MIN_DROPPED_SPAN = 5
+
+
+def _coverage_words(text: str) -> list[str]:
+    """Normalized word sequence used for the drop check — punctuation is noise here."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).split()
+
+
+def coverage_gap(raw: list[dict[str, Any]], prompt: str) -> str | None:
+    """The longest run of parent-prompt wording that no subtask covers, or None.
+
+    Matching is by BIGRAM, not by word: individual words ("number", "date", "end") recur all
+    over a task prompt and a bag-of-words check would call a dropped clause covered by its
+    own vocabulary appearing elsewhere.
+    """
+    covered = set()
+    for d in raw:
+        template = str(d.get("template_prompt", ""))
+        for name, value in (d.get("values") or {}).items():
+            template = template.replace("{{%s}}" % name, str(value))
+        words = _coverage_words(template)
+        covered.update(zip(words, words[1:]))
+
+    words = _coverage_words(prompt)
+    run: list[str] = []
+    worst: list[str] = []
+    for first, second in zip(words, words[1:]):
+        if (first, second) in covered:
+            run = []
+            continue
+        run.append(first if not run else second)
+        if len(run) > len(worst):
+            worst = list(run)
+    if len(worst) < _MIN_DROPPED_SPAN:
+        return None
+    return (f"dropped wording from the task: {' '.join(worst)!r} appears in no subtask. "
+            "Every instruction in the task must survive into exactly one subtask")
 
 
 def whole_prompt_fallback(prompt: str, marker: str | None) -> list[Subtask]:
@@ -227,12 +432,17 @@ def match_cached_decomposition(prompt: str) -> dict[str, Any] | None:
 
 
 async def _llm_decompose(
-    prompt: str, llm: Any, feedback: str | None = None,
+    prompt: str, llm: Any, feedback: str | None = None, strict_coverage: bool = True,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """One DECOMPOSE_SYSTEM_PROMPT call -> (validated raw subtask dicts, rejection reason).
 
     `feedback` is the rejection reason from the previous attempt, folded into the user
     message so the retry corrects that specific mistake — a blind resample repeats it.
+
+    `strict_coverage` rejects a split that drops task wording. It is OFF on the final attempt
+    on purpose: a structurally sound split missing one clause still runs the task far better
+    than the whole-prompt fallback that a rejection would leave us with, so the gap is logged
+    and kept rather than traded for one giant node.
     """
     user = f"Split this task:\n\n{prompt}"
     if feedback:
@@ -252,6 +462,13 @@ async def _llm_decompose(
     if problem:
         logger.warning("LLM decomposition rejected: %s", problem)
         return None, problem
+    gap = coverage_gap(raw, prompt)
+    if gap:
+        if strict_coverage:
+            logger.warning("LLM decomposition rejected: %s", gap)
+            return None, gap
+        logger.error("decomposition KEPT despite dropped wording (%s) — the subtask that "
+                     "should carry it will run without that instruction", gap)
     # Translate is_save_step into a marker slot (the caller substitutes the real marker).
     out: list[dict[str, Any]] = []
     for d in raw:
@@ -259,6 +476,7 @@ async def _llm_decompose(
             "template_prompt": " ".join(str(d["template_prompt"]).split()),
             "values": {str(k): str(v) for k, v in (d.get("values") or {}).items()},
             "is_save_step": bool(d.get("is_save_step")),
+            "tab_url": d.get("tab_url"),
         })
     return out, None
 
@@ -287,7 +505,7 @@ async def get_decomposition(
         raw = [
             {"template_prompt": d.prompt, "values": dict(d.values or {}),
              "marker": d.marker, "postcondition": d.postcondition,
-             "kind": getattr(d, "kind", None)}
+             "kind": getattr(d, "kind", None), "tab_url": getattr(d, "tab_url", None)}
             for d in declared
         ]
         problem = _validate(raw, prompt)
@@ -304,7 +522,7 @@ async def get_decomposition(
     if not redecompose:
         cached = sstore.load_decomposition(tid)
         if cached:
-            return _build_subtasks(cached["subtasks"], marker)
+            return _build_subtasks(cached["subtasks"], marker, trust_kind=False)
 
         # Tier 3: derived from a cached decomposition of the same prompt shape.
         derived = match_cached_decomposition(prompt)
@@ -312,15 +530,21 @@ async def get_decomposition(
             problem = _validate(derived["subtasks"], prompt)
             if problem is None:
                 sstore.save_decomposition(tid, derived)
-                return _build_subtasks(derived["subtasks"], marker)
+                return _build_subtasks(derived["subtasks"], marker, trust_kind=False)
             logger.warning("derived decomposition invalid (%s); falling through", problem)
 
-    # Tier 4: LLM, once per novel prompt shape (one retry, with the rejection fed back).
+    # Tier 4: LLM, once per novel prompt shape (retries feed the rejection reason back).
+    # Three attempts, not two: a long chain typically burns one on a structural rejection
+    # (token closure), which used to leave the dropped-wording check no retry to spend — the
+    # gap was then only reported, never corrected. The last attempt is coverage-advisory, so
+    # the extra attempt costs tokens only on prompts that are already failing.
     if llm is not None:
         problem: str | None = None
-        for attempt in (1, 2):
+        attempts = 3
+        for attempt in range(1, attempts + 1):
             try:
-                raw, problem = await _llm_decompose(prompt, llm, feedback=problem)
+                raw, problem = await _llm_decompose(prompt, llm, feedback=problem,
+                                                    strict_coverage=(attempt < attempts))
             except Exception as exc:  # noqa: BLE001 - decomposition must never crash a run
                 logger.warning("LLM decomposition attempt %d failed: %s", attempt, exc)
                 raw = None  # a transport error carries no feedback; keep any prior reason

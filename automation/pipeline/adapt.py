@@ -97,9 +97,12 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for i, step in enumerate(steps):
-        if step.get("action") not in ("fill", "type", "find_click"):
+        if step.get("action") not in ("fill", "select", "type", "find_click", "upload"):
             continue
-        value = str(step.get("value") if step.get("action") == "fill"
+        # An upload step's `value` is the file's BASENAME (compile drops the folder —
+        # files.UPLOADS_DIR is implied), which is exactly the string the prompt spells,
+        # so the standard verbatim-in-prompt lift rule applies.
+        value = str(step.get("value") if step.get("action") in ("fill", "select", "upload")
                     else step.get("text") or "").strip()
         if not value:
             continue
@@ -336,12 +339,32 @@ def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[s
             new_step["value"] = _sub(new_step["value"], escape=False)
         if isinstance(new_step.get("text"), str):
             new_step["text"] = _sub(new_step["text"], escape=False)
+            if new_step.get("action") == "find_click" and _TOKEN.search(step["text"]):
+                # The click's text IS an instantiated value: the semantic replay must
+                # refuse a wrong-named best match (see _find_click verify_name).
+                new_step["verify_name"] = True
+        if isinstance(new_step.get("expect_text"), str):
+            # A compile-time landed-name guard the parameterizer may have tokenized;
+            # raw value — it is compared against rendered text, not used as a selector.
+            new_step["expect_text"] = _sub(new_step["expect_text"], escape=False)
         if new_step.get("selectors"):
+            token_names = {m.group(1) for s in step.get("selectors") or []
+                           for m in _TOKEN.finditer(s)}
             new_step["selectors"] = [_sub(s, escape=True) for s in new_step["selectors"]]
+            if new_step.get("action") == "click" and len(token_names) == 1:
+                (name,) = token_names
+                if name in merged:
+                    # This click means "the element NAMED <value>" — selector fallbacks
+                    # (positional xpaths, stale hrefs) resolve confidently to the WRONG
+                    # row when the value changed (observed live: business FOOD LIMITED
+                    # clicked FUNFOOD LIMITED). _resolve verifies every acted-on
+                    # candidate against this value.
+                    new_step["expect_text"] = merged[name]
         steps.append(new_step)
 
     for step in steps:
-        leftovers = ([str(step.get("value", "")), str(step.get("text", ""))]
+        leftovers = ([str(step.get("value", "")), str(step.get("text", "")),
+                      str(step.get("expect_text", ""))]
                      + list(step.get("selectors") or []))
         if any(_TOKEN.search(text) for text in leftovers):
             logger.warning("unresolved template tokens in step %r; refusing to instantiate", step)

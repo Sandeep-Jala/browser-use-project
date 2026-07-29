@@ -50,6 +50,22 @@ def test_transpile_parameterized_template():
     assert lint_code(code) == []
 
 
+def test_upload_step_transpiles_and_parameterizes():
+    from automation.skills.codegen import lint_code, transpile
+
+    steps = [{"action": "upload", "selectors": ['css=[id="zone"]'],
+              "fingerprint": {"tag": "div"}, "hidden_ok": True, "value": "{{file}}"}]
+    code, anchors = transpile("s", steps, params={"file": "list.csv"})
+    assert "await api.upload(" in code and ", file)" in code
+    assert lint_code(code) == []
+    (_handle, anchor), = anchors.items()
+    assert anchor["hidden_ok"] is True
+
+    # Unparameterized value stays a literal.
+    code, _ = transpile("s", [{**steps[0], "value": "raw.csv"}])
+    assert "'raw.csv')" in code
+
+
 def test_select_pair_collapses_to_select_option():
     steps = [
         {"action": "type", "text": "{{customer}}"},

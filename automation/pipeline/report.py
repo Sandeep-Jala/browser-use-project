@@ -238,6 +238,9 @@ def _render_html(result: "RunResult") -> str:
     # ---- Agent steps (per-step progress timeline) ----
     p.append(_render_steps(result.steps, result.model_actions, result.n_steps))
 
+    # ---- Run video (--record) ----
+    p.append(_render_video(result))
+
     # ---- Screenshots gallery ----
     p.append(_render_screenshots(result.screenshots))
 
@@ -564,6 +567,26 @@ def _render_steps(
         p.append("<div class='result-box muted'>No steps recorded.</div>")
     p.append("</div>")
     return "".join(p)
+
+
+def _render_video(result: "RunResult") -> str:
+    """Player for the run's .mp4 (--record), or "" when the run wasn't recorded.
+
+    Referenced RELATIVELY: report.html and run.mp4 are written to the same run directory,
+    so the page stays portable if the folder is copied or zipped."""
+    video = (result.artifacts or {}).get("video")
+    if not video or not Path(video).exists():
+        return ""
+    return (
+        "<div class='section'><div class='section-title'>"
+        "<span class='material-icons' style='color:var(--primary)'>movie</span>"
+        " Run Recording <span class='muted' style='font-weight:400; font-size:0.85rem'>"
+        "(time-lapse — the browser emits frames only when the page changes, so waits "
+        "between steps are skipped)</span></div>"
+        f"<video src='{_esc(Path(video).name)}' controls preload='metadata' "
+        "style='width:100%; max-width:1100px; border-radius:8px; background:#000'>"
+        "</video></div>"
+    )
 
 
 def _render_screenshots(screenshots: list[str | None]) -> str:

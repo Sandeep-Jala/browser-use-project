@@ -208,6 +208,7 @@ dependencies = [
     { name = "browser-use" },
     { name = "fastembed" },
     { name = "groq" },
+    { name = "imageio", extra = ["ffmpeg"] },
     { name = "playwright" },
     { name = "psutil" },
     { name = "python-dotenv" },
@@ -222,9 +223,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "browser-use", specifier = "==0.13.3" },
+    { name = "browser-use", specifier = "==0.13.6" },
     { name = "fastembed", specifier = ">=0.8.0" },
     { name = "groq", specifier = ">=1.0.0" },
+    { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.2" },
     { name = "playwright", specifier = ">=1.60.0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
@@ -261,7 +263,7 @@ wheels = [
 
 [[package]]
 name = "browser-harness"
-version = "0.1.4"
+version = "0.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cdp-use" },
@@ -269,14 +271,14 @@ dependencies = [
     { name = "pillow" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/96/a50549ee42ee79cb2de718cecbc162cd710c6bb4cd680bedb014c2983ca9/browser_harness-0.1.4.tar.gz", hash = "sha256:667779be7ba7e19f676f0cf93653f28f340ef69fa66f73b56aab129cd1c3d13f", size = 44244, upload-time = "2026-07-01T13:25:21.967Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/bc/a3aefcad0df4450f560969f64a1fab86d1b3cf0e1ec66ce3bd55aa63ece3/browser_harness-0.1.6.tar.gz", hash = "sha256:90c0c019e0bc0a1f189da28592abf4e7b4e3ebfb0d530ea173c0432829dba882", size = 94229, upload-time = "2026-07-17T05:03:31.632Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/0b/776a76d5814725db50bc4588c51b0d21c3ada177ae037b031964c93a96eb/browser_harness-0.1.4-py3-none-any.whl", hash = "sha256:e42d777db5c8b48966dbf4b14aa46e1b400294b8ce229eb17abd6989542c7fbd", size = 47223, upload-time = "2026-07-01T13:25:20.689Z" },
+    { url = "https://files.pythonhosted.org/packages/24/d5/78013b7229843880d7f18945022662793eb00daeec2e5d2ea62687bc00c9/browser_harness-0.1.6-py3-none-any.whl", hash = "sha256:65d92ac05b71b5702ab734a389d4142dd749eb1f005d71792106c5da8e8eddca", size = 99498, upload-time = "2026-07-17T05:03:30.142Z" },
 ]
 
 [[package]]
 name = "browser-use"
-version = "0.13.3"
+version = "0.13.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -316,9 +318,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uuid7" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/dd/c4f16a3a7f4cf4607b6736960d2174eefa82b9e05124b1ce25f34c8424b3/browser_use-0.13.3.tar.gz", hash = "sha256:b88b677b2234d1c7601f6e05c84fb5767723bf4c5ec4ed12ab1b880ed8221811", size = 603390, upload-time = "2026-07-02T00:27:51.959Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/d0/2ca49275bad774bd32bfb18c126e3158fc8e6d6a92239e9b0013d53ac220/browser_use-0.13.6.tar.gz", hash = "sha256:a631740b6feb42fe84544c95166e15342569329dbad31691fac8d5cd56a70a83", size = 610208, upload-time = "2026-07-17T05:32:00.429Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/56/9f65b86b2be2e11c08bb6b9d357afb15f84625206b239c437071dbb190e2/browser_use-0.13.3-py3-none-any.whl", hash = "sha256:0756dd726837fa7c0f0aa02eae2c47a93c3d02ef7dba980c8dae9077d8a0157d", size = 706997, upload-time = "2026-07-02T00:27:50.623Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/ab/c9cad020e4394c124bef008b38484f1fec626f8317b541991b47f19df638/browser_use-0.13.6-py3-none-any.whl", hash = "sha256:dc284a6130d56368a0a2fa6d6d6d467296e61b3ec165b6b290aecc5ca19b4a9c", size = 714684, upload-time = "2026-07-17T05:31:58.713Z" },
 ]
 
 [[package]]
@@ -1126,6 +1128,40 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cd/63/9496c57188a2ee585e0f1db071d75089a11e98aa86eb99d9d7618fc1edce/idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848", size = 196711, upload-time = "2026-06-02T14:34:07.794Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/5e/d4e9f1a599fb8e573b7b87160658329fbf28d19eac2718f51fc3def3aa5a/idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2", size = 65455, upload-time = "2026-06-02T14:34:06.319Z" },
+]
+
+[[package]]
+name = "imageio"
+version = "2.37.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/62/aa770a9307508d2a2a2c62d536a49347bffe9e55322db27838d3c93d0b07/imageio-2.37.4.tar.gz", hash = "sha256:e45cbc5e83502047fb138f7f585f7f105a136a57eea5f4b3cfc6ce1b52720bd3", size = 390173, upload-time = "2026-07-20T05:26:11.369Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/2d/ca050652104bab2cf55e569db2a178b1b61cb041fef28307f2db383f6d9f/imageio-2.37.4-py3-none-any.whl", hash = "sha256:1ab2e22c8debf700f24c3ac43e8f95f3b3a8110c83b93411e97b4b0b2cd1c7e6", size = 318000, upload-time = "2026-07-20T05:26:09.874Z" },
+]
+
+[package.optional-dependencies]
+ffmpeg = [
+    { name = "imageio-ffmpeg" },
+    { name = "psutil" },
+]
+
+[[package]]
+name = "imageio-ffmpeg"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/bd/c3343c721f2a1b0c9fc71c1aebf1966a3b7f08c2eea8ed5437a2865611d6/imageio_ffmpeg-0.6.0.tar.gz", hash = "sha256:e2556bed8e005564a9f925bb7afa4002d82770d6b08825078b7697ab88ba1755", size = 25210, upload-time = "2025-01-16T21:34:32.747Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/58/87ef68ac83f4c7690961bce288fd8e382bc5f1513860fc7f90a9c1c1c6bf/imageio_ffmpeg-0.6.0-py3-none-macosx_10_9_intel.macosx_10_9_x86_64.whl", hash = "sha256:9d2baaf867088508d4a3458e61eeb30e945c4ad8016025545f66c4b5aaef0a61", size = 24932969, upload-time = "2025-01-16T21:34:20.464Z" },
+    { url = "https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:b1ae3173414b5fc5f538a726c4e48ea97edc0d2cdc11f103afee655c463fa742", size = 21113891, upload-time = "2025-01-16T21:34:00.277Z" },
+    { url = "https://files.pythonhosted.org/packages/33/e7/1925bfbc563c39c1d2e82501d8372734a5c725e53ac3b31b4c2d081e895b/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc", size = 25632706, upload-time = "2025-01-16T21:33:53.475Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282", size = 29498237, upload-time = "2025-01-16T21:34:13.726Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/13/59da54728351883c3c1d9fca1710ab8eee82c7beba585df8f25ca925f08f/imageio_ffmpeg-0.6.0-py3-none-win32.whl", hash = "sha256:196faa79366b4a82f95c0f4053191d2013f4714a715780f0ad2a68ff37483cc2", size = 19652251, upload-time = "2025-01-16T21:34:06.812Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl", hash = "sha256:02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a", size = 31246824, upload-time = "2025-01-16T21:34:28.6Z" },
 ]
 
 [[package]]

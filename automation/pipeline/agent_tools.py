@@ -1,6 +1,6 @@
 """Custom agent tools the prompts rely on, registered on a browser-use ``Tools`` registry.
 
-The system/expander prompts (see prompts.py) instruct the agent to call seven actions that are
+The system/expander prompts (see prompts.py) instruct the agent to call custom actions that are
 NOT part of browser-use's built-in set:
 
   * skip_step(reason)          — escape hatch: abandon the current objective, keep going.
@@ -8,6 +8,10 @@ NOT part of browser-use's built-in set:
   * capped_scroll(down, pages) — discovery scroll capped at 0.5 pages per call.
   * find_by_text(text)         — find interactive elements by label in a FRESH snapshot,
                                  returning their current click indexes (optionally clicking).
+  * extract_data(text, label)  — capture a piece of on-page data by a REPLAYABLE locator:
+                                 the value is returned to the agent now AND recorded so a
+                                 compiled `extract` step re-reads it fresh on every replay
+                                 (aux-tab subtasks fetching live data depend on this).
   * list_actions(near_text)    — list clickable controls near a heading/row, decoding the
                                  nameless icon buttons (Fluent/SVG) browser-use renders blank.
   * verify_save_registered()   — ground truth for saves: did a create-write actually hit the
@@ -57,8 +61,10 @@ from browser_use.tools.views import InputTextAction
 
 from automation.pipeline.script_compile import (
     RAW_FIND_JS as _RAW_FIND_JS,
+    RAW_TEXT_FIND_JS as _RAW_TEXT_FIND_JS,
     REVEAL_CSS_JS as _REVEAL_CSS_JS,
     _RS_FILTER_ID,
+    value_took as _value_took,
 )
 
 logger = logging.getLogger("framework.tools")
@@ -171,6 +177,35 @@ def _norm_phrase(s: str) -> str:
     comparing a clicked element's name against the query that found it (and the same
     normalization RAW_FIND_JS ranks candidates with)."""
     return " ".join(t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t)
+
+
+def _matching_nodes(state: Any, tokens: list[str]) -> list[tuple[int, Any, str]]:
+    """The token match over the interactive snapshot: (index, node, label) for every
+    element whose visible text / attributes / descendant icon hints contain ALL tokens.
+    Shared by find_by_text and extract_data so both tools locate elements identically."""
+    matches: list[tuple[int, Any, str]] = []
+    for idx, node in sorted(state.dom_state.selector_map.items()):
+        try:
+            label = " ".join(node.get_all_children_text(max_depth=5).split())[:300]
+            haystack = label.lower()
+            for attr in ("aria-label", "title", "placeholder", "value", "alt", "name", "id"):
+                val = (node.attributes or {}).get(attr) or ""
+                if val:
+                    haystack += " " + val.lower()
+                    if not label and attr not in ("id", "name"):
+                        label = val
+            # Icon buttons carry their meaning in a child glyph browser-use drops; fold
+            # the child hints in so a nameless <button/> becomes matchable/visible.
+            hints = _descendant_icon_hints(node)
+            if hints:
+                haystack += " " + hints.lower()
+                if not label:
+                    label = hints
+            if all(t in haystack for t in tokens):
+                matches.append((idx, node, label))
+        except Exception:  # noqa: BLE001 - skip malformed nodes, keep scanning
+            continue
+    return matches
 
 
 def _hidden_click_receipt(query: str, clicked_name: str) -> str:
@@ -390,6 +425,111 @@ def _is_dropdown_filter(node: Any) -> bool:
     return (attrs.get("aria-autocomplete") or "").strip().lower() not in ("", "none")
 
 
+# ------------------------------- stubborn-field fills -------------------------------
+# browser-use clears a field by assigning `this.value = ""` from JS. React's value tracker
+# wraps the value property on the ELEMENT INSTANCE, so that assignment updates the tracker's
+# last-known value along with the DOM: the `input` event dispatched right after looks like a
+# no-op, React skips the change, and its state still holds the OLD value — which it paints
+# back over whatever we type next. The field then "won't clear", or the old figure returns
+# the moment the row re-renders (the pay-forecast amount cells fail exactly this way).
+#
+# So we clear the way a user does, with real key events no framework can miss: focus,
+# select-all, Delete, then End + Backspace-per-character for fields that refuse a selection.
+# Select-all goes out as the `selectAll` EDITING COMMAND rather than a Ctrl+A/Cmd+A chord so
+# it lands the same on every platform. browser-use already types char-by-char with real key
+# events, so with the JS clear out of the way the whole fill is keyboard-only.
+#
+# Every fill is then READ BACK and repaired if the field didn't take: this is the capacity
+# the agent was missing, and it is why no prompt should ever have to explain "use backspace".
+
+# Clear+retype rounds attempted when a fill reads back wrong before we report the mismatch.
+_FILL_REPAIR_ROUNDS = 2
+
+
+async def _field_handle(browser_session: BrowserSession | None, node: Any):
+    """(cdp_session, object_id) for `node`'s live DOM element, or None if it can't be
+    resolved — every caller degrades to browser-use's own behaviour on None."""
+    backend_id = getattr(node, "backend_node_id", None)
+    if browser_session is None or backend_id is None:
+        return None
+    try:
+        cdp_session = await browser_session.get_or_create_cdp_session()
+        resolved = await cdp_session.cdp_client.send.DOM.resolveNode(
+            params={"backendNodeId": backend_id}, session_id=cdp_session.session_id)
+        object_id = ((resolved or {}).get("object") or {}).get("objectId")
+    except Exception as exc:  # noqa: BLE001 - best-effort; the normal fill path still runs
+        logger.debug("could not resolve field object id: %s", exc)
+        return None
+    return (cdp_session, object_id) if object_id else None
+
+
+async def _call_on_field(handle, declaration: str, args: list | None = None):
+    """Run `declaration` with the field as `this` and return its by-value result."""
+    cdp_session, object_id = handle
+    result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+        params={"objectId": object_id, "functionDeclaration": declaration,
+                "arguments": [{"value": a} for a in (args or [])], "returnByValue": True},
+        session_id=cdp_session.session_id)
+    return (result.get("result") or {}).get("value")
+
+
+async def _field_value(handle) -> str | None:
+    """The field's current value (textContent for contenteditable), or None when it can't
+    be read — a re-rendered node leaves a stale object id, and reporting that as "" would
+    look exactly like a field that refused our text. Callers skip verification on None."""
+    try:
+        value = await _call_on_field(
+            handle, "function(){ return this.value !== undefined ? this.value "
+                    ": (this.textContent || ''); }")
+    except Exception as exc:  # noqa: BLE001 - a readback failure must not fail the fill
+        logger.debug("field readback failed (node likely re-rendered): %s", exc)
+        return None
+    return "" if value is None else str(value)
+
+
+async def _press(handle, key: str, code: str, vk: int, *,
+                 commands: list[str] | None = None, repeat: int = 1) -> None:
+    """Dispatch `repeat` real keyDown/keyUp pairs at the focused element."""
+    cdp_session, _ = handle
+    down: dict[str, Any] = {"type": "keyDown", "key": key, "code": code,
+                            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    if commands:
+        down["commands"] = commands
+    up = {"type": "keyUp", "key": key, "code": code,
+          "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    for _ in range(repeat):
+        await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+            params=down, session_id=cdp_session.session_id)
+        await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+            params=up, session_id=cdp_session.session_id)
+
+
+async def _keyboard_clear(handle) -> bool:
+    """Empty the field with real keystrokes. True once a readback shows it empty."""
+    try:
+        await _call_on_field(handle, "function(){ this.focus(); return true; }")
+        current = await _field_value(handle)
+        if current is None:
+            return False  # unreadable: let browser-use's own clear have its turn
+        if not current:
+            return True
+        # Select-all as an editing command (platform-independent), then Delete.
+        await _press(handle, "a", "KeyA", 65, commands=["selectAll"])
+        await _press(handle, "Delete", "Delete", 46)
+        after_delete = await _field_value(handle)
+        if not after_delete:
+            return after_delete is not None
+        # Fields that drop the selection: walk back from the end, one Backspace per
+        # character (+ slack for anything the page re-inserted while we typed).
+        logger.debug("select-all clear left %r; falling back to Backspace", after_delete)
+        await _press(handle, "End", "End", 35)
+        await _press(handle, "Backspace", "Backspace", 8, repeat=len(after_delete) + 4)
+        return await _field_value(handle) == ""
+    except Exception as exc:  # noqa: BLE001 - caller falls back to the JS clear
+        logger.debug("keyboard clear failed: %s", exc)
+        return False
+
+
 def build_tools() -> Tools:
     """Return a browser-use `Tools` registry with our custom actions added, `evaluate`
     removed (JS form-fills are unrecordable — see module docstring), and the built-in
@@ -414,11 +554,39 @@ def build_tools() -> Tools:
             logger.warning("⚠️ %s", msg)
             return ActionResult(extracted_content=msg)
         dropdown = _is_dropdown_filter(node)
+        # Clear with real keystrokes ourselves when we can reach the element, and hand
+        # browser-use clear=False so its JS `value = ""` (invisible to React — see the
+        # stubborn-field notes above) never runs. `params.clear` is left untouched: the
+        # compiler reads it to decide whether the replayed fill clears too.
+        handle = await _field_handle(browser_session, node)
+        kbd_cleared = bool(handle) and params.clear and await _keyboard_clear(handle)
         try:
-            event = browser_session.event_bus.dispatch(
-                TypeTextEvent(node=node, text=params.text, clear=params.clear))
+            event = browser_session.event_bus.dispatch(TypeTextEvent(
+                node=node, text=params.text, clear=params.clear and not kbd_cleared))
             await event
             input_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
+            # Read back BEFORE Enter and retry the whole clear+type when the field kept
+            # another value: a repaired fill here is the difference between the run
+            # continuing and the agent burning steps refreshing the page. It must be before
+            # Enter — a search box that empties itself on submit would otherwise read back
+            # as a field that refused the text.
+            repaired, verified = False, None
+            if handle and params.text:
+                for attempt in range(_FILL_REPAIR_ROUNDS):
+                    verified = await _field_value(handle)
+                    if verified is None or _value_took(params.text, verified):
+                        break  # took, or unreadable — nothing to repair against
+                    logger.warning("field kept %r after typing %r; clearing with keystrokes "
+                                   "and retyping (attempt %d/%d)", verified, params.text,
+                                   attempt + 1, _FILL_REPAIR_ROUNDS)
+                    await _keyboard_clear(handle)
+                    retry = browser_session.event_bus.dispatch(
+                        TypeTextEvent(node=node, text=params.text, clear=False))
+                    await retry
+                    await retry.event_result(raise_if_any=True, raise_if_none=False)
+                    repaired = True
+                else:
+                    verified = await _field_value(handle)  # readback after the last repair
             if not dropdown:
                 enter = browser_session.event_bus.dispatch(SendKeysEvent(keys="Enter"))
                 await enter
@@ -427,7 +595,7 @@ def build_tools() -> Tools:
             logger.error("input failed at index %s: %s", params.index, exc)
             return ActionResult(error=f"Failed to type text into element {params.index}: {exc}")
         meta = dict(input_metadata) if isinstance(input_metadata, dict) else {}
-        actual = meta.pop("actual_value", None)
+        meta.pop("actual_value", None)  # stale once we repaired; `verified` supersedes it
         # The compiler's signal to mirror the Enter as a replay `press` step; a structured
         # flag, not the receipt text, so rewording the message can't change replays.
         meta["auto_enter"] = not dropdown
@@ -436,9 +604,17 @@ def build_tools() -> Tools:
                    "click the option you want)")
         else:
             msg = f"Typed '{params.text}' and pressed Enter"
-        if actual is not None and actual != params.text:
-            msg += (f". Note: the field's actual value '{actual}' differs from the typed "
-                    "text — the page may have reformatted or autocompleted it.")
+        if verified is not None and not _value_took(params.text, verified):
+            # Two causes, one receipt: the text went into a NEIGHBOURING control (the field
+            # you aimed at never changed), or this field refuses the value. Escape+relocate
+            # fixes the first and costs little on the second; the reload is the last resort.
+            msg += (f". WARNING: the field still reads '{verified}', not '{params.text}' — the "
+                    "value did NOT take, even after clearing it with keystrokes. Do NOT report "
+                    "this field as set. Press Escape to close any dropdown the typing opened, "
+                    "re-locate the field with find_by_text, and retype it. If it STILL refuses, "
+                    "reload the page, navigate back to this field, and redo the change.")
+        elif repaired:
+            msg += " (the field first kept its old value; cleared and retyped, now correct)"
         logger.debug(msg)
         return ActionResult(extracted_content=msg, long_term_memory=msg, metadata=meta)
 
@@ -531,28 +707,7 @@ def build_tools() -> Tools:
         tokens = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
         if not tokens:
             return ActionResult(error=f"find_by_text: no searchable text in {query!r}")
-        matches: list[tuple[int, Any, str]] = []
-        for idx, node in sorted(state.dom_state.selector_map.items()):
-            try:
-                label = " ".join(node.get_all_children_text(max_depth=5).split())[:300]
-                haystack = label.lower()
-                for attr in ("aria-label", "title", "placeholder", "value", "alt", "name", "id"):
-                    val = (node.attributes or {}).get(attr) or ""
-                    if val:
-                        haystack += " " + val.lower()
-                        if not label and attr not in ("id", "name"):
-                            label = val
-                # Icon buttons carry their meaning in a child glyph browser-use drops; fold
-                # the child hints in so a nameless <button/> becomes matchable/visible.
-                hints = _descendant_icon_hints(node)
-                if hints:
-                    haystack += " " + hints.lower()
-                    if not label:
-                        label = hints
-                if all(t in haystack for t in tokens):
-                    matches.append((idx, node, label))
-            except Exception:  # noqa: BLE001 - skip malformed nodes, keep scanning
-                continue
+        matches = _matching_nodes(state, tokens)
 
         def _line(idx: int, node: Any, label: str) -> str:
             attrs = node.attributes or {}
@@ -601,7 +756,7 @@ def build_tools() -> Tools:
                        f"find_by_text('{query}', click_first=true) to click the best match directly.")
                 logger.info("🔎 %s", msg)
                 return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True)
+                                    include_in_memory=True, metadata={"no_click": True})
             msg = (
                 f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
                 "The element is not in this page's DOM. FIRST check: is this the page you think "
@@ -610,7 +765,12 @@ def build_tools() -> Tools:
                 "capped_scroll or apply the ELEMENT NOT FOUND POLICY; do not repeat this exact query."
             )
             logger.info("🔎 %s", msg)
-            return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+            # no_click: this was a PROBE that touched nothing — without the stamp, compile
+            # treats a metadata-less click_first result as a dropped-metadata click and
+            # emits a semantic find_click (observed live: a closed-panel check committed
+            # a find_click('save') that then failed every replay on the healthy page).
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                include_in_memory=True, metadata={"no_click": True})
 
         # Exact-label preference: 'Inputs' matches both the link AND its parent <li> container;
         # when exactly one candidate's own label/aria-label/id equals the query, that is the
@@ -663,7 +823,110 @@ def build_tools() -> Tools:
             + "; ".join(f"index={idx} <{node.tag_name}> '{label[:40]}'" for idx, node, label in shown[:5])
         )
         logger.info("🔎 find_by_text('%s'): %d match(es)", query, len(matches))
-        return ActionResult(extracted_content=content, long_term_memory=memory, include_in_memory=True)
+        # no_click: a candidate LISTING — the agent clicks by index next; compiling this
+        # result as a find_click would bake a phantom duplicate click into the recording.
+        return ActionResult(extracted_content=content, long_term_memory=memory,
+                            include_in_memory=True, metadata={"no_click": True})
+
+    @tools.action(
+        "Capture on-page data so this step can report it AND future replays can re-read it "
+        "fresh without an LLM. Locates the element whose visible text/labels match every "
+        "word of `text` (same matching as find_by_text) and records its current text under "
+        "`label` (short snake_case role name, e.g. generated_identity, account_balance). "
+        "Read-only — clicks nothing. Prefer ONE call on the block/card that shows the "
+        "facts (the block's whole text is the value; later steps parse it). Do NOT use it "
+        "for values your own instructions specify or that you typed/picked yourself — "
+        "state those in your done message instead."
+    )
+    async def extract_data(text: str, label: str, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        query = (text or "").strip()
+        slug = re.sub(r"[^a-z0-9_]+", "_", (label or "").strip().lower()).strip("_") or "value"
+        if not query:
+            return ActionResult(error="extract_data: text must be non-empty")
+        if browser_session is None:
+            return ActionResult(error="extract_data: BrowserSession not injected")
+        try:
+            state = await browser_session.get_browser_state_summary(include_screenshot=False)
+        except Exception as exc:  # noqa: BLE001 - a lookup must never crash the run
+            logger.warning("extract_data failed to snapshot the page: %s", exc)
+            return ActionResult(error=f"extract_data: could not read page state: {exc}")
+        tokens = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
+        if not tokens:
+            return ActionResult(error=f"extract_data: no searchable text in {query!r}")
+
+        value, element = "", None
+        matches = _matching_nodes(state, tokens)
+        # A form control's snapshot text is NOT its value: a <select>'s children text is
+        # every option label concatenated ("Random Male Female" for the gender chooser —
+        # the observed live failure), an <input>'s is empty. Defer control matches to the
+        # raw-DOM finders below, whose select branch reads the SELECTED option.
+        matches = [m for m in matches
+                   if str(getattr(m[1], "node_name", "") or "").lower()
+                   not in ("select", "input", "textarea")]
+        if matches:
+            # Exact-label preference, as in find_by_text: with several candidates, the one
+            # whose own label/aria-label/id equals the query is the intended target.
+            chosen = matches
+            if len(matches) > 1:
+                wanted = _norm_phrase(query)
+                exact = [m for m in matches
+                         if _norm_phrase(m[2]) == wanted
+                         or any(_norm_phrase((m[1].attributes or {}).get(a) or "") == wanted
+                                for a in ("aria-label", "id", "name"))]
+                if exact:
+                    chosen = exact
+            _idx, node, node_label = chosen[0]
+            text_value = " ".join(node.get_all_children_text(max_depth=5).split())
+            value = (text_value or node_label or "").strip()[:1000]
+            element = _captured_element(node, node_label)
+        else:
+            # The value may live outside the interactive snapshot (plain text is not an
+            # interactive element). Query the raw DOM directly, click disabled: first the
+            # control-shaped finder, then the static-text finder — a value in a bare
+            # <h3>/<div> (the fakenamegenerator identity block) is invisible to both the
+            # snapshot and RAW_FIND_JS's control selector.
+            raw = None
+            for expr in (_RAW_FIND_JS % (json.dumps(tokens), "false"),
+                         _RAW_TEXT_FIND_JS % json.dumps(tokens)):
+                try:
+                    raw = await _eval_js(browser_session, expr)
+                except Exception as exc:  # noqa: BLE001 - fallback is best-effort
+                    logger.debug("extract_data raw-DOM fallback failed: %s", exc)
+                    raw = None
+                if raw and not raw.get("error") and raw.get("count"):
+                    break
+            if raw and not raw.get("error") and raw.get("count"):
+                value = " ".join(str(raw.get("name") or "").split())[:1000]
+                el = raw.get("element") or {}
+                if el.get("tag"):
+                    element = {
+                        "node_name": str(el.get("tag") or ""),
+                        "attributes": dict(el.get("attrs") or {}),
+                        "ax_name": " ".join(str(raw.get("name") or "").split()),
+                    }
+                    if el.get("xpath"):
+                        # Positional anchor — the ONLY selector that survives on pages
+                        # whose value (and therefore its text= selector) changes each run.
+                        element["x_path"] = str(el["xpath"])
+
+        if not value:
+            # No metadata on a miss: a valueless extract must compile to NOTHING, not to a
+            # step that would fail every replay.
+            msg = (f"extract_data('{query}'): nothing matched on the CURRENT page, or the "
+                   f"match has no visible text. The value was NOT captured. Scroll it into "
+                   f"view or re-call extract_data with words that appear in or right next "
+                   f"to the value.")
+            logger.info("📋 %s", msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                include_in_memory=True)
+
+        msg = f"extract_data('{query}'): {slug} = '{value}'"
+        logger.info("📋 %s", msg)
+        return ActionResult(
+            extracted_content=msg, long_term_memory=msg, include_in_memory=True,
+            metadata={"extract": {"label": slug, "value": value, "query": query,
+                                  "interacted_element": element}},
+        )
 
     @tools.action(
         "Ground truth for saves: check whether the record you tried to save actually reached the "
@@ -689,10 +952,33 @@ def build_tools() -> Tools:
             msg = ("NOT REGISTERED: no create-write has hit the server — the Save did NOT go "
                    "through. The form almost certainly shows validation errors (required fields, "
                    "invalid values, missing item selection). Find the error messages on the form, "
-                   "fix those exact fields, and click Save again. Do NOT report success until "
+                   "fix those exact fields, and save again. Do NOT report success until "
                    "this tool returns CONFIRMED.")
         logger.info("🧾 %s", msg.split(".")[0])
         return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+
+    @tools.action(
+        "Ground truth for downloads: list the files this browser session has downloaded. A "
+        "click that starts a download often reports a TIMEOUT even though it worked — call "
+        "this instead of clicking again. CONFIRMED + the expected filename means the "
+        "download is real; NONE means no download has happened yet. Read-only."
+    )
+    async def verify_download(browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        try:
+            files = list(getattr(browser_session, "downloaded_files", None) or [])
+        except Exception as exc:  # noqa: BLE001 - a probe failure must never crash the run
+            return ActionResult(error=f"verify_download failed: {exc}")
+        if not files:
+            msg = ("verify_download: NONE — no file download has been observed in this "
+                   "session. The download control has not been successfully triggered yet.")
+        else:
+            names = ", ".join(Path(p).name for p in files[-5:])
+            msg = (f"verify_download: CONFIRMED — {len(files)} file(s) downloaded this "
+                   f"session (latest: {names}). If this covers the file your step needed, "
+                   f"the download succeeded: do NOT click the download control again.")
+        logger.info("📥 %s", msg.split(" If ")[0])
+        return ActionResult(extracted_content=msg, long_term_memory=msg,
+                            include_in_memory=True)
 
     @tools.action(
         "Scan the CURRENT page for layout bugs: sideways page overflow, visible elements spilling "

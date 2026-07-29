@@ -24,6 +24,20 @@ def test_system_rules_carry_discovery_and_settle_blocks():
     assert "Never chain repeated waits" in p
 
 
+def test_system_rules_dummy_values_for_unspecified_required_fields():
+    # A required field the task never mentions used to dead-end the run: the validation
+    # loop said "fix those fields" but nothing licensed a value, so the agent stalled or
+    # called fail_and_stop. Free-input fields now get an invented dummy value; dropdown
+    # discipline is unchanged (options come from the list, never from imagination).
+    p = SPEED_OPTIMIZATION_PROMPT
+    assert "Required fields the task omits" in p
+    assert "INVENT" in p and "dummy value" in p
+    assert "never replace a task-given value" in p
+    assert "NEVER invent credentials" in p
+    assert "State every invented value in your done message" in p
+    assert "Do NOT type random names into dropdown search fields" in p
+
+
 def test_scoped_prompt_always_carries_verification_discipline():
     p = scoped_subtask_prompt("go to Estimates", [], [])
     assert "VERIFY EVERY ACTION" in p
@@ -43,6 +57,10 @@ def test_scoped_prompt_expected_end_and_save():
     assert 'DONE CONDITION: this step is complete ONLY when the page URL path matches' in p
     assert "/books/clients/*/dashboard" in p
     assert "verify_save_registered" in p and "CONFIRMED" in p
+    # The save step restates the dummy-value license inline: it is the step where an
+    # unspecified required field actually blocks the record.
+    assert "dummy value" in p
+    assert "dummy value" not in scoped_subtask_prompt("go to Estimates", [], [])
 
 
 def test_scoped_prompt_lists_all_remaining_as_context():
@@ -68,6 +86,51 @@ def test_scoped_prompt_defaults_omit_findings_and_observe():
     p = scoped_subtask_prompt("go to Estimates", [], [])
     assert "OBSERVATIONS recorded" not in p
     assert "OBSERVATION/VERIFICATION" not in p
+    assert "FILE DOWNLOAD" not in p
+
+
+def test_scoped_prompt_loop_block():
+    """The loop node's repeat-until contract: action framing (the judge observation
+    block stays OUT), one iteration at a time, no jumping ahead, and a generic
+    done-condition — without it, observation framing made the agent declare the
+    employees loop done after a single Save & Next."""
+    p = scoped_subtask_prompt(
+        "process employees one at a time until Owen Millar is shown", [], [], loop=True)
+    assert "LOOP step" in p
+    assert "ONE iteration at a time" in p
+    assert "NEVER jump ahead" in p
+    assert "DONE CONDITION" in p and "stop condition holds" in p
+    assert "MANY iterations" in p
+    assert "final observed state" in p
+    assert "OBSERVATION/VERIFICATION" not in p
+    # And the block stays out of every non-loop prompt.
+    assert "LOOP step" not in scoped_subtask_prompt("go to Estimates", [], [])
+
+
+def test_scoped_prompt_download_contract():
+    """The download segment's verify-then-done rule: click ONCE, a timeout receipt is
+    NORMAL, verify_download CONFIRMED = done immediately."""
+    p = scoped_subtask_prompt("select download, select PDF", [], [], downloads_file=True)
+    assert "FILE DOWNLOAD" in p
+    assert "ONCE" in p and "TIMEOUT" in p and "NORMAL" in p
+    assert "verify_download" in p
+    assert "success=true immediately" in p
+
+
+def test_scoped_prompt_aux_tab_block():
+    p = scoped_subtask_prompt("search DuckDuckGo for X and note the top result", [], [],
+                              aux_tab="https://duckduckgo.com")
+    assert "SEPARATE HELPER TAB" in p
+    assert "https://duckduckgo.com" in p
+    # The extraction contract: page-GENERATED facts go through extract_data (prefer one
+    # capture of the block that shows them); values the instructions themselves specify
+    # are restated in the done message, never hunted on the page.
+    assert "extract_data" in p
+    assert "ONE" in p and "block" in p
+    assert "do NOT extract_data it" in p
+    assert "do NOT open or close any tab" in p
+    # Default prompts carry none of it.
+    assert "SEPARATE HELPER TAB" not in scoped_subtask_prompt("go to Estimates", [], [])
 
 
 def test_dirty_prompt_sanitizes_url_looking_failure_text():

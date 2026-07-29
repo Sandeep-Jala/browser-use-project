@@ -16,13 +16,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from functools import partial
 
 import psutil
 
 from playwright.async_api import async_playwright
 
 from automation.browser.login import login
+from automation.browser.session import launch_session
 from automation.pipeline import assertions as asserts
+from automation.pipeline import files as pfiles
 from automation.collectors.console import ConsoleCollector
 from automation.collectors.network import NetworkCollector
 from automation.config import Config
@@ -68,9 +71,12 @@ async def run_task(runner: Runner, task: str, fresh: bool, marker: str | None, s
 
 
 async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
-               redecompose: bool = False, reauthor: str | None = None) -> bool:
+               redecompose: bool = False, reauthor: str | None = None,
+               log_all_hosts: bool = False, record: bool = False) -> bool:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
+    if record:  # the flag turns recording ON; RECORD_VIDEO=true in .env is the standing way
+        config.record_video = True
     config.ensure_dirs()
     _kill_stale_browser(config.cdp_port)
 
@@ -93,8 +99,43 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
         print("[*] no ground-truth marker (or --marker none): network gate disabled; "
               "success comes from the segment gates + judge")
 
+    # Files the prompt names ("upload X.csv ...") must exist NON-EMPTY in
+    # automation/uploads/ BEFORE login: the resolved absolute paths become the agent's
+    # upload_file allowlist. A bad path is worse than a failed run — observed live: a
+    # nonexistent relative path "uploaded" fine, then Save crashed the tab
+    # (RESULT_CODE_KILLED_BAD_MESSAGE) when the page tried to read it.
+    upload_files, file_problems = pfiles.resolve_prompt_files(task)
+    if file_problems:
+        raise SystemExit("[!] file reference(s) could not be resolved:\n    "
+                         + "\n    ".join(file_problems))
+    for f in upload_files:
+        print(f"[*] file for upload: {f} ({os.path.getsize(f):,} bytes)")
+
+    # Assertions judge the app under test only: scope defaults to the login URL's
+    # host, so helper-tab sites and third-party trackers can't fail a healthy run.
+    # A task's own `assertions.scope` (hosts list, or None = everything) overrides.
+    # Resolved BEFORE the Runner because the LOG CAPTURE uses the same scope: the
+    # collectors record only events produced by in-scope pages ("the app's logs"),
+    # and one shared derivation guarantees a captured-out entry can never be one an
+    # assertion rule needed. --log-all-hosts records everything (debugging a helper
+    # site itself); the assertions stay scoped either way.
+    defaults = dict(asserts.DEFAULT_SPEC)
+    scope_hosts = asserts.scope_hosts_for(config.login_url)
+    if scope_hosts:
+        defaults["scope"] = {"hosts": scope_hosts}
+    assert_spec = asserts.merge_spec(defaults, spec.assertions)
+    log_scope = None if log_all_hosts else (assert_spec.get("scope") or {}).get("hosts")
+
     async with async_playwright() as playwright:
-        browser, _page, cdp_url = await login(playwright, config)
+        # INVERTED handoff: browser-use launches and OWNS the browser (the session then
+        # classifies LOCAL — validated uploads, native download handling); login connects
+        # to it over CDP to authenticate. See browser/session.py.
+        session = launch_session(config, config.artifacts_dir / ".downloads_staging")
+        await session.start()
+        cdp_url = session.cdp_url
+        if not cdp_url:
+            raise SystemExit("[!] the agent browser exposed no CDP endpoint")
+        await login(playwright, config, cdp_url)
         print(f"[*] Login complete (CDP {cdp_url}) | model: {config.active_model} "
               f"vision={config.use_vision}")
 
@@ -104,17 +145,21 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
         try:
             runner = Runner(
                 cdp_url, config, playwright,
-                collector_factories=[NetworkCollector, ConsoleCollector],
+                session=session,
+                collector_factories=[
+                    partial(NetworkCollector, scope_hosts=log_scope),
+                    partial(ConsoleCollector, scope_hosts=log_scope),
+                ],
                 expander_llm=expander_llm,
                 judge_llm=expander_llm,  # feeds browser-use's built-in end-of-run judge
                 extend_system_message=SPEED_OPTIMIZATION_PROMPT,
                 tools=build_tools(),  # custom actions the prompts call (escape hatches, UI scans)
+                available_files=upload_files,
             )
 
             result = await run_task(runner, task, fresh, success_marker, spec=spec,
                                     redecompose=redecompose, reauthor=reauthor)
-            checks = asserts.apply(result, asserts.merge_spec(asserts.DEFAULT_SPEC,
-                                                              spec.assertions))
+            checks = asserts.apply(result, assert_spec)
             paths = build_report(result)
             result.artifacts["report_html"] = paths["html"]
 
@@ -138,6 +183,13 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
                       f"{sum(1 for c in checks if c.passed is None)} skipped)")
                 for c in failed:
                     print(f"     ✗ {c.name}: {c.detail}")
+            downloads = [d for s in (result.subtasks or [])
+                         for d in (s.get("downloads") or [])]
+            if downloads:
+                print(f"   downloads ({len(downloads)}) in "
+                      f"{result.artifacts_dir}/downloads/:")
+                for d in downloads:
+                    print(f"     ⬇ {d}")
             gt = result.ground_truth or {}
             if gt:
                 print(f"   ground truth: create-write to '{gt.get('marker')}' seen in network: "
@@ -155,7 +207,12 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
             # Combined verdict for CI: the flow completed AND the telemetry was healthy.
             return bool(result.is_successful) and result.assertions_passed is not False
         finally:
-            await browser.close()
+            # The session owns the browser now (keep_alive only spans segments, not the
+            # process): kill closes Chromium itself.
+            try:
+                await session.kill()
+            except Exception as exc:  # noqa: BLE001 - teardown must never mask the verdict
+                log.debug("session kill at exit: %s", exc)
 
 
 def cli() -> None:
@@ -182,10 +239,23 @@ def cli() -> None:
                              "prompt substrings (e.g. --reauthor 0 or --reauthor 'add "
                              "estimate'). Other subtasks still replay; the entry is replaced "
                              "only if the new recording passes its gate.")
+    parser.add_argument("--log-all-hosts", action="store_true",
+                        help="Record console/network telemetry from EVERY page. By default "
+                             "the logs are scoped to the app under test (same scope as the "
+                             "assertions), so helper-tab sites and their ad stacks stay out "
+                             "of the artifacts; use this when debugging a helper site "
+                             "itself.")
+    parser.add_argument("--record", action="store_true",
+                        help="Save an .mp4 of the run to artifacts/<run_id>/run.mp4. The "
+                             "capture is a TIME-LAPSE of the page viewport: the browser "
+                             "emits a frame only when the page changes, so the waits "
+                             "between LLM steps collapse and a long run becomes a short "
+                             "clip. Set RECORD_VIDEO_SIZE=1280x800 to cut the cost.")
     args = parser.parse_args()
 
     ok = asyncio.run(main(args.task, args.fresh, args.marker,
-                          redecompose=args.redecompose, reauthor=args.reauthor))
+                          redecompose=args.redecompose, reauthor=args.reauthor,
+                          log_all_hosts=args.log_all_hosts, record=args.record))
     raise SystemExit(0 if ok else 1)
 
 
