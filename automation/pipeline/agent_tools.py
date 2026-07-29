@@ -55,9 +55,10 @@ from typing import Any
 from browser_use import Tools
 from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserSession
-from browser_use.browser.events import ClickElementEvent, SendKeysEvent, TypeTextEvent
+from browser_use.browser.events import (ClickElementEvent, SelectDropdownOptionEvent,
+                                        SendKeysEvent, TypeTextEvent)
 from browser_use.dom.views import DOMInteractedElement
-from browser_use.tools.views import InputTextAction
+from browser_use.tools.views import InputTextAction, SelectDropdownOptionAction
 
 from automation.pipeline.script_compile import (
     RAW_FIND_JS as _RAW_FIND_JS,
@@ -487,6 +488,24 @@ async def _field_value(handle) -> str | None:
     return "" if value is None else str(value)
 
 
+async def _select_state(handle) -> tuple[str, str] | None:
+    """The <select>'s current (value, selected-option label), or None when it can't be read
+    (stale object id after a re-render, or the element is not a <select>) — callers treat
+    None as "cannot verify", never as a mismatch."""
+    try:
+        state = await _call_on_field(
+            handle, "function(){ if (this.tagName !== 'SELECT') return null; "
+                    "var o = this.selectedOptions && this.selectedOptions[0]; "
+                    "return { value: this.value == null ? '' : String(this.value), "
+                    "label: (o && o.text) || '' }; }")
+    except Exception as exc:  # noqa: BLE001 - verification is best-effort
+        logger.debug("select readback failed (node likely re-rendered): %s", exc)
+        return None
+    if not isinstance(state, dict):
+        return None
+    return (str(state.get("value") or ""), str(state.get("label") or ""))
+
+
 async def _press(handle, key: str, code: str, vk: int, *,
                  commands: list[str] | None = None, repeat: int = 1) -> None:
     """Dispatch `repeat` real keyDown/keyUp pairs at the focused element."""
@@ -617,6 +636,82 @@ def build_tools() -> Tools:
             msg += " (the field first kept its old value; cleared and retyped, now correct)"
         logger.debug(msg)
         return ActionResult(extracted_content=msg, long_term_memory=msg, metadata=meta)
+
+    # Same-name override of the built-in select_dropdown (same mechanism as `input` above).
+    # The built-in awaits the picker's self-report UNBOUNDED and trusts it: on an ad-heavy
+    # page the post-selection settle can outlive the event timeout, the receipt comes back
+    # empty, and the agent re-sets an option that already took (observed live: the country
+    # <select> was set three times). Here the element itself is READ BACK after every
+    # dispatch and the receipt states what the select now shows — the same verify-after
+    # rule the `input` fill follows. Same param model, so recorded history keeps the exact
+    # built-in shape and the compiler's native-select path needs no changes.
+    @tools.action(
+        'Set the option of a <select> element.',
+        param_model=SelectDropdownOptionAction,
+    )
+    async def select_dropdown(params: SelectDropdownOptionAction,
+                              browser_session=None) -> ActionResult:
+        node = await browser_session.get_element_by_index(params.index)
+        if node is None:
+            msg = (f"Element index {params.index} not available - page may have changed. "
+                   "Try refreshing browser state.")
+            logger.warning("⚠️ %s", msg)
+            return ActionResult(extracted_content=msg)
+        target = (params.text or "").strip()
+        # Resolve the element BEFORE dispatching: a post-selection re-render leaves a stale
+        # object id, which must read as "cannot verify", not as a refused option.
+        handle = await _field_handle(browser_session, node)
+
+        def _took(state: tuple[str, str] | None) -> bool:
+            if state is None:
+                return False
+            want = " ".join(target.split()).lower()
+            # Label first, value as fallback — the same ladder replay's select uses.
+            return any(" ".join(s.split()).lower() == want for s in state if s)
+
+        failure: str | None = None
+        try:
+            event = browser_session.event_bus.dispatch(
+                SelectDropdownOptionEvent(node=node, text=params.text))
+            await event
+            data = await event.event_result(timeout=10.0, raise_if_any=True,
+                                            raise_if_none=False)
+            if not (isinstance(data, dict) and data.get("success") == "true"):
+                failure = (data.get("error") if isinstance(data, dict) else None) \
+                    or "the picker returned no confirmation"
+        except Exception as exc:  # noqa: BLE001 - the read-back below is the real verdict
+            failure = str(exc) or exc.__class__.__name__
+
+        state = await _select_state(handle) if handle else None
+        shows = (state[1] or state[0]) if state else ""
+        if _took(state):
+            if failure is None:
+                msg = (f"Selected dropdown option '{params.text}' at index {params.index} — "
+                       f"the select now reads '{shows}'.")
+            else:
+                msg = (f"Selected dropdown option '{params.text}' at index {params.index}. "
+                       f"The picker's own confirmation failed ({failure}), but read-back "
+                       f"confirms the select now reads '{shows}' — the option IS set; do "
+                       "NOT set it again.")
+            logger.info("🔽 %s", msg)
+            return ActionResult(extracted_content=msg, include_in_memory=True,
+                                long_term_memory=msg)
+        if failure is None and state is None:
+            # The picker claims success and the element is unreadable — no grounds to
+            # overrule the claim; keep the built-in's receipt.
+            msg = f"Selected dropdown option '{params.text}' at index {params.index}"
+            logger.info("🔽 %s", msg)
+            return ActionResult(extracted_content=msg, include_in_memory=True,
+                                long_term_memory=msg)
+        if state is None:
+            return ActionResult(error=(
+                f"select_dropdown '{params.text}' at index {params.index} failed: {failure}"))
+        reason = f" ({failure})" if failure else ""
+        return ActionResult(error=(
+            f"select_dropdown '{params.text}' at index {params.index} did NOT take{reason}: "
+            f"the select still reads '{shows}'. Do not report it as set — call "
+            f"dropdown_options(index={params.index}) to see the exact option texts and pick "
+            "again with one of them."))
 
     @tools.action(
         "Abandon the CURRENT objective/step and continue the run. Use when a step failed but "
@@ -788,13 +883,46 @@ def build_tools() -> Tools:
 
         if click_first and len(matches) == 1:
             idx, node, label = matches[0]
+            tag = str(getattr(node, "tag_name", "") or "").lower()
+            attrs_map = getattr(node, "attributes", None) or {}
+            # Native <select>s (and file inputs) can never be clicked — browser-use refuses
+            # the click, and the refusal comes back as a RETURNED {'validation_error': ...},
+            # not an exception, so a blind dispatch reads as success (observed live: two
+            # phantom "clicked" receipts on the country <select> convinced the agent its
+            # already-applied selection kept failing). Refuse up front, naming the action
+            # that actually works, and stamp no_click so nothing compiles from this.
+            if tag == "select":
+                msg = (f"find_by_text('{query}'): found the single match "
+                       f"{_line(idx, node, label)} but did NOT click it — it is a native "
+                       f"<select>, which cannot be clicked. Use dropdown_options(index={idx}) "
+                       f"to list its options, then select_dropdown(index={idx}, "
+                       f"text='<option>') to pick one.")
+                logger.info("🔎 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
+            if tag == "input" and str(attrs_map.get("type") or "").lower() == "file":
+                msg = (f"find_by_text('{query}'): found the single match "
+                       f"{_line(idx, node, label)} but did NOT click it — it is a file "
+                       f"input; use upload_file on index {idx} instead.")
+                logger.info("🔎 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
             try:
                 event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
                 await event
-                await event.event_result(raise_if_any=True, raise_if_none=False)
+                res = await event.event_result(raise_if_any=True, raise_if_none=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("find_by_text click failed: %s", exc)
                 return ActionResult(error=f"find_by_text: found '{label[:80]}' but click failed: {exc}")
+            # browser-use also refuses clicks by RETURNING {'validation_error': ...} (its own
+            # click action checks for exactly this) — a refusal dict is NOT a click.
+            if isinstance(res, dict) and res.get("validation_error"):
+                msg = (f"find_by_text('{query}'): found the single match "
+                       f"{_line(idx, node, label)} but the click was REFUSED: "
+                       f"{res['validation_error']} Nothing was clicked.")
+                logger.info("🔎 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
             # Record WHAT we clicked so script_compile can turn this custom action into a real
             # click step (a custom action carries no index, so browser-use captures no
             # interacted_element for it). Same DOMInteractedElement shape a built-in click records.
@@ -855,6 +983,7 @@ def build_tools() -> Tools:
             return ActionResult(error=f"extract_data: no searchable text in {query!r}")
 
         value, element = "", None
+        expanded = False
         matches = _matching_nodes(state, tokens)
         # A form control's snapshot text is NOT its value: a <select>'s children text is
         # every option label concatenated ("Random Male Female" for the gender chooser —
@@ -863,6 +992,34 @@ def build_tools() -> Tools:
         matches = [m for m in matches
                    if str(getattr(m[1], "node_name", "") or "").lower()
                    not in ("select", "input", "textarea")]
+
+        async def _raw_lookup(exprs: tuple[str, ...]):
+            for expr in exprs:
+                try:
+                    found = await _eval_js(browser_session, expr)
+                except Exception as exc:  # noqa: BLE001 - fallback is best-effort
+                    logger.debug("extract_data raw-DOM fallback failed: %s", exc)
+                    found = None
+                if found and not found.get("error") and found.get("count"):
+                    return found
+            return None
+
+        def _raw_capture(raw: dict) -> tuple[str, dict | None]:
+            raw_value = " ".join(str(raw.get("name") or "").split())[:1000]
+            raw_element = None
+            el = raw.get("element") or {}
+            if el.get("tag"):
+                raw_element = {
+                    "node_name": str(el.get("tag") or ""),
+                    "attributes": dict(el.get("attrs") or {}),
+                    "ax_name": " ".join(str(raw.get("name") or "").split()),
+                }
+                if el.get("xpath"):
+                    # Positional anchor — the ONLY selector that survives on pages
+                    # whose value (and therefore its text= selector) changes each run.
+                    raw_element["x_path"] = str(el["xpath"])
+            return raw_value, raw_element
+
         if matches:
             # Exact-label preference, as in find_by_text: with several candidates, the one
             # whose own label/aria-label/id equals the query is the intended target.
@@ -879,35 +1036,27 @@ def build_tools() -> Tools:
             text_value = " ".join(node.get_all_children_text(max_depth=5).split())
             value = (text_value or node_label or "").strip()[:1000]
             element = _captured_element(node, node_label)
+            if value and _norm_phrase(value) == _norm_phrase(query):
+                # Zero information gained: the capture IS the query (a bare name in its
+                # own heading — the caller wanted the card AROUND it). The static-text
+                # finder expands exactly such matches to the enclosing block; replace the
+                # capture only when it really grew, so an honest tight value never becomes
+                # a miss.
+                raw = await _raw_lookup((_RAW_TEXT_FIND_JS % json.dumps(tokens),))
+                if raw and raw.get("expanded"):
+                    value, element = _raw_capture(raw)
+                    expanded = True
         else:
             # The value may live outside the interactive snapshot (plain text is not an
             # interactive element). Query the raw DOM directly, click disabled: first the
             # control-shaped finder, then the static-text finder — a value in a bare
             # <h3>/<div> (the fakenamegenerator identity block) is invisible to both the
             # snapshot and RAW_FIND_JS's control selector.
-            raw = None
-            for expr in (_RAW_FIND_JS % (json.dumps(tokens), "false"),
-                         _RAW_TEXT_FIND_JS % json.dumps(tokens)):
-                try:
-                    raw = await _eval_js(browser_session, expr)
-                except Exception as exc:  # noqa: BLE001 - fallback is best-effort
-                    logger.debug("extract_data raw-DOM fallback failed: %s", exc)
-                    raw = None
-                if raw and not raw.get("error") and raw.get("count"):
-                    break
-            if raw and not raw.get("error") and raw.get("count"):
-                value = " ".join(str(raw.get("name") or "").split())[:1000]
-                el = raw.get("element") or {}
-                if el.get("tag"):
-                    element = {
-                        "node_name": str(el.get("tag") or ""),
-                        "attributes": dict(el.get("attrs") or {}),
-                        "ax_name": " ".join(str(raw.get("name") or "").split()),
-                    }
-                    if el.get("xpath"):
-                        # Positional anchor — the ONLY selector that survives on pages
-                        # whose value (and therefore its text= selector) changes each run.
-                        element["x_path"] = str(el["xpath"])
+            raw = await _raw_lookup((_RAW_FIND_JS % (json.dumps(tokens), "false"),
+                                     _RAW_TEXT_FIND_JS % json.dumps(tokens)))
+            if raw:
+                value, element = _raw_capture(raw)
+                expanded = bool(raw.get("expanded"))
 
         if not value:
             # No metadata on a miss: a valueless extract must compile to NOTHING, not to a
@@ -921,6 +1070,9 @@ def build_tools() -> Tools:
                                 include_in_memory=True)
 
         msg = f"extract_data('{query}'): {slug} = '{value}'"
+        if expanded:
+            msg += (" (the exact match was only the query text itself; captured its "
+                    "surrounding block)")
         logger.info("📋 %s", msg)
         return ActionResult(
             extracted_content=msg, long_term_memory=msg, include_in_memory=True,

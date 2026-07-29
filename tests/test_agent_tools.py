@@ -337,3 +337,154 @@ def test_captured_element_manual_fallback_for_offscreen_nodes():
     assert el["ax_name"] == "View all"          # matched label fills in for the ax name
     assert "x_path" not in el                   # unreachable xpath is simply omitted
 
+
+# --------------------- find_by_text truthfulness on unclickables ---------------------
+# The live failure these guard: browser-use REFUSES a click on a native <select> by
+# RETURNING {'validation_error': ...} (never raising), and find_by_text used to discard
+# that result and report "clicked the single match" anyway — two phantom receipts on the
+# country <select> convinced the agent its already-applied selection kept failing.
+
+
+class _FakeEvent:
+    def __init__(self, result=None, exc=None):
+        self._result, self._exc = result, exc
+
+    def __await__(self):
+        async def _dispatched():
+            return None
+        return _dispatched().__await__()
+
+    async def event_result(self, **_kw):
+        if self._exc:
+            raise self._exc
+        return self._result
+
+
+class _FakeClickSession(_FakeBrowserSession):
+    def __init__(self, nodes, result=None, exc=None):
+        super().__init__(nodes)
+        from types import SimpleNamespace
+
+        self.event_bus = SimpleNamespace(dispatch=lambda _e: _FakeEvent(result, exc))
+
+
+class _FakeSelectDomNode(_FakeDomNode):
+    def __init__(self):
+        super().__init__("Australia Austria United Kingdom", attributes={"id": "c"})
+        self.node_name = "SELECT"
+        self.tag_name = "select"
+
+
+async def test_find_by_text_refuses_to_click_native_select():
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="united kingdom", click_first=True),
+                   browser_session=_FakeBrowserSession({9: _FakeSelectDomNode()}))
+
+    assert res.error is None
+    assert "did NOT click" in res.extracted_content
+    assert "select_dropdown(index=9" in res.extracted_content
+    assert res.metadata == {"no_click": True}    # compiles to NOTHING, never a phantom click
+
+
+async def test_find_by_text_refuses_to_click_file_input():
+    fn, pm = _registered_action("find_by_text")
+    node = _FakeDomNode("", attributes={"type": "file", "name": "csv upload"})
+    node.node_name = "INPUT"
+    node.tag_name = "input"
+    res = await fn(params=pm(text="csv upload", click_first=True),
+                   browser_session=_FakeBrowserSession({4: node}))
+
+    assert res.error is None
+    assert "did NOT click" in res.extracted_content
+    assert "upload_file" in res.extracted_content
+    assert res.metadata == {"no_click": True}
+
+
+async def test_find_by_text_reports_refused_click_instead_of_lying(monkeypatch):
+    """A returned validation_error dict is a REFUSAL, not a click — the receipt must say
+    so and must not stamp interacted_element (which would compile a dead click step)."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    fn, pm = _registered_action("find_by_text")
+    node = _FakeDomNode("Continue", attributes={"id": "go"})
+    node.tag_name = "h2"
+    refusal = {"validation_error": "Cannot click on <select> elements. "
+                                   "Use dropdown_options(index=...) action instead."}
+    res = await fn(params=pm(text="continue", click_first=True),
+                   browser_session=_FakeClickSession({4: node}, result=refusal))
+
+    assert res.error is None
+    assert "REFUSED" in res.extracted_content
+    assert "Nothing was clicked" in res.extracted_content
+    assert res.metadata == {"no_click": True}
+
+
+# ------------------------- select_dropdown read-back override -------------------------
+# The built-in trusts the picker's self-report; on an ad-heavy page the confirmation can
+# time out AFTER the selection took, and the empty failure receipt made the agent re-set
+# the same option repeatedly. The override reads the element back and reports what the
+# select actually shows.
+
+
+class _FakeSelectSession:
+    def __init__(self, result=None, exc=None):
+        from types import SimpleNamespace
+
+        self._node = object()
+        self.event_bus = SimpleNamespace(dispatch=lambda _e: _FakeEvent(result, exc))
+
+    async def get_element_by_index(self, _index):
+        return self._node
+
+
+def _patch_select_readback(monkeypatch, state):
+    monkeypatch.setattr(agent_tools, "SelectDropdownOptionEvent", lambda **kw: kw)
+
+    async def field_handle(_session, _node):
+        return ("cdp", "obj")
+
+    async def select_state(_handle):
+        return state
+
+    monkeypatch.setattr(agent_tools, "_field_handle", field_handle)
+    monkeypatch.setattr(agent_tools, "_select_state", select_state)
+
+
+def test_select_dropdown_override_is_registered():
+    from automation.pipeline.agent_tools import build_tools
+
+    action = build_tools().registry.registry.actions["select_dropdown"]
+    assert action.function.__module__ == "automation.pipeline.agent_tools"
+
+
+async def test_select_dropdown_timeout_is_rescued_by_readback(monkeypatch):
+    _patch_select_readback(monkeypatch, ("uk", "United Kingdom"))
+    fn, pm = _registered_action("select_dropdown")
+    res = await fn(params=pm(index=9, text="United Kingdom"),
+                   browser_session=_FakeSelectSession(exc=TimeoutError("no confirmation")))
+
+    assert res.error is None
+    assert "read-back confirms" in res.extracted_content
+    assert "do NOT set it again" in res.extracted_content
+
+
+async def test_select_dropdown_mismatch_is_reported_truthfully(monkeypatch):
+    _patch_select_readback(monkeypatch, ("au", "Australia"))
+    fn, pm = _registered_action("select_dropdown")
+    res = await fn(params=pm(index=9, text="United Kingdom"),
+                   browser_session=_FakeSelectSession(result={"success": "true"}))
+
+    assert res.error is not None
+    assert "did NOT take" in res.error
+    assert "Australia" in res.error
+    assert "dropdown_options(index=9)" in res.error
+
+
+async def test_select_dropdown_success_echoes_readback(monkeypatch):
+    _patch_select_readback(monkeypatch, ("uk", "United Kingdom"))
+    fn, pm = _registered_action("select_dropdown")
+    res = await fn(params=pm(index=9, text="United Kingdom"),
+                   browser_session=_FakeSelectSession(result={"success": "true"}))
+
+    assert res.error is None
+    assert "now reads 'United Kingdom'" in res.extracted_content
+

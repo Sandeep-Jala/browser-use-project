@@ -495,9 +495,13 @@ async def test_run_steps_extract_query_reads_static_text():
         ]
         out = await run_steps(page, steps, timeout_ms=3000)
         assert out["failed_at"] is None
-        assert out["extracted"]["generated_name"] == "Felix MacDonald"
-        # The tightest element around the address is the whole block — city and postcode
-        # ride along, which is exactly what the add-employee step needs.
+        # The name alone in its <h3> is EXACTLY the query — zero information gained — so
+        # the finder expands to the enclosing card (2026-07-29): the whole identity block
+        # is the value, and the consuming step parses the facts out of it.
+        assert out["extracted"]["generated_name"] == \
+            "Felix MacDonald 93 Mounthoolie Lane SUNNYSIDE AB1 5AW"
+        # The address capture already gains beyond its query (city and postcode ride
+        # along), so it is NOT expanded — the tightest element stays the anchor.
         assert out["extracted"]["generated_address"] == \
             "93 Mounthoolie Lane SUNNYSIDE AB1 5AW"
 
@@ -508,11 +512,53 @@ async def test_run_steps_extract_query_reads_static_text():
 
         # The finder hands back a positional xpath — the anchor that makes fresh-data
         # extracts replayable when the value's own text is the only other identity.
+        # With the zero-gain expansion the anchor is the CARD, not the bare <h3>: a
+        # replay re-reads the whole block (fresh name AND address) from this slot.
         import json as _json
 
         from automation.pipeline.script_compile import RAW_TEXT_FIND_JS
         raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["felix", "macdonald"]))
-        assert raw["element"]["xpath"] == "/html/body/div/h3"
+        assert raw["expanded"] is True
+        assert raw["element"]["xpath"] == "/html/body/div"
+        # A query that already fills its element is untouched: no expansion flag.
+        raw = await page.evaluate(
+            RAW_TEXT_FIND_JS % _json.dumps(["93", "mounthoolie", "lane"]))
+        assert raw["expanded"] is False
+        assert raw["element"]["xpath"] == "/html/body/div/div"
+
+
+async def test_extract_zero_gain_expansion_guards():
+    """Expansion never fires when it cannot help: a first-gaining ancestor bigger than
+    the 1000-char value cap keeps the tight capture (never a page blob), and a <select>
+    (whose reported text is already the SELECTED option, not page prose) never expands."""
+    import json as _json
+
+    from playwright.async_api import async_playwright
+
+    from automation.pipeline.script_compile import RAW_TEXT_FIND_JS
+    from tests.test_heal_promotion import _launch
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        filler = "lorem ipsum dolor sit amet " * 60          # ~1600 chars of sibling text
+        await page.set_content(f"""
+          <div class="page">
+            <h3>Rio Kerr</h3>
+            <p>{filler}</p>
+          </div>
+        """)
+        raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["rio", "kerr"]))
+        assert raw["expanded"] is False
+        assert raw["name"] == "Rio Kerr"
+
+        await page.set_content("""
+          <select id="c"><option selected>United Kingdom</option>
+          <option>France</option></select>
+        """)
+        raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["united", "kingdom"]))
+        assert raw["expanded"] is False
+        assert raw["name"] == "United Kingdom"
 
 
 def test_upload_file_action_compiles_to_basename_step(tmp_path):

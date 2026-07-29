@@ -36,6 +36,8 @@ class FakePage:
         self.fronted = 0
         self.gotos = []
         self.evals = []
+        self.routes = []                  # (pattern, handler) from page.route
+        self.ops = []                     # ("route"|"goto", arg) in call order
         self.goto_error = None
 
     def is_closed(self):
@@ -53,7 +55,12 @@ class FakePage:
         if self.goto_error:
             raise RuntimeError(self.goto_error)
         self.gotos.append(url)
+        self.ops.append(("goto", url))
         self.url = url
+
+    async def route(self, pattern, handler):
+        self.routes.append((pattern, handler))
+        self.ops.append(("route", pattern))
 
     async def evaluate(self, expr):
         self.evals.append(expr)
@@ -175,6 +182,56 @@ async def test_open_aux_tab_goto_failure_closes_page_and_raises():
     assert hs._aux_page is None
     assert ctx.pages == [main]                       # the dead page was closed
     assert hs.current_page() is main
+
+
+# ------------------------------- aux-tab ad blocking -------------------------------
+
+
+async def test_open_aux_tab_registers_ad_blocking_before_goto():
+    """The route must exist BEFORE the goto (the initial ad barrage is the expensive one)
+    and only on the helper tab — the app tab never gets a route."""
+    hs, ctx, main = _session()
+    page = await hs.open_aux_tab("https://www.fakenamegenerator.com/gen-male-gd-uk.php")
+
+    kinds = [op[0] for op in page.ops]
+    assert "route" in kinds and "goto" in kinds
+    assert kinds.index("route") < kinds.index("goto")
+    assert page.routes and page.routes[0][1] is hybrid._abort_ad_requests
+    assert main.routes == []
+
+
+def test_blocked_ad_host_is_suffix_matched():
+    assert hybrid._is_blocked_ad_host("https://x.doubleclick.net/instream/ad.js")
+    assert hybrid._is_blocked_ad_host("https://taboola.com/widget")
+    # Suffix match, not substring: a lookalike registrable domain is NOT blocked.
+    assert not hybrid._is_blocked_ad_host("https://evildoubleclick.net/x")
+    # The aux site itself and CMP/consent hosts are never blocked (the recording clicks
+    # the consent banner — see the _AUX_BLOCKED_HOSTS comment).
+    assert not hybrid._is_blocked_ad_host("https://www.fakenamegenerator.com/gen-male-gd-uk.php")
+    assert not hybrid._is_blocked_ad_host("https://cdn.cookielaw.org/consent.js")
+    assert not hybrid._is_blocked_ad_host("not a url")
+
+
+async def test_abort_ad_requests_aborts_only_blocked_hosts():
+    class FakeRoute:
+        def __init__(self, url):
+            self.request = SimpleNamespace(url=url)
+            self.aborted = False
+            self.continued = False
+
+        async def abort(self):
+            self.aborted = True
+
+        async def continue_(self):
+            self.continued = True
+
+    ad = FakeRoute("https://securepubads.googlesyndication.com/tag.js")
+    await hybrid._abort_ad_requests(ad)
+    assert ad.aborted and not ad.continued
+
+    page_req = FakeRoute("https://www.fakenamegenerator.com/gen-male-gd-uk.php")
+    await hybrid._abort_ad_requests(page_req)
+    assert page_req.continued and not page_req.aborted
 
 
 async def test_close_aux_tab_refocuses_main_and_is_idempotent():

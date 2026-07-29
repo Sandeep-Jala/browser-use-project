@@ -846,7 +846,11 @@ RAW_FIND_JS = r"""
 # contains every token and returns that element's rendered text as the value (shortest text
 # wins among several deepest matches, i.e. the tightest element around the value; for a
 # <select> the SELECTED option's label — its rendered text is every option concatenated,
-# which is never the value a user sees chosen). Read-only
+# which is never the value a user sees chosen). One exception to "tightest wins": when the
+# tightest capture is EXACTLY the query (zero information gained — a bare name in its own
+# <h3>, the fakenamegenerator identity card), it expands to the nearest ancestor that adds
+# text (`expanded: true` in the result), capped at 1000 chars so a page-sized container can
+# never replace a tight match. Read-only
 # by construction: it clicks nothing. Shared verbatim between authoring (agent_tools) and
 # replay (_extract_value) so a text-anchored extract re-reads identically on every run.
 #
@@ -904,6 +908,31 @@ RAW_TEXT_FIND_JS = r"""
       var sel_opt = (top.el.selectedOptions && top.el.selectedOptions[0]) || null;
       top = { el: top.el, text: (sel_opt && sel_opt.text) || top.el.value || top.text };
     }
+    // Zero-information-gain expansion: a capture that is EXACTLY the query teaches nothing
+    // (a generated name alone in its own <h3> — the caller wanted the card AROUND it).
+    // Climb to the nearest ancestor that adds text; if that first-gaining ancestor is
+    // bigger than the 1000-char value cap, keep the tight capture instead of a page blob.
+    var expanded = false;
+    if (top.el.tagName !== 'SELECT') {
+      var normText = function (s) {
+        return (s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).join(' ');
+      };
+      var queryNorm = TOKENS.join(' ');
+      if (normText(top.text) === queryNorm) {
+        var anc = top.el.parentElement;
+        while (anc && anc !== document.body) {
+          var ancText = (anc.innerText || '').replace(/\s+/g, ' ').trim();
+          if (normText(ancText) !== queryNorm) {
+            if (ancText.length && ancText.length <= 1000) {
+              top = { el: anc, text: ancText };
+              expanded = true;
+            }
+            break;
+          }
+          anc = anc.parentElement;
+        }
+      }
+    }
     var attrs = {};
     ['id', 'aria-label', 'title', 'name', 'placeholder', 'data-testid', 'href', 'role']
       .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
@@ -919,7 +948,7 @@ RAW_TEXT_FIND_JS = r"""
     };
     var xpath = '';
     try { xpath = xp(top.el); } catch (e) {}
-    return { count: scored.length, name: top.text.slice(0, 500),
+    return { count: scored.length, name: top.text.slice(0, 1000), expanded: expanded,
              names: scored.slice(0, 5).map(function (o) { return o.text.slice(0, 80); }),
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs, xpath: xpath } };
   } catch (e) { return { error: String(e) }; }

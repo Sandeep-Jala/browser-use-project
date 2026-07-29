@@ -39,9 +39,9 @@ def build_llm(config: Config) -> BaseChatModel:
             # the task said random. The cap must rise with the effort: completion tokens
             # INCLUDE the hidden reasoning tokens, and medium effort at 4096 risks
             # finish_reason='length' with empty content.
-            # reasoning_effort="medium",
-            # max_completion_tokens=8192,
-            max_completion_tokens= 4096,
+            reasoning_effort="low",
+            max_completion_tokens=8192,
+            # max_completion_tokens= 4096,
             # Best-effort determinism: at temperature 0, Azure still varies across backend
             # replicas; a fixed seed narrows step-to-step decision flakiness.
             seed=42,
@@ -71,6 +71,7 @@ def build_expander_llm(config: Config) -> BaseChatModel | None:
         temperature=0.0,
         timeout=45.0,
         max_retries=5,
-        max_completion_tokens=4096,
+        reasoning_effort="medium",
+        max_completion_tokens=8192,
         seed=42,
     )

@@ -86,7 +86,13 @@ FROZEN_TIDS = {
     # The import and pension prompts CHANGED WORDING beyond values ("The FOOD LIMITED",
     # "and then click save", "The FOOD LIMITED name"), so their navigation/import
     # subtasks re-author on first run instead of replaying the committed skills.
-    "payroll_add_generated_employee": "b3122d7090b410c1",
+    # Re-frozen 2026-07-29: the fakenamegenerator sentence (shared verbatim by its three
+    # carriers: here, payroll_food_limited_e2e, payroll_food_limited_e2e_rti) now opens
+    # gen-male-gd-uk.php directly — the URL pre-encodes male/Scottish/UK and generates a
+    # fresh identity per load, so the helper-tab step is load -> extract -> done instead
+    # of three dropdowns + Generate on an ad-heavy page. Old aux segment cc27ec56df2ab562
+    # is orphaned; each carrier records the shared replacement on its first run.
+    "payroll_add_generated_employee": "f2139a1401d9b262",
     # Re-frozen 2026-07-22 (second edit round): import/pension retargeted to plain
     # "FOOD LIMITED"; pay_forecast added (matches the live run's decomposition cache).
     "payroll_import_employees_csv": "4ef26eab374400f7",
@@ -101,7 +107,9 @@ FROZEN_TIDS = {
     # Clearing is deliberately NOT described in these prompts — it is UI trivia. An earlier
     # attempt to auto-recover it (select-all re-clear inside agent_tools.input) did not work
     # against the real fields and was removed; nothing compensates for a failed clear today.
-    "payroll_pay_forecast": "64e3a4d8192634dc",
+    # Re-frozen 2026-07-29 (user edit): "combobox search employee" -> "combobox select
+    # employee".
+    "payroll_pay_forecast": "2c08f433c09a15f1",
     "crm_add_contact": "5f244c1446787a15",
     # Re-frozen 2026-07-24: data-request tail reworded after the 07-23 freeze ("latest
     # sent request"/"Submittec" -> "the top sent request"/"Submitted", "now click" ->
@@ -121,7 +129,12 @@ FROZEN_TIDS = {
     # new pay-forecast clause ("if there is no data shown, refresh the page and do it
     # again" — the typo "sefresh" was corrected while re-freezing; the old decomposition
     # (f486b7ab4dabbd20) was already gone with the cleared decompositions dir).
-    "payroll_food_limited_e2e": "0a7eff511d164852",
+    # Re-frozen 2026-07-29: fakenamegenerator direct-URL reword (see the
+    # payroll_add_generated_employee note above — same sentence, same replacement segment).
+    # Re-frozen again same day (user edit, applied to both e2e copies to keep the shared
+    # pay-forecast sentence byte-compatible): "combobox search employee" -> "combobox
+    # select employee".
+    "payroll_food_limited_e2e": "287ea967fcab1973",
     # RTI payrun-processing chain (Save/Next per employee, min-wage + pop-up branches,
     # employee-8 expenses/addition, 2nd-last FPS submit, date roll, client sort order).
     # Re-frozen 2026-07-27: the employee pass and the advance-to-Struan clause reworded
@@ -144,7 +157,19 @@ FROZEN_TIDS = {
     # to run the pair as one pass. ~20 subtasks, which is why decompose.MAX_SUBTASKS was
     # raised 15 -> 24; at the old ceiling this split was rejected and the run degraded to
     # whole_prompt_fallback. Re-freeze whenever either half is reworded.
-    "payroll_food_limited_e2e_rti": "2138c20e98916aa9",
+    # Re-frozen 2026-07-29, two edits at once: (a) the user's FPS bulk-upload rewording
+    # ("...employee list, unselect all the employee, Select the employee we added earlier,
+    # Click on FPS, select document ... and Submit") — the id had already drifted to
+    # df1ae025b2ec3d6a before this freeze caught up; (b) the shared fakenamegenerator
+    # direct-URL reword (see the payroll_add_generated_employee note above).
+    # Re-frozen again 2026-07-29 afternoon (user edits): the FIRST RTI employee pass
+    # gained "if the Save & Next button is disabled, Move on to the next employee"; then
+    # the SECOND (advance-to-Struan) pass was reworded to "if the Save and next is
+    # disabled move on to the next employee" (dropping its "check that each save
+    # advances ... never click a name" parenthetical), and the shared pay-forecast
+    # sentence became "combobox select employee". Orphans the day's earlier
+    # decompositions (73189d7e98b77d8e, 24278f203524c274); the next run re-decomposes.
+    "payroll_food_limited_e2e_rti": "d96d84af87ab5da5",
 }
 
 

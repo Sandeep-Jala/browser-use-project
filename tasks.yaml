@@ -601,12 +601,17 @@ crm_add_contact:
 # that populated the library: sentence 1 replays the navigation entry, the fakenamegenerator
 # sentence replays the committed helper-tab skill, and the import sentence replays the
 # committed upload skill. Do NOT reword casually — prompt text is identity.
+# 2026-07-29 deliberate reword (all three copies identically): the fakenamegenerator sentence
+# now opens gen-male-gd-uk.php directly — the URL pre-encodes male/Scottish/UK and generates a
+# fresh identity per load, so the step is load -> extract -> done instead of driving three
+# dropdowns + Generate on an ad-heavy page. Old helper-tab segment cc27ec56df2ab562 is
+# orphaned; the first run after this records its replacement.
 payroll_add_generated_employee:
   prompt: >-
     go to Payroll module, search and select Food Limited business name, go to employee section.
-    Open a new tab, go to https://www.fakenamegenerator.com/ , set Name to Scottish, gender
-    to Male and Country to United Kingdom, click Generate, and note the generated identity;
-    remember Name,gender , Address and Date of birth. Add Employee using the noted generated
+    Open a new tab, go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this URL directly
+    shows a freshly generated identity: male, Scottish name set, United Kingdom), and note the
+    generated identity; remember Name, gender (Male), Address and Date of birth. Add Employee using the noted generated
     name, address, gender and date of birth (dd/mm/yyyy), join date 06/04/2026, select join
     with as existing employee, NI number AB341254C, NI category A, gross pay 3500, select
     student loan with start date 06/04/2026, and postgraduate loan from 06/04/2026 with end
@@ -633,7 +638,7 @@ payroll_pay_forecast:
   # Edit-forecast + download flow: no create-write POST, so the marker is intentionally omitted
   # (success comes from the segment gates + judge). Downloads land in the browser's download dir.
   prompt: >-
-    go to Payroll module, search and select FOOD LIMITED business name, go to pay forecast, search for employee Bailey Stevenson in the combobox search employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then Clear the pay of Dec-26 and set it to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
+    go to Payroll module, search and select FOOD LIMITED business name, go to pay forecast, search for employee Bailey Stevenson in the combobox select employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then Clear the pay of Dec-26 and set it to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
     select download, select PDF, then select download and select Excel.
   tags: [payroll]
 
@@ -652,14 +657,14 @@ crm_data_request:
 payroll_food_limited_e2e:
   prompt: >-
     go to Payroll module, search and select FOOD LIMITED business name, go to employee section.
-    Open a new tab, go to https://www.fakenamegenerator.com/ , set Name to Scottish, gender to
-    Male and Country to United Kingdom, click Generate, and note the generated identity; remember
-    Name,gender , Address and Date of birth. Add Employee using the noted generated name, address,
+    Open a new tab, go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this URL directly
+    shows a freshly generated identity: male, Scottish name set, United Kingdom), and note the
+    generated identity; remember Name, gender (Male), Address and Date of birth. Add Employee using the noted generated name, address,
     gender and date of birth (dd/mm/yyyy), join date 06/04/2026, select join with as existing
     employee, NI number  should be AB followed by a random 6 digit number and end with C, NI
     category A, gross pay 3500, select student loan with start date 06/04/2026, and postgraduate
     loan from 06/04/2026 with end date 01/07/2027, and save. Then go to pay forecast, search for
-    employee which we added in the combobox search employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then set the pay of Dec-26 to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
+    employee which we added in the combobox select employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then set the pay of Dec-26 to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
     select download, select PDF, then select download and select Excel. Then go to data request,
     click add request, click payroll review, click standard, select employee, click save, Now in this send email section, change from to no-reply, and click send, if the send email section is not closed, click save again. Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and click the blue Sent badge in its Status column to open the Payroll Status dialog. In that dialog set Status to Submitted, type well done in the Notes field, and click Save. Then click the ref. no. link on that same top row to open the Payroll Review panel, tick the Select Employee checkbox at the top of that panel so the Verify button becomes enabled, and click Verify.
   tags: [payroll]
@@ -698,29 +703,27 @@ payroll_rti_process:
 payroll_food_limited_e2e_rti:
   prompt: >-
     go to Payroll module, search and select FOOD LIMITED business name, go to employee section.
-    Open a new tab, go to https://www.fakenamegenerator.com/ , set Name to Scottish, gender to
-    Male and Country to United Kingdom, click Generate, and note the generated identity; remember
-    Name,gender , Address and Date of birth. Add Employee using the noted generated name, address,
+    Open a new tab, go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this URL directly
+    shows a freshly generated identity: male, Scottish name set, United Kingdom), and note the
+    generated identity; remember Name, gender (Male), Address and Date of birth. Add Employee using the noted generated name, address,
     gender and date of birth (dd/mm/yyyy), join date 06/04/2026, select join with as existing
     employee, NI number  should be AB followed by a random 6 digit number and end with C, NI
     category A, gross pay 3500, select student loan with start date 06/04/2026, and postgraduate
     loan from 06/04/2026 with end date 01/07/2027, and save. Then go to pay forecast, search for
-    employee which we added in the combobox search employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then set the pay of Dec-26 to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
+    employee which we added in the combobox select employee, and if no data is shown, refresh the page and enter the employee name again, repeating until you see that the employee's pay rows have loaded. Then set the pay of Dec-26 to 5000, and set the net pay of Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. If a value does not load or a field keeps its old value, refresh the page, enter the employee name again, and redo that change.
     select download, select PDF, then select download and select Excel. Then go to data request,
     click add request, click payroll review, click standard, select employee, click save, Now in this send email section, change from to no-reply, and click send, if the send email section is not closed, click save again. Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and click the blue Sent badge in its Status column to open the Payroll Status dialog. In that dialog set Status to Submitted, type well done in the Notes field, and click Save. Then click the ref. no. link on that same top row to open the Payroll Review panel, tick the Select Employee checkbox at the top of that panel so the Verify button becomes enabled, and click Verify.
     go to Payroll & RTI, Set the date to May-26, click Save & Next. If a pop up appears, select 'don't show this again' and click Process.
     Process the existing employees one at a time by clicking Save & Next, and after each click
-    check that the next employee has loaded (never click an employee's name in the list to
-    jump ahead), stopping as soon as Owen Millar is the employee shown. If you see an error
+    check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Owen Millar is the employee shown. If you see an error
     'The employer pay is lower than the minimum wage rate', click Add Payment, set Amount to
     5000, and click Save & Next. With Owen Millar shown as the current employee, click Add
     Expenses or Benefits, set Type to 'Assets transferred' from April 2026 to May 2026,
     set Cost to 200,set Employee contribution to 100, and click Save, then select Addition or Deduction, set Type to
     'Additions', amount is 500, period to is May 26, name is bonus and click Save. Continue
-    clicking Save & Next one employee at a time in the same way (check that each save
-    advances to the next employee, and never click a name in the list) until Struan
-    Gallagher is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee panel, select document
-    New_Employees_List_-_WI_LTD.csv, and Submit, In case FPS of a employee already done, unselect that employee and redo it again. Then go to Payroll & RTI, change the date
+    clicking Save & Next one employee at a time in the same way, if the Save and next is disabled move on to the next employee, until Struan
+    Gallagher is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee list,unselect all the employee, Select the employee we added earlier,Click on FPS, select document
+    New_Employees_List_-_WI_LTD.csv, and Submit. Then go to Payroll & RTI, change the date
     to next month, and click Save & Next 3 times. Then go to clients, go to practice
     settings, click edit, select alphabetic order A to Z, and save.
   tags: [payroll]

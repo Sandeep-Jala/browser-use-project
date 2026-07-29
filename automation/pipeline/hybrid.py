@@ -46,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.async_api import Page
 
@@ -67,6 +68,57 @@ logger = logging.getLogger("framework.hybrid")
 # A library entry that fails this many CONSECUTIVE replays is stale by definition: archive
 # it so the next run authors a clean replacement (see subtask_store.archive_if_failing).
 _ARCHIVE_AFTER_FAILURES = 2
+
+# Ad/tracker hosts blocked in HELPER TABS ONLY (open_aux_tab): foreign sites the aux
+# machinery visits are ad-saturated (fakenamegenerator's ad iframes pushed every DOM
+# snapshot to 15-30s+ and timed out the watchdogs), and an aux tab exists to read one
+# fact, never to render ads. The app tab is untouched. Keep this list to PURE ad/tracking
+# domains — NEVER add CMP/consent hosts (cookielaw.org, consensu.org, consentmanager.net):
+# recordings legitimately click the consent banner, which must keep appearing.
+_AUX_BLOCKED_HOSTS = frozenset({
+    "adnxs.com",
+    "adsafeprotected.com",
+    "adservice.google.com",
+    "amazon-adsystem.com",
+    "casalemedia.com",
+    "criteo.com",
+    "doubleclick.net",
+    "google-analytics.com",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "googletagservices.com",
+    "openx.net",
+    "outbrain.com",
+    "pubmatic.com",
+    "rubiconproject.com",
+    "taboola.com",
+})
+
+
+def _is_blocked_ad_host(url: str) -> bool:
+    """True when `url`'s host is (or is a subdomain of) a blocked ad/tracker domain."""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _AUX_BLOCKED_HOSTS)
+
+
+async def _abort_ad_requests(route) -> None:
+    """page.route handler for aux tabs: abort ad/tracker requests, pass everything else.
+    A handler that neither aborts nor continues would hang its request, so every path
+    falls back to continue_."""
+    try:
+        if _is_blocked_ad_host(route.request.url):
+            logger.debug("aux tab blocked ad request: %s", route.request.url[:120])
+            await route.abort()
+            return
+    except Exception:  # noqa: BLE001 - blocking is best-effort sugar
+        pass
+    try:
+        await route.continue_()
+    except Exception as exc:  # noqa: BLE001 - request likely gone (tab closing)
+        logger.debug("aux tab route continue_ failed: %s", exc)
 
 
 # ------------------------------- gates -------------------------------
@@ -465,6 +517,14 @@ class HybridSession:
             logger.debug("window.open helper-tab path failed (%s); falling back to "
                          "context.new_page (may open as a separate window)", exc)
             page = await main.context.new_page()
+        try:
+            # Registered BEFORE the goto so the initial ad barrage never loads. Dies with
+            # the page in close_aux_tab; the app tab never gets a route.
+            await page.route("**/*", _abort_ad_requests)
+            logger.info("aux tab: ad/tracker request blocking active (%d hosts; app tab "
+                        "untouched)", len(_AUX_BLOCKED_HOSTS))
+        except Exception as exc:  # noqa: BLE001 - blocking is best-effort sugar
+            logger.debug("aux tab ad blocking unavailable: %s", exc)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         except Exception:
