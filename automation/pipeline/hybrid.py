@@ -41,6 +41,7 @@ import json
 import logging
 import re
 import shutil
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -318,6 +319,11 @@ class Segment:
     # Files downloaded during this segment's window (basenames; the files live in the
     # run's artifacts downloads/ folder).
     downloads: list[str] = field(default_factory=list)
+    # Why this segment did NOT replay (None on replays): "fresh" | "reauthor" | "judge" |
+    # "loop" | "conditional" | "dynamic" | "no_entry" | "identity_fork" |
+    # "values_unresolved". The answer to "why didn't it use the recording?" without
+    # archaeology — surfaced in the report row and the run summary.
+    skip_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -327,8 +333,47 @@ class Segment:
             "duration_seconds": round(self.duration_seconds, 1),
             "healed_steps": self.healed_steps, "tokens": self.tokens, "error": self.error,
             "finding": self.finding, "extracted": self.extracted,
-            "downloads": self.downloads,
+            "downloads": self.downloads, "skip_reason": self.skip_reason,
         }
+
+
+def _write_progress(hs: "HybridSession", *, task: str, tid: str, subtasks: list[Any],
+                    segments: list[Segment], status: str,
+                    is_successful: bool | None = None) -> None:
+    """Persist the run's machine-readable state so far to <run_dir>/progress.json.
+
+    Called at every segment boundary: report.json exists only after a CLEAN finish (it is
+    assembled after finalize and written by __main__), so a crashed or killed run used to
+    leave no per-segment record at all — no gates, no modes, no skip_reason breakdown to do
+    forensics on. progress.json is that evidence, updated as the run advances; the final
+    write flips status to "finished". The collectors flush at the same boundary so
+    network.json/console.json survive a hard kill as of the last completed segment.
+    Persistence is best-effort by rule: an evidence write must never break the run.
+    """
+    try:
+        payload = {
+            "run_id": hs.run_id,
+            "task": task,
+            "task_id": tid,
+            "status": status,
+            "started": hs.started.isoformat(timespec="seconds"),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "subtasks_total": len(subtasks),
+            "planned": [{"prompt": s.template_prompt, "kind": getattr(s, "kind", "action")}
+                        for s in subtasks],
+            "segments": [s.as_dict() for s in segments],
+            "is_successful": is_successful,
+        }
+        _atomic_write(hs.run_dir / "progress.json",
+                      json.dumps(payload, indent=2, default=str))
+    except Exception as exc:  # noqa: BLE001 - evidence write must never break the run
+        logger.exception("progress.json write failed: %s", exc)
+    for collector in getattr(hs, "collectors", None) or []:
+        try:
+            collector.write()
+        except Exception as exc:  # noqa: BLE001 - same rule as above
+            logger.exception("collector %s mid-run flush failed: %s",
+                             getattr(collector, "name", "?"), exc)
 
 
 # ------------------------------- the shared session -------------------------------
@@ -733,6 +778,7 @@ class HybridSession:
             owns_save=gate.kind == "marker",
             downloads_file=gate.kind == "download",
             findings=findings, observe=kind == "judge", loop=kind == "loop",
+            conditional=is_conditional_guard(sub.template_prompt),
             aux_tab=getattr(sub, "tab_url", None))
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
                       context=context, mode="authored", kind=kind)
@@ -881,6 +927,26 @@ def _step_value_candidates(steps: list[dict[str, Any]]) -> list[tuple[str, str]]
             if step.get("expect_text"):
                 names.append(str(step["expect_text"]))
             out.extend((name, "click") for name in names)
+    return out
+
+
+def _unattributed_typed_values(steps: list[dict[str, Any]], prompt: str,
+                               flagged: list[str]) -> list[str]:
+    """Typed values with NO provenance at all — absent from the prompt and not flagged
+    for binding. On a CONSUMER segment (wording uses noted data) these are refusal-grade:
+    a RE-FORMATTED runtime value ("October 25, 1971" typed as 25/10/1971) escapes the
+    substring guard entirely, and a baked literal would write the authoring run's data
+    into every later run's records (the DR021/DR022 wrong-record class). Only a commit
+    that accounts for every typed value is honest. Length floor 3 skips micro-picks
+    ("A", "Mr") that carry no identity."""
+    out: list[str] = []
+    for value, kind in _step_value_candidates(steps):
+        value = value.strip()
+        if kind != "typed" or len(value) < 3:
+            continue
+        if value in flagged or value in out or _names_value(prompt, value):
+            continue
+        out.append(value)
     return out
 
 
@@ -1111,6 +1177,7 @@ async def _author_segment(
     dirty: bool = False, prior_failure: str | None = None,
     findings: list[str] | None = None, commit: bool = True,
     run_values: dict[str, str] | None = None,
+    start_url: str | None = None, dynamic: bool = False,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
 
@@ -1125,24 +1192,29 @@ async def _author_segment(
     hollow pass — so nothing of it may ever enter the library.
     """
     segment_started = datetime.now().timestamp()
+    # Authoring records to a TEMP path and promotes only on success: the canonical
+    # recording.json always corresponds to the last COMMITTED skill, and a failed
+    # re-authoring can no longer destroy it (observed live 2026-07-29: a failed --fresh
+    # re-author overwrote the Dec-26 segment's good recording, then set the wreck aside
+    # as .failed.json).
+    rec_tmp = (sstore.recording_path(sid).with_suffix(".new.json")
+               if commit and not dirty else None)
     seg = await hs.agent_segment(
         sub, sid, context, gate, completed=completed, remaining=remaining,
         dirty=dirty, prior_failure=prior_failure, findings=findings,
-        record_path=sstore.recording_path(sid) if commit and not dirty else None,
+        record_path=rec_tmp,
     )
     if not seg.ok:
-        # Keep a FAILED authoring's trace for diagnosis, but OFF the canonical path: the
-        # canonical recording must always correspond to the COMMITTED skill (a failed
-        # --reauthor must not leave its trace under a passing entry's name). The mtime
-        # guard makes sure we only move a trace THIS segment wrote — not a previous
-        # successful run's recording when the agent crashed before saving.
-        rec = sstore.recording_path(sid)
+        # Keep a FAILED authoring's trace for diagnosis, but OFF the canonical path. The
+        # mtime guard makes sure we only move a trace THIS segment wrote — not a stale
+        # temp file orphaned by a crashed earlier run.
         try:
-            if commit and not dirty and rec.exists() \
-                    and rec.stat().st_mtime >= segment_started - 1:
-                rec.replace(rec.with_suffix(".failed.json"))
+            if rec_tmp is not None and rec_tmp.exists() \
+                    and rec_tmp.stat().st_mtime >= segment_started - 1:
+                failed = sstore.recording_path(sid).with_suffix(".failed.json")
+                rec_tmp.replace(failed)
                 logger.info("segment %s: failed authoring trace kept at %s",
-                            sid, rec.with_suffix(".failed.json").name)
+                            sid, failed.name)
         except OSError as exc:
             logger.debug("could not set aside failed recording for %s: %s", sid, exc)
         return seg
@@ -1152,6 +1224,17 @@ async def _author_segment(
         # Recovered in place, but the recording is not committable. A stale entry that keeps
         # failing gets retired so the NEXT run authors a clean replacement.
         sstore.archive_if_failing(sid, threshold=_ARCHIVE_AFTER_FAILURES)
+        return seg
+    # Promote the fresh recording to canonical before compiling from it. A segment that
+    # recorded nothing (or only an orphaned stale temp exists) has nothing to commit —
+    # never re-compile a previous run's trace under a fresh pass.
+    try:
+        if rec_tmp is None or not rec_tmp.exists() \
+                or rec_tmp.stat().st_mtime < segment_started - 1:
+            return seg
+        rec_tmp.replace(sstore.recording_path(sid))
+    except OSError as exc:
+        logger.warning("segment %s: could not promote fresh recording: %s", sid, exc)
         return seg
 
     # Rescue truncation: if the agent flailed after the save landed, cut the segment's
@@ -1193,6 +1276,23 @@ async def _author_segment(
         for value in _body_sourced_values(steps, task_wording, bodies):
             if value not in runtime_values:
                 runtime_values.append(value)
+        if dynamic:
+            # The wording DECLARES consumption of noted data, so this commit is held to
+            # a stricter bar than the substring guard alone: every typed value must be
+            # prompt-sourced or flagged for binding, and there must be something to bind.
+            # An unattributable value may be runtime data the guard cannot see (a
+            # re-formatted date), and a consumer recording with no bindable value at all
+            # keeps the pre-bindings behavior: author fresh every run.
+            loose = _unattributed_typed_values(steps, sub.instantiated_prompt,
+                                               runtime_values)
+            if loose or not runtime_values:
+                sstore.steps_path(sid).unlink(missing_ok=True)
+                what = (f"unattributable typed value(s) "
+                        f"{', '.join(v[:32] for v in loose[:3])}" if loose
+                        else "no bindable runtime value in the recording")
+                print(f"[*] segment [{sid}]: consumes noted data with {what} -> not "
+                      f"cached; future runs author it with their own fresh values")
+                return seg
         bound = None
         if runtime_values:
             sources = {**(run_values or {}), **(seg.extracted or {})}
@@ -1233,6 +1333,10 @@ async def _author_segment(
             context=context, end_context=end_context,
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
+        if start_url:
+            # The raw page the authoring run started from — informational (identity-fork
+            # log lines point here); never navigated to automatically.
+            manifest_fields["start_url"] = start_url
         if bound is not None:
             manifest_fields["bindings"] = bindings
         if getattr(sub, "tab_url", None):
@@ -1295,6 +1399,10 @@ async def run_hybrid_task(
     findings: list[str] = []        # "prompt: observation" lines, fed to later segments
     run_values: dict[str, str] = {}  # structured {label: value} extracts, run-wide
     resolve_binding = _binding_resolver(run_values, hs)
+    # First evidence write BEFORE any segment runs: a run that dies in subtask 0 still
+    # leaves the decomposition plan on disk.
+    _write_progress(hs, task=task, tid=tid, subtasks=subtasks, segments=segments,
+                    status="running")
     try:
         for i, sub in enumerate(subtasks):
             # An aux-tab subtask is keyed on its DECLARED tab URL (host-qualified — see
@@ -1302,8 +1410,9 @@ async def run_hybrid_task(
             # framework's goto(tab_url) IS the replay precondition, and main-page keying
             # would split the identical helper procedure into one entry per hosting task.
             aux_url = getattr(sub, "tab_url", None)
+            raw_start_url = aux_url or await hs.current_url()
             context = (sstore.normalize_aux_context(aux_url) if aux_url
-                       else sstore.normalize_context(await hs.current_url()))
+                       else sstore.normalize_context(raw_start_url))
             sid = sstore.subtask_id(sub.template_prompt, context)
             force_author = reauthor_match(reauthor, sub)
             is_judge = getattr(sub, "kind", "action") == "judge"
@@ -1313,15 +1422,19 @@ async def run_hybrid_task(
             # branch run must never commit one). See decompose.is_conditional_guard.
             is_conditional = is_conditional_guard(sub.template_prompt)
             # Dynamic-input gate: a subtask whose wording USES data noted by an earlier
-            # segment ("the noted generated name") must not replay once this run HAS such
-            # observations — runtime values are never parameterizable (adapt lifts only
-            # values the prompt spells out), so a cached script would type the AUTHORING
-            # run's concrete ones: stale by construction. It runs with the agent, which
-            # receives the fresh findings, and is never committed — a fresh recording
-            # would just bake THIS run's values as the next run's stale ones. Without
-            # findings there is nothing fresh to be stale against (and nothing the agent
-            # could substitute either), so the zero-LLM replay stays.
-            is_dynamic = bool(findings) and consumes_noted_data(sub.template_prompt)
+            # segment ("the noted generated name") must not replay a plain recording once
+            # this run HAS such observations — runtime values are never parameterizable
+            # (adapt lifts only values the prompt spells out), so a cached script would
+            # type the AUTHORING run's concrete ones: stale by construction. It runs with
+            # the agent, which receives the fresh findings. Its recording IS committed
+            # when the provenance guard can bind EVERY runtime value to a structured
+            # source this run produced ({{bound_N}}, resolved fresh at load time);
+            # unattributable or prose-only values refuse the commit and the segment keeps
+            # authoring each run. Without findings there is nothing fresh to be stale
+            # against (and nothing the agent could substitute either), so the zero-LLM
+            # replay stays.
+            is_consumer = bool(findings) and consumes_noted_data(sub.template_prompt)
+            is_dynamic = is_consumer
 
             # Semantic routing: a wording with NO direct entry may still be a known
             # procedure (alias table -> local embeddings -> one LLM verify). A routed sid
@@ -1348,6 +1461,7 @@ async def run_hybrid_task(
             gate = segment_gate(sub, entry, context)
             remaining = [s.instantiated_prompt for s in subtasks[i + 1:]]
             seg: Segment | None = None
+            skip_reason: str | None = None   # why this subtask did not replay
 
             if is_dynamic and (entry or {}).get("bindings"):
                 # The entry was committed WITH runtime bindings: its dynamic values
@@ -1377,6 +1491,8 @@ async def run_hybrid_task(
                                   mode="authored", kind=getattr(sub, "kind", "action"),
                                   error=f"could not open helper tab {aux_url}: {exc}")
                     segments.append(seg)
+                    _write_progress(hs, task=task, tid=tid, subtasks=subtasks,
+                                    segments=segments, status="running")
                     print(f"[*] subtask {i} [{sid}]: FAILED ({seg.error}) -> stopping "
                           f"task (later subtasks depend on this state)")
                     break
@@ -1440,9 +1556,11 @@ async def run_hybrid_task(
                             seg = await _author_segment(
                                 hs, sub, author_sid, context, gate, completed=completed,
                                 remaining=remaining, dirty=dirty, prior_failure=prior,
-                                findings=takeover_findings, run_values=run_values)
+                                findings=takeover_findings, run_values=run_values,
+                                start_url=raw_start_url, dynamic=is_consumer)
                             seg.mode = "replay_failed->authored"
                     else:
+                        skip_reason = "values_unresolved"
                         print(f"[*] subtask {i} [{sid}]: library hit but values did not "
                               f"resolve -> authoring")
 
@@ -1450,29 +1568,54 @@ async def run_hybrid_task(
                     if force_author and sstore.has_script(sid):
                         # The existing entry stays as the gate's end_context reference and is
                         # only overwritten if the fresh authoring passes its gate.
+                        skip_reason = "reauthor"
                         print(f"[*] subtask {i} [{sid}]: --reauthor -> authoring with the "
                               f"agent (entry replaced only on success)")
                     elif is_judge:
+                        skip_reason = "judge"
                         print(f"[*] subtask {i} [{sid}]: judge node (verification) -> agent "
                               f"runs it live, never cached")
                     elif is_loop:
+                        skip_reason = "loop"
                         print(f"[*] subtask {i} [{sid}]: loop node (repeat-until) -> agent "
                               f"runs it live with an extended step budget, never cached")
                     elif is_conditional:
+                        skip_reason = "conditional"
                         print(f"[*] subtask {i} [{sid}]: conditional branch guard -> agent "
                               f"runs it live, never cached")
                     elif is_dynamic:
+                        skip_reason = "dynamic"
                         print(f"[*] subtask {i} [{sid}]: uses data noted by an earlier "
-                              f"step -> agent runs it with this run's fresh values, "
-                              f"never cached")
+                              f"step -> agent runs it with this run's fresh values "
+                              f"(cached only if the provenance guard can bind them)")
+                    elif fresh and sstore.has_script(sid):
+                        # Without this print a --fresh run with a library hit is
+                        # indistinguishable from a cache miss (observed live 2026-07-29:
+                        # "recordings are never used" was a --fresh run).
+                        skip_reason = "fresh"
+                        print(f"[*] subtask {i} [{sid}]: --fresh -> ignoring the library "
+                              f"entry, re-authoring (entry replaced on success)")
                     elif not sstore.has_script(sid):
-                        print(f"[*] subtask {i} [{sid}]: no library entry -> authoring "
-                              f"with the agent")
+                        fork = sstore.find_same_template_entry(sub.template_prompt, sid)
+                        if fork is not None:
+                            osid, oentry = fork
+                            skip_reason = "identity_fork"
+                            print(f"[*] subtask {i} [{sid}]: identity fork — same wording "
+                                  f"recorded from {oentry.get('context')} as [{osid}] "
+                                  f"(start {oentry.get('start_url') or 'unknown'}), not "
+                                  f"reusable from {context} -> authoring fresh")
+                        else:
+                            skip_reason = "no_entry"
+                            print(f"[*] subtask {i} [{sid}]: no library entry -> authoring "
+                                  f"with the agent")
                     seg = await _author_segment(hs, sub, author_sid, context, gate,
                                                 completed=completed, remaining=remaining,
                                                 findings=findings, run_values=run_values,
+                                                start_url=raw_start_url,
+                                                dynamic=is_consumer,
                                                 commit=not is_judge and not is_loop
-                                                and not is_conditional and not is_dynamic)
+                                                and not is_conditional)
+                    seg.skip_reason = skip_reason
             finally:
                 if aux_url:
                     # Subtask-scoped lifetime: whatever happened above, the helper tab is
@@ -1481,6 +1624,8 @@ async def run_hybrid_task(
                     await hs.close_aux_tab()
 
             segments.append(seg)
+            _write_progress(hs, task=task, tid=tid, subtasks=subtasks, segments=segments,
+                            status="running")
             if not seg.ok:
                 print(f"[*] subtask {i} [{sid}]: FAILED ({seg.error}) -> stopping task "
                       f"(later subtasks depend on this state)")
@@ -1512,11 +1657,22 @@ async def run_hybrid_task(
         result.usage = {"total_tokens": total_tokens, "total_cost": total_cost}
     replayed = sum(1 for s in segments if s.mode == "replay")
     authored = len(segments) - replayed
+    # Break the authored count down by WHY each segment did not replay — a bare
+    # "0 replayed" hides whether the cache was cold, bypassed (--fresh), or the
+    # subtasks are live-by-kind.
+    reasons = Counter(s.skip_reason for s in segments if s.skip_reason)
+    breakdown = ", ".join(f"{n} {r}" for r, n in sorted(reasons.items()))
     result.final_result = (
         f"Hybrid run: {len(segments)}/{len(subtasks)} subtasks "
-        f"({replayed} replayed, {authored} authored)"
+        f"({replayed} replayed, {authored} authored"
+        + (f": {breakdown}" if breakdown else "") + ")"
         + ("" if all_ok else f" — FAILED at subtask {len(segments) - 1}")
     )
+    # Final evidence write: status flips to "finished" with the verdict. report.json (the
+    # richer artifact, written by __main__ AFTER assertions) stays authoritative;
+    # progress.json is kept so a crash between here and report writing still leaves proof.
+    _write_progress(hs, task=task, tid=tid, subtasks=subtasks, segments=segments,
+                    status="finished", is_successful=result.is_successful)
 
     logger.info("◀ HYBRID done %s: success=%s %s", tid, result.is_successful,
                 result.final_result)

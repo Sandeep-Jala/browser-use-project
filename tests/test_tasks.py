@@ -146,7 +146,27 @@ FROZEN_TIDS = {
     # "when we reach employee Name Owen Millar" wording then let the recovery agent jump
     # to Owen by clicking his row, skipping employees). Old decomposition c7485f5b089e1f4d
     # and its loop entry (0b3f702083deb2c0) are orphaned.
-    "payroll_rti_process": "5d74633bf54934cd",
+    # Re-frozen 2026-07-30: (a) the morning's user edits (Alan Marshall / David Williamson
+    # retargets, disabled-button clauses) had already drifted the pin past 5d74633bf54934cd;
+    # (b) both date lines disambiguated to "using the period dropdown in the top bar,
+    # set/change the period ..." after the wrong-referent runaway — "Set the date to
+    # May-26" made the agent type a fabricated 26/05/2026 into the per-employee Pay date
+    # field and loop Save & Next across 5 employees under Apr-26 before finding the
+    # top-bar dropdown; (c) the SECOND employee pass regained "and after each click check
+    # that the next employee has loaded" so it classifies loop again (the 07-29 reword had
+    # dropped its judge phrase, silently demoting it to a cacheable fixed-click action).
+    # Orphans today's decomposition 853742267f5ce2ca (left on disk, inert).
+    # Re-frozen 2026-07-30 PM: (a) the popup conditional gained its explicit false
+    # branch ("if no pop up appears, do nothing ... never click other buttons to make
+    # it appear") — with the popup suppressed server-side (SkipNotification flag from
+    # an earlier session), the agent hunted for "Process" and find_by_text resolved it
+    # via tooltip text to the "Reminder to process the payroll" icon button, opening
+    # and closing the email compose modal in an endless loop (one Send POST luckily
+    # bounced: "Email not sent"); (b) "then click Save & Next" became "once (... do
+    # not click it again)" — the pay run completes async, the agent re-clicked while
+    # waiting and ran 4 pay runs, committing a 4-click recording for a 1-click step
+    # (0725aaf250fbb33f, archived). Orphans decomposition 31eb68f783fe19c8.
+    "payroll_rti_process": "8f5655d8d70671e6",
     # Re-frozen 2026-07-27: the data-request tail was rewritten in ALL THREE copies that
     # carry it (here, crm_data_request, payroll_food_limited_e2e) against screenshots of the
     # real UI — the old "click on status sent ... select status Sent/Submitted, Note well
@@ -169,7 +189,15 @@ FROZEN_TIDS = {
     # advances ... never click a name" parenthetical), and the shared pay-forecast
     # sentence became "combobox select employee". Orphans the day's earlier
     # decompositions (73189d7e98b77d8e, 24278f203524c274); the next run re-decomposes.
-    "payroll_food_limited_e2e_rti": "d96d84af87ab5da5",
+    # Re-frozen 2026-07-30: same three RTI-half edits as payroll_rti_process (employee-name
+    # retargets had already drifted the pin past d96d84af87ab5da5; period-dropdown
+    # disambiguation of both date lines; second pass regained its check-that clause ->
+    # loop kind), applied to this copy deliberately so the reworded period/loop subtasks
+    # keep one shared wording identity across both tasks.
+    # Re-frozen 2026-07-30 PM: same two RTI-half edits as payroll_rti_process (popup
+    # conditional false branch, single-click Save & Next clause), applied to this copy
+    # deliberately to keep the shared wording identity. Orphans 994afb778ccdf6e3.
+    "payroll_food_limited_e2e_rti": "7ced6865d976ab1c",
 }
 
 

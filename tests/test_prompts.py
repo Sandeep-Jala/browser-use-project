@@ -6,12 +6,13 @@ from automation.pipeline.hybrid import Gate, _describe_expected_end
 from automation.pipeline.prompts import SPEED_OPTIMIZATION_PROMPT, scoped_subtask_prompt
 
 
-def test_system_rules_match_one_action_per_step():
-    # The old "Chain multiple safe actions" advice contradicted max_actions_per_step=1
-    # (runner.py): the model planned chains that got truncated, then acted on a false
-    # world model. The rule must state the real contract.
+def test_system_rules_match_max_actions_per_step():
+    # The prompt must state the real contract set by max_actions_per_step in runner.py
+    # (raised 1→4, 2026-07-30): batching is allowed only across non-re-rendering actions,
+    # and any page-changing action must end the step (stale-index guard).
     assert "Chain multiple" not in SPEED_OPTIMIZATION_PROMPT
-    assert "ONE action per step" in SPEED_OPTIMIZATION_PROMPT
+    assert "up to 4 actions per step" in SPEED_OPTIMIZATION_PROMPT
+    assert "stale element indices" in SPEED_OPTIMIZATION_PROMPT
 
 
 def test_system_rules_carry_discovery_and_settle_blocks():
@@ -78,8 +79,17 @@ def test_scoped_prompt_findings_and_observe_blocks():
     assert "CC = billing@acme.com" in p
     assert "OBSERVATION/VERIFICATION step" in p
     assert "WHAT YOU OBSERVED" in p
-    # Honest-reporting demand is part of the observe contract.
-    assert "if the check does NOT hold" in p
+    # Honest-reporting demand cuts BOTH ways: a check the wording states must be
+    # compared and failed honestly when it does not hold...
+    assert "stated check does NOT hold" in p
+    assert "finish with success=false" in p
+    # ...but the criteria come from the step wording ALONE — a button labeled
+    # 'Verify' drew judge framing onto a pure-action step, the agent invented a
+    # post-click status expectation and false-negatived the whole run.
+    assert "ONLY pass/fail criteria" in p
+    assert "NEVER invent an expected outcome" in p
+    assert "clean receipts IS success" in p
+    assert "end state you observed as FACT" in p
 
 
 def test_scoped_prompt_defaults_omit_findings_and_observe():
@@ -105,6 +115,30 @@ def test_scoped_prompt_loop_block():
     assert "OBSERVATION/VERIFICATION" not in p
     # And the block stays out of every non-loop prompt.
     assert "LOOP step" not in scoped_subtask_prompt("go to Estimates", [], [])
+
+
+def test_scoped_prompt_conditional_block():
+    """The branch-guard contract: condition absent -> immediate no-op success. Without
+    it, the generic end-state footer made the agent treat a vacuous pass as a failed
+    run and hunt for controls matching the branch's action words — observed live: a
+    server-suppressed popup's 'click Process' resolved via tooltip text to the
+    'Reminder to process the payroll' icon button, opening the email modal in an
+    endless open/close loop (and completing two unintended pay runs on the way)."""
+    p = scoped_subtask_prompt(
+        "If a pop up appears, select 'don't show this again' and click Process",
+        [], [], conditional=True)
+    assert "CONDITIONAL step" in p
+    assert "ONLY IF" in p
+    assert "success=true immediately" in p
+    assert "condition did not occur" in p
+    assert "NEVER click" in p and "MAKE the condition true" in p
+    # The tooltip-word trap named generically: no clicking a control just because its
+    # name echoes a word from the branch's actions.
+    assert "name or tooltip contains a word" in p
+    # Both branches stay live: a true condition still performs the stated actions.
+    assert "condition DOES hold" in p
+    # And the block stays out of every non-conditional prompt.
+    assert "CONDITIONAL step" not in scoped_subtask_prompt("go to Estimates", [], [])
 
 
 def test_scoped_prompt_download_contract():

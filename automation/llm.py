@@ -34,12 +34,14 @@ def build_llm(config: Config) -> BaseChatModel:
             # frequency_penalty is deliberately left at its 0.3 default: it exists to stop
             # gpt-4.1-mini's runaway "\t" generation — do not zero it.
             max_retries=5,
-            # Applied only to reasoning models (o4-mini): "low" (browser-use's default)
+            # Applied only to reasoning models (o4-mini). "low" (browser-use's default)
             # produced shallow moves — saving before mandatory fields, a fixed NI where
-            # the task said random. The cap must rise with the effort: completion tokens
+            # the task said random — and reacted to app errors without connecting them to
+            # earlier steps; raised to "medium" 2026-07-30 (user-approved) for exactly that
+            # causal-reasoning depth. The cap must rise with the effort: completion tokens
             # INCLUDE the hidden reasoning tokens, and medium effort at 4096 risks
-            # finish_reason='length' with empty content.
-            reasoning_effort="low",
+            # finish_reason='length' with empty content (8192 is sized for medium).
+            reasoning_effort="medium",
             max_completion_tokens=8192,
             # max_completion_tokens= 4096,
             # Best-effort determinism: at temperature 0, Azure still varies across backend

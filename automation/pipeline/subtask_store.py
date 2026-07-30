@@ -122,17 +122,36 @@ def task_id(prompt: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
-def subtask_id(template_prompt: str, context: str) -> str:
-    """Stable short id for a (tokenized subtask prompt, starting context) pair.
-
-    Normalized hard so decompositions of DIFFERENT parent tasks converge on one entry:
-    whitespace collapsed, lowercased, token names erased ({{business}} == {{business_name}}
-    — wording carries the identity, not what the LLM called the slot), and trailing
-    punctuation dropped (where the decomposer cuts a span decides whether it ends in '.').
-    """
+def normalize_template(template_prompt: str) -> str:
+    """The wording half of a subtask's identity, normalized hard so decompositions of
+    DIFFERENT parent tasks converge on one entry: whitespace collapsed, lowercased, token
+    names erased ({{business}} == {{business_name}} — wording carries the identity, not
+    what the LLM called the slot), and trailing punctuation dropped (where the decomposer
+    cuts a span decides whether it ends in '.')."""
     norm = " ".join(template_prompt.split()).lower()
-    norm = TOKEN_RE.sub("{{*}}", norm).rstrip(" .,;")
+    return TOKEN_RE.sub("{{*}}", norm).rstrip(" .,;")
+
+
+def subtask_id(template_prompt: str, context: str) -> str:
+    """Stable short id for a (tokenized subtask prompt, starting context) pair."""
+    norm = normalize_template(template_prompt)
     return hashlib.sha256(f"{norm}\n{context}".encode("utf-8")).hexdigest()[:16]
+
+
+def find_same_template_entry(template_prompt: str,
+                             exclude_sid: str) -> tuple[str, dict[str, Any]] | None:
+    """First manifest entry with the same normalized wording under a DIFFERENT sid.
+
+    That is an identity fork: sids key on wording + start context, so the same subtask
+    recorded from another starting page is invisible to a direct lookup. Surfaced (not
+    auto-replayed — navigating to a stored URL can cross run-specific records) so the
+    log can say a recording exists but is unreachable from here."""
+    tnorm = normalize_template(template_prompt)
+    for osid, entry in load_manifest().items():
+        if osid != exclude_sid \
+                and normalize_template(str(entry.get("template_prompt") or "")) == tnorm:
+            return osid, entry
+    return None
 
 
 def steps_path(sid: str) -> Path:

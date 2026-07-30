@@ -675,19 +675,17 @@ payroll_food_limited_e2e:
 # chain with conditional branches, so marker is omitted (no single fragment gates every write).
 payroll_rti_process:
   prompt: >-
-    go to Payroll module, search and select FOOD LIMITED business name, go to Payroll & RTI click Save & Next. If a pop up appears, select 'don't show this again' and click Process.
+    go to Payroll module, search and select FOOD LIMITED business name, go to Payroll & RTI, Set the date to May-26, click Save & Next. If a pop up appears, select 'don't show this again' and click Process.
     Process the existing employees one at a time by clicking Save & Next, and after each click
-    check that the next employee has loaded (never click an employee's name in the list to
-    jump ahead), stopping as soon as Owen Millar is the employee shown. If you see an error
+    check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Owen Millar is the employee shown. If you see an error
     'The employer pay is lower than the minimum wage rate', click Add Payment, set Amount to
-    5000, and click Save & Next. With Owen Millar shown as the current employee, click Add
+    5000, and click Save & Next. With Alan Marshall shown as the current employee, click Add
     Expenses or Benefits, set Type to 'Assets transferred' from April 2026 to May 2026,
     set Cost to 200,set Employee contribution to 100, and click Save, then select Addition or Deduction, set Type to
     'Additions', amount is 500, period to is May 26, name is bonus and click Save. Continue
-    clicking Save & Next one employee at a time in the same way (check that each save
-    advances to the next employee, and never click a name in the list) until Struan
-    Gallagher is the employee shown.Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee panel, select document
-    New_Employees_List_-_WI_LTD.csv, and Submit, In case FPS of a employee already done, unselect that employee and redo it again. Then go to Payroll & RTI, change the date
+    clicking Save & Next one employee at a time in the same way, if the Save and next is disabled move on to the next employee, until David Williamson
+    is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee list,unselect all the employee, Select the employee we added earlier,Click on FPS, select document
+    New_Employees_List_-_WI_LTD.csv, and Submit. Then go to Payroll & RTI, change the date
     to next month, and click Save & Next 3 times. Then go to clients, go to practice
     settings, click edit, select alphabetic order A to Z, and save.
   tags: [payroll]
@@ -717,12 +715,12 @@ payroll_food_limited_e2e_rti:
     Process the existing employees one at a time by clicking Save & Next, and after each click
     check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Owen Millar is the employee shown. If you see an error
     'The employer pay is lower than the minimum wage rate', click Add Payment, set Amount to
-    5000, and click Save & Next. With Owen Millar shown as the current employee, click Add
+    5000, and click Save & Next. With Alan Marshall shown as the current employee, click Add
     Expenses or Benefits, set Type to 'Assets transferred' from April 2026 to May 2026,
     set Cost to 200,set Employee contribution to 100, and click Save, then select Addition or Deduction, set Type to
     'Additions', amount is 500, period to is May 26, name is bonus and click Save. Continue
-    clicking Save & Next one employee at a time in the same way, if the Save and next is disabled move on to the next employee, until Struan
-    Gallagher is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee list,unselect all the employee, Select the employee we added earlier,Click on FPS, select document
+    clicking Save & Next one employee at a time in the same way, if the Save and next is disabled move on to the next employee, until David Williamson
+    is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee list,unselect all the employee, Select the employee we added earlier,Click on FPS, select document
     New_Employees_List_-_WI_LTD.csv, and Submit. Then go to Payroll & RTI, change the date
     to next month, and click Save & Next 3 times. Then go to clients, go to practice
     settings, click edit, select alphabetic order A to Z, and save.

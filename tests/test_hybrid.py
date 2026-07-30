@@ -4,6 +4,9 @@ The browser-facing surface (HybridSession) is faked via an injected seam, while 
 the library commit rules (_author_segment), and the gate evaluation run for real against
 tmp_path-monkeypatched stores."""
 import json
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -60,12 +63,19 @@ class FakeSession:
     findings list each agent call received (the carry-over channel under test)."""
 
     def __init__(self, runner, *, replays=None, agents=None, create_write_seen=True,
-                 recording=None):
+                 recording=None, run_dir=None):
         self.runner = runner
         self.replays = list(replays or [])
         self.agents = list(agents or [])
         self.create_write_seen = create_write_seen
         self.recording = recording or FAKE_RECORDING
+        # Progress-artifact surface (_write_progress reads these at every segment
+        # boundary). Defaults to a throwaway dir so tests that don't inspect
+        # progress.json never write into the repo CWD.
+        self.run_id = "test"
+        self.run_dir = Path(run_dir) if run_dir else Path(tempfile.mkdtemp(prefix="fake-run-"))
+        self.started = datetime.now()
+        self.collectors = []
         self.replay_calls = 0
         self.agent_calls = 0
         self.findings_seen = []
@@ -124,10 +134,11 @@ class FakeSession:
         return _skeleton_result(ground_truth=gt)
 
 
-def _seg(ok, *, executed=0, error=None, mode="replay", write_step=None, finding=None):
+def _seg(ok, *, executed=0, error=None, mode="replay", write_step=None, finding=None,
+         extracted=None):
     return Segment(index=0, sid="", prompt="", context="", mode=mode, ok=ok,
                    steps_executed=executed, error=error, write_step=write_step,
-                   finding=finding)
+                   finding=finding, extracted=extracted)
 
 
 def _runner():
@@ -260,6 +271,7 @@ async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
     assert result.is_successful is True
     assert fake.replay_calls == 0 and fake.agent_calls == 2
     assert [s["kind"] for s in result.subtasks] == ["action", "judge"]
+    assert result.subtasks[1]["skip_reason"] == "judge"
     # The judge agent ran WITHOUT a recording path, and the hollow entry was not replaced.
     assert fake.record_paths[1] is None
     assert not ss.recording_path(judge_sid).exists()
@@ -467,6 +479,50 @@ async def test_parent_marker_gate_still_required(stores, monkeypatch):
     assert result.is_successful is False
 
 
+# ------------------------------- progress artifact -------------------------------
+
+
+async def test_progress_json_written_and_finished(stores, monkeypatch):
+    """A clean run leaves progress.json with status "finished" and every segment record."""
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")],
+                       run_dir=stores / "artifacts")
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    progress = json.loads((stores / "artifacts" / "progress.json").read_text())
+    assert progress["status"] == "finished"
+    assert progress["is_successful"] is True and result.is_successful is True
+    assert progress["subtasks_total"] == 2
+    assert [p["prompt"] for p in progress["planned"]] == [
+        "go to the section.",
+        "add invoice for customer {{customer}} and click save",
+    ]
+    assert len(progress["segments"]) == 2
+    for seg in progress["segments"]:
+        assert "gate" in seg and "skip_reason" in seg and seg["ok"] is True
+
+
+async def test_progress_json_survives_mid_run_crash(stores, monkeypatch):
+    """A crash mid-segment leaves progress.json holding every COMPLETED segment.
+
+    Only one queued agent segment for two subtasks: the second agent call pops an empty
+    list (IndexError), standing in for a real mid-segment crash. run_hybrid_task's result
+    assembly never runs — but the boundary write after segment 0 is already on disk."""
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")],
+                       run_dir=stores / "artifacts")
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    with pytest.raises(IndexError):
+        await _run(fake)
+
+    progress = json.loads((stores / "artifacts" / "progress.json").read_text())
+    assert progress["status"] == "running"       # the final "finished" write never ran
+    assert progress["subtasks_total"] == 2
+    assert len(progress["segments"]) == 1        # segment 0 persisted before the crash
+    assert progress["segments"][0]["ok"] is True
+    assert progress["is_successful"] is None
+
+
 # ------------------------------- aux-tab subtasks -------------------------------
 
 
@@ -618,8 +674,9 @@ NOTED_SPEC = TaskSpec(
 async def test_noted_data_consumer_never_replays_and_retires_entry(stores, monkeypatch):
     """A subtask that USES data noted by an earlier segment must not replay its cached
     recording (it would type the AUTHORING run's stale values — the observed Add Employee
-    bug): the stale entry is retired, the agent runs the segment with this run's fresh
-    findings, and the fresh recording is never committed."""
+    bug): the stale entry is retired and the agent runs the segment with this run's fresh
+    findings. The fresh recording IS taken now (the provenance guard decides commit), but
+    with nothing bindable in it the guard refuses and nothing enters the library."""
     ctx = ss.normalize_context("http://app/section")
     consumer_sid = ss.subtask_id(NOTED_SPEC.subtasks[1].prompt, ctx)
     _seed_entry(consumer_sid)   # concrete values baked by a previous authoring run
@@ -637,12 +694,14 @@ async def test_noted_data_consumer_never_replays_and_retires_entry(stores, monke
     assert fake.findings_seen[1] == [
         "open the generator and note the generated identity.: "
         "generated_name = Kerris McKay"]
-    # Stale entry retired; the fresh run recorded nothing and committed nothing.
+    # Stale entry retired; the guard-refused fresh recording committed nothing.
     assert not ss.has_script(consumer_sid)
     assert consumer_sid not in ss.load_manifest()
     assert list((ss.LIBRARY_DIR / "archive").glob(f"{consumer_sid}.steps.*.json"))
-    assert fake.record_paths[1] is None
+    # The consumer DID record (to the temp path) — commit is the guard's call now.
+    assert fake.record_paths[1] is not None
     assert result.subtasks[1]["mode"] == "authored"
+    assert result.subtasks[1]["skip_reason"] == "dynamic"
 
 
 async def test_noted_consumer_replays_when_nothing_was_noted_this_run(stores, monkeypatch):
@@ -667,6 +726,169 @@ async def test_noted_consumer_replays_when_nothing_was_noted_this_run(stores, mo
     assert fake.replay_calls == 2 and fake.agent_calls == 0
     assert ss.has_script(consumer_sid)
     assert consumer_sid in ss.load_manifest()
+
+
+BOUND_PROMPT = ("load the identity page. "
+                "add employee using the noted generated name and save")
+BOUND_SPEC = TaskSpec(key="b1", prompt=BOUND_PROMPT, subtasks=(
+    SubtaskDecl(prompt="load the identity page."),
+    SubtaskDecl(prompt="add employee using the noted generated name and save"),
+))
+
+
+def _fill_steps_stub(steps):
+    """A hybrid.save_steps stand-in: pretend the recording compiled to `steps`."""
+    def stub(rec, steps_path, max_steps=None, emit_start_goto=False):
+        steps_path.parent.mkdir(parents=True, exist_ok=True)
+        steps_path.write_text(json.dumps(steps))
+        return steps
+    return stub
+
+
+async def test_consumer_with_structured_source_commits_bindings_then_replays(
+        stores, monkeypatch):
+    """The 2026-07-24 runtime-bindings reversal, completed: a consumer segment whose
+    runtime values ALL bind to a structured source (an extract label this run captured)
+    commits WITH bindings — and the next run replays it zero-LLM, resolving the bound
+    value from its OWN fresh data instead of the authoring run's literal."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "fill", "selectors": ["css=#name"], "value": "Kerris McKay"},
+        {"action": "click", "selectors": ['text="Save"']},
+    ]))
+
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
+             extracted={"generated_name": "Kerris McKay"}),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
+                                   spec=BOUND_SPEC)
+
+    assert result.is_successful is True
+    entry = ss.load_manifest()[consumer_sid]
+    assert entry["bindings"] == {"bound_1": {"kind": "extract",
+                                             "label": "generated_name"}}
+    assert entry["params"] == {"bound_1": "Kerris McKay"}
+    assert entry["start_url"] == "http://app/section"
+    # The committed template carries the token, not the authoring literal (the tier-1
+    # transpiler may consume steps.json into a code skill; the template is canonical).
+    tmpl = json.loads(ss.template_path(consumer_sid).read_text())
+    assert tmpl["steps"][0]["value"] == "{{bound_1}}"
+    assert result.subtasks[1]["skip_reason"] == "dynamic"
+
+    # Next run: the producer's fresh extract resolves the binding -> zero-LLM replay.
+    fake2 = FakeSession(_runner(), replays=[
+        _seg(True, finding="generated_name = Struan Boyd",
+             extracted={"generated_name": "Struan Boyd"}),
+        _seg(True),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake2))
+    result2 = await run_hybrid_task(fake2.runner or _runner(), BOUND_PROMPT,
+                                    spec=BOUND_SPEC)
+
+    assert result2.is_successful is True
+    assert fake2.replay_calls == 2 and fake2.agent_calls == 0
+    assert result2.subtasks[1]["mode"] == "replay"
+    assert result2.subtasks[1]["skip_reason"] is None
+
+
+async def test_consumer_commit_refused_when_a_typed_value_has_no_provenance(
+        stores, monkeypatch):
+    """The reformat hole stays closed: a consumer recording carrying a typed value that
+    is neither prompt-sourced nor bindable (e.g. a re-formatted date the substring guard
+    cannot see) must NOT commit — a baked literal would write the authoring run's data
+    into every later run's records (the DR021/DR022 wrong-record class)."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "fill", "selectors": ["css=#name"], "value": "Kerris McKay"},
+        {"action": "fill", "selectors": ["css=#dob"], "value": "25/10/1971"},
+        {"action": "click", "selectors": ['text="Save"']},
+    ]))
+
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
+             extracted={"generated_name": "Kerris McKay"}),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
+                                   spec=BOUND_SPEC)
+
+    assert result.is_successful is True
+    assert consumer_sid not in ss.load_manifest()
+    assert not ss.has_script(consumer_sid)
+
+
+async def test_identity_fork_detected_when_wording_recorded_elsewhere(
+        stores, monkeypatch):
+    """Same wording committed under a DIFFERENT start context is invisible to the direct
+    lookup (sids key wording + context). The miss is no longer silent: the subtask row
+    and the summary name the fork instead of a bare cache miss."""
+    other_sid = ss.subtask_id(SPEC.subtasks[0].prompt, "/other")
+    ss.steps_path(other_sid).parent.mkdir(parents=True, exist_ok=True)
+    ss.steps_path(other_sid).write_text(
+        json.dumps([{"action": "wait", "seconds": 1.0}]))
+    ss.update_manifest(other_sid, SPEC.subtasks[0].prompt, context="/other",
+                       start_url="http://app/other")
+
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    assert result.subtasks[0]["skip_reason"] == "identity_fork"
+    assert result.subtasks[1]["skip_reason"] == "no_entry"
+    assert "1 identity_fork" in result.final_result
+    assert "1 no_entry" in result.final_result
+
+
+async def test_fresh_reauthors_with_a_visible_reason(stores, monkeypatch):
+    """--fresh bypassing a library hit used to print NOTHING — indistinguishable from a
+    cache miss (the live 2026-07-29 'recordings are never used' mystery). It now carries
+    a reason end to end: per-subtask row and the summary breakdown."""
+    _seed_entry(_sid_for(SPEC.subtasks[0].prompt))
+    _seed_entry(_sid_for(SPEC.subtasks[1].prompt))
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake, fresh=True)
+
+    assert fake.replay_calls == 0 and fake.agent_calls == 2
+    assert [s["skip_reason"] for s in result.subtasks] == ["fresh", "fresh"]
+    assert "(0 replayed, 2 authored: 2 fresh)" in result.final_result
+
+
+async def test_failed_reauthor_no_longer_destroys_the_canonical_recording(
+        stores, monkeypatch):
+    """A failed re-authoring records to the temp path and its wreck is set aside as
+    .failed.json — the canonical recording stays byte-identical to the committed skill
+    (the live 2026-07-29 Dec-26 segment recording loss)."""
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    assert (await _run(fake)).is_successful is True
+    sid0 = _sid_for(SPEC.subtasks[0].prompt)
+    good = ss.recording_path(sid0).read_text()
+
+    wreck = {"history": [{
+        "state": {"url": "http://app/start", "interacted_element": []},
+        "model_output": {"action": [{"navigate": {"url": "http://app/broken"}}]},
+        "result": [],
+    }]}
+    fake2 = FakeSession(_runner(), agents=[_seg(False, mode="authored", error="boom")],
+                        recording=wreck)
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake2))
+    result2 = await _run(fake2, fresh=True)
+
+    assert result2.is_successful is False
+    assert ss.recording_path(sid0).read_text() == good           # canonical intact
+    failed = ss.recording_path(sid0).with_suffix(".failed.json")
+    assert json.loads(failed.read_text()) == wreck               # wreck set aside
+    assert ss.has_script(sid0)                                   # entry still replayable
 
 
 def test_findings_sourced_values_flags_runtime_data_only():

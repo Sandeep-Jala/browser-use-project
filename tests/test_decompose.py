@@ -341,6 +341,10 @@ def test_node_kind_heuristic():
                                None) == "action"
     assert decompose.node_kind('check the option "no sharing" and submit', None) == "action"
     assert decompose.node_kind("go to inputs section,select sales", None) == "action"
+    # The disambiguated RTI period pick: "period"/"dropdown"/"top bar" must not drift
+    # into the judge net — a deterministic UI pick should stay cacheable.
+    assert decompose.node_kind("using the period dropdown in the top bar, set the period "
+                               "to May-26, then click Save & Next", None) == "action"
     # A marker-owning subtask is ALWAYS action — its network gate is machine ground truth.
     assert decompose.node_kind("verify and save the record", "Invoices") == "action"
     # An aux-tab subtask is action even with observational wording: its replayed extract
@@ -354,22 +358,26 @@ def test_node_kind_heuristic():
                                tab_url="https://duckduckgo.com") == "judge"
 
 
-# The two RTI employee loops, verbatim from the live decomposition: imperative actions
-# with the verification folded inside. Judge framing made the agent declare them done
-# after ONE Save & Next (the observed wrong-employee bug) — they must classify "loop".
+# The two RTI employee loops, mirroring the live tasks.yaml wording (refreshed
+# 2026-07-30): imperative actions with the verification folded inside. Judge framing
+# made the agent declare them done after ONE Save & Next (the observed wrong-employee
+# bug) — they must classify "loop". The second pass's "check that" clause is
+# load-bearing: the 07-29 reword dropped it and the pass silently became a cacheable
+# fixed-click action.
 LOOP_OWEN = ("Process the existing employees one at a time by clicking Save & Next, and "
-             "after each click check that the next employee has loaded (never click an "
-             "employee's name in the list to jump ahead), stopping as soon as "
+             "after each click check that the next employee has loaded, if the Save & "
+             "Next button is disabled, Move on to the next employee. stopping as soon as "
              "{{employee}} is the employee shown")
-LOOP_STRUAN = ("Continue clicking Save & Next one employee at a time in the same way "
-               "(check that each save advances to the next employee, and never click a "
-               "name in the list) until {{employee}} is the employee shown")
+LOOP_DAVID = ("Continue clicking Save & Next one employee at a time in the same way, and "
+              "after each click check that the next employee has loaded, if the Save and "
+              "next is disabled move on to the next employee, until {{employee}} is the "
+              "employee shown")
 
 
 def test_node_kind_loop_detection():
     # Judge phrase + iteration cues, with the judge phrase NOT the head directive -> loop.
     assert decompose.node_kind(LOOP_OWEN, None) == "loop"
-    assert decompose.node_kind(LOOP_STRUAN, None) == "loop"
+    assert decompose.node_kind(LOOP_DAVID, None) == "loop"
     # A LEADING judge directive stays judge even when WHAT it checks iterates.
     assert decompose.node_kind(
         "Check that entries do not repeat across pages and each page loads",
@@ -379,8 +387,8 @@ def test_node_kind_loop_detection():
     # Cue-free verification stays judge; judge-free iteration stays action.
     assert decompose.node_kind("verify the CC field matches", None) == "judge"
     assert decompose.node_kind(
-        "Then go to Payroll & RTI, change the date to next month, and click Save & Next "
-        "3 times", None) == "action"
+        "Then go to Payroll & RTI, using the period dropdown in the top bar, change the "
+        "period to the next month, and click Save & Next 3 times", None) == "action"
     # Marker precedence is unchanged: machine ground truth caches safely.
     assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
     # Explicit declarations still win in both directions.

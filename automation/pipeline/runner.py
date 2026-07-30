@@ -372,15 +372,16 @@ class Runner:
             use_vision=self.config.use_vision,
             vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
-            # ONE action per LLM step (default 5). This app re-renders after every input AND
-            # after every click, so any action queued behind another acts on a stale page.
-            # 2 was tried with a text rule forbidding a click as the second action, but the
-            # model still queued input+click (run 20260708_153223 step 12: typed "bike" into
-            # the Item react-select and clicked option-1 in the same step — the click index
-            # came from the pre-typing DOM, so it hit a stale option and the item never truly
-            # registered: Account/VAT were not auto-filled). Structural enforcement is the
-            # only thing that reliably prevents it; every click now sees a fresh DOM.
-            max_actions_per_step=1,
+            # Raised 1→4 (2026-07-30, experiment). CAUTION: 1 was a deliberate fix — this app
+            # re-renders after every input AND click, so an action queued behind another acts
+            # on a stale page. 2 was tried with a text rule forbidding a click as the second
+            # action, but the model still queued input+click (run 20260708_153223 step 12:
+            # typed "bike" into the Item react-select and clicked option-1 in the same step —
+            # the click index came from the pre-typing DOM, so it hit a stale option and the
+            # item never truly registered: Account/VAT were not auto-filled). If stale-index
+            # misclicks reappear, drop back to 1 (structural enforcement was the only thing
+            # that reliably prevented them).
+            max_actions_per_step=4,
             # plan_update echo in every step's output; redundant with the expanded task that is
             # resent each step. ENABLE_PLANNING=false in .env turns it off (default on).
             # Worth an A/B off: scoped_subtask_prompt already restates the job every step, so
@@ -391,8 +392,13 @@ class Runner:
             # Custom actions the prompts rely on (skip_step, fail_and_stop, capped_scroll,
             # detect_layout_issues, run_accessibility_scan) plus all built-ins. None → built-ins.
             tools=self.tools,
-            # browser-use's built-in end-of-run judge (use_judge defaults True); run it on our
-            # model. We read its verdict below instead of running a second judge of our own.
+            # browser-use's end-of-run judge (use_judge defaults True) is OFF: the hybrid
+            # engine's segment gates (marker/download/postcondition — network ground truth)
+            # are the verdict, the judge never overrides the agent's self-reported success
+            # (browser-use's own _judge_and_log contract), and the hybrid path discarded its
+            # verdict anyway (HybridSession.finalize hardcodes judgement=None) — a full-trace
+            # LLM call per segment for nothing.
+            use_judge=False,
             judge_llm=self.judge_llm,
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop
             # override prompt on Ctrl+C, so disable browser-use's own signal handler.
@@ -512,10 +518,14 @@ class Runner:
             joined = " | ".join(n[:200] for n in notices[:5])
             notice = (
                 f"⚠ PAGE NOTIFICATION(S) since your last action: {joined}\n"
-                "This is the app reporting the OUTCOME of what you just did. If it states an "
-                "error, validation failure, permission problem, or anything blocking, the "
-                "action did NOT succeed — address it and do NOT report success. If it confirms "
-                "success, treat that as your evidence."
+                "This is the app reporting the OUTCOME of what you just did. If it confirms "
+                "success, treat that as your evidence. If it states an error, do NOT report "
+                "success and do NOT react blindly: first reason about WHY, given the steps "
+                "already completed this run, then follow the PAGE NOTIFICATIONS protocol — "
+                "validation: fix the named fields and save again; ALREADY done/exists (said "
+                "about the outcome you were told to produce): an earlier step or run already "
+                "produced it — verify the state and skip_step, never force it again; "
+                "permission/blocked: fail_and_stop quoting it; transient: retry once."
             )
             if _inject_context(_agent, notice):
                 logger.info("⚠ page-notification surfaced: %s", joined[:80])

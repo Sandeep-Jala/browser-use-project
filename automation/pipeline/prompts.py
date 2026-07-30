@@ -35,9 +35,11 @@ SPEED_OPTIMIZATION_PROMPT = """
 
 SPEED & EFFICIENCY
 - Be concise and direct. Skip unnecessary narration.
-- You can execute exactly ONE action per step — multi-action
-  chains will NOT run. Pick the single action that makes the
-  most progress.
+- You can execute up to 4 actions per step. Batch actions ONLY
+  when the page will not re-render between them (e.g. filling
+  several plain text fields). After any action that changes the
+  page — a click, a select, typing into an autocomplete — stop
+  the step there: later actions would use stale element indices.
 - Prefer the most direct path to the goal.
 
 ───────────────────────────────────────────────────────────
@@ -209,14 +211,31 @@ bar reporting the outcome, then it fades. The harness captures
 these and injects any new one into your context as
 "⚠ PAGE NOTIFICATION(S)".
   • Treat that text as the authoritative result of your last
-    action. An error, validation, permission, or "failed"
-    notification means the action did NOT succeed — do NOT report
-    success; read what it says, fix that cause, and retry.
+    action — never assume success from silence, and never dismiss
+    an error toast as unrelated without reading it fully.
   • A success/confirmation notification is your evidence the
     action worked.
-  • If a notification's meaning is unclear, read it fully before
-    deciding — never assume success from silence, and never
-    dismiss an error toast as unrelated without reading it.
+  • On an ERROR notification, do NOT react blindly. First state
+    in your evaluation WHY the app rejected the action, using the
+    steps already completed this run as evidence. Then act by
+    error class:
+    - VALIDATION (a field is named, "required", "invalid"): the
+      record never saved — fix exactly the named fields, save
+      again.
+    - ALREADY DONE (the OUTCOME you were told to produce
+      "already exists" / was "already submitted/processed"): an
+      earlier step or a previous run already produced that state
+      — forcing it again is wrong. Verify on screen that the
+      state matches the goal, then skip_step quoting the
+      notification and continue with the remaining work. (This
+      is NOT the duplicate-VALUE case: a create task rejecting
+      your invented value as a duplicate still means invent a
+      different value.)
+    - PERMISSION/BLOCKED (no rights, locked period, feature
+      unavailable): not fixable from the UI — fail_and_stop
+      quoting the notification.
+    - TRANSIENT ("try again", timeout, temporary): retry the
+      SAME action once; if it repeats, treat it as blocked.
 
 ───────────────────────────────────────────────────────────
 CREATE MEANS CREATE — never edit existing records
@@ -592,6 +611,7 @@ def scoped_subtask_prompt(
     findings: list[str] | None = None,
     observe: bool = False,
     loop: bool = False,
+    conditional: bool = False,
     aux_tab: str | None = None,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
@@ -614,7 +634,14 @@ def scoped_subtask_prompt(
     carry the observed facts, because later segments receive it as a finding. `loop` marks
     a loop node: the step repeats an action until its stated stop condition holds, so the
     prompt carries the repeat-until contract and its generic done-condition (without it,
-    observation framing made the agent declare a loop done after one iteration). `aux_tab`
+    observation framing made the agent declare a loop done after one iteration).
+    `conditional` marks a branch-guard node (leading-"If" wording): when the stated
+    condition does not hold on the page, the correct outcome is an immediate no-op
+    success — without saying so, the generic "done with success=true when the end state
+    was not reached is a failed run" footer made the agent hunt for controls matching
+    the branch's action words to force the condition true (observed live: a suppressed
+    popup's "click Process" resolved to a "Reminder to process the payroll" icon button,
+    opening/closing the email modal in an endless loop). `aux_tab`
     marks an aux-tab segment: the framework already opened and focused a helper tab at
     that URL, all work happens there, and facts must be captured via extract_data so
     future replays can re-read them fresh.
@@ -704,11 +731,19 @@ def scoped_subtask_prompt(
         lines.append(
             "\nThis is an OBSERVATION/VERIFICATION step. Your final done message is its "
             "product: state exactly WHAT YOU OBSERVED — the concrete values, names, or "
-            "settings you read — and the verdict (e.g. 'Client Review setting = Account "
-            "Manager; Review for dropdown showed John Smith (the Account Manager) — "
-            "MATCH'). Later steps receive your message as recorded fact, so a bare "
-            "'done' or 'verified' without the observed values is a FAILED step. Report "
-            "honestly: if the check does NOT hold, say so and state what you saw instead."
+            "settings you read. The ONLY pass/fail criteria are the checks YOUR ONLY "
+            "JOB states in words. When it states a check, compare what you read against "
+            "it and state the verdict (e.g. 'Client Review setting = Account Manager; "
+            "Review for dropdown showed John Smith (the Account Manager) — MATCH'); if "
+            "a stated check does NOT hold, report honestly: say so, state what you saw "
+            "instead, and finish with success=false. When it states NO expected value "
+            "or end state — it only tells you to click, tick, open, or read things — "
+            "completing those actions with clean receipts IS success: finish with "
+            "success=true and report the end state you observed as FACT, even when a "
+            "status or label differs from what you expected. NEVER invent an expected "
+            "outcome and fail the step over it. Later steps receive your message as "
+            "recorded fact, so a bare 'done' or 'verified' without the observed values "
+            "is a FAILED step."
         )
     if loop:
         lines.append(
@@ -722,6 +757,19 @@ def scoped_subtask_prompt(
             "page. Reaching it may take MANY iterations — a long repetition is expected, "
             "not a sign of being stuck. Your done message must state the final observed "
             "state (the value/name shown when you stopped)."
+        )
+    if conditional:
+        lines.append(
+            "\nThis is a CONDITIONAL step: its actions apply ONLY IF the condition "
+            "stated in YOUR ONLY JOB actually holds. FIRST read the current page and "
+            "decide whether the popup/element/error it names is present RIGHT NOW. If "
+            "it is NOT, this step is COMPLETE: call done with success=true immediately, "
+            "stating that the condition did not occur — for a conditional step the "
+            "unchanged page IS the verified end state, and reporting it is success, "
+            "not failure. NEVER click, re-trigger earlier actions, or search the page "
+            "to MAKE the condition true, and never click a control merely because its "
+            "name or tooltip contains a word from this step's actions. If the "
+            "condition DOES hold, perform the stated actions and verify them as usual."
         )
     if remaining:
         lines.append("\nStill ahead in this workflow (context only — each is handled "
