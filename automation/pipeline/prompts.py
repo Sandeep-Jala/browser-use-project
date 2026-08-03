@@ -141,10 +141,11 @@ after typing (its receipt says "pressed Enter"), so:
   • Do NOT follow input with send_keys "Enter" — it already
     happened. Just wait ~2 seconds for results to load.
   • EXCEPTION: dropdown/combobox filters (react-select) are
-    NOT search boxes. The tool detects them and SUPPRESSES
-    Enter (the receipt says so); type and then CLICK the
-    option you want — never send Enter yourself either (it
-    selects whatever option happens to be focused).
+    NOT search boxes — don't type into them with `input` at
+    all. Pick the option with select_dropdown(index, text)
+    (see DROPDOWN / COMBOBOX PICKS); never send Enter in a
+    combobox (it selects whatever option happens to be
+    focused).
   • Only after typing (with its auto-Enter) + wait may you
     conclude a record is "not found" — NEVER from typing
     alone.
@@ -347,19 +348,35 @@ the same page view that require scrolling to reach.
     then apply the ELEMENT NOT FOUND POLICY.
 
 ───────────────────────────────────────────────────────────
-REACT-SELECT DROPDOWN INTERACTION
+DROPDOWN / COMBOBOX PICKS — use select_dropdown, ONE action
 ───────────────────────────────────────────────────────────
-React-select dropdowns (id starting with "react-select-") do
-NOT open by clicking the container div or indicator button.
+For EVERY dropdown pick — native <select> AND custom comboboxes
+(react-select "react-select-N-input", role=combobox) — call
+select_dropdown(index, text). It opens the menu, clicks the
+matching option the way the widget requires, and VERIFIES the
+value took, all in one action. Do NOT hand-roll dropdown picks
+with click + input + find_by_text — typed filter text makes the
+combobox input match your own find_by_text query, and batched
+follow-up clicks close the menu you just opened.
 
-  CORRECT sequence to open a react-select dropdown:
-    1. Locate the <input type="text" role="combobox"> element
-       inside the react-select container (id: react-select-N-input).
-    2. Click THAT input element — this opens the option list.
-    3. Click the desired option from the list.
-
-  If the same click fails twice → immediately try the combobox
-  input element (step 1 above). Do NOT retry the button 3+ times.
+  • TARGETING among several adjacent comboboxes: their inputs
+    all look identical (nameless role=combobox). Locate the one
+    you mean by its VISIBLE placeholder or current value —
+    find_by_text('Select employee') / find_by_text('Monthly') —
+    then call select_dropdown on THAT index. Never guess between
+    anonymous combobox inputs.
+  • If the receipt says "the dropdown ACTUALLY lists: ...", those
+    options are ALL that exist. Re-read the task and pick the one
+    it means with select_dropdown(index, text='<option>') — do
+    NOT hunt the page for your original text or type it anywhere.
+  • NEVER batch Save/submit (or any other click) into the same
+    step as a dropdown pick. Pick → read the receipt → THEN save
+    in a later step. A premature Save closes the menu, discards
+    the pick, and re-renders the form (all indexes go stale).
+  • If select_dropdown errors twice on the same dropdown, fall
+    back to: click the combobox input (react-select-N-input) to
+    open it, read the option list from the FRESH state, click the
+    option by its index in a NEW step (no other actions batched).
 
 ───────────────────────────────────────────────────────────
 FORM VALIDATION HANDLING — Required fields the task omits
@@ -378,13 +395,13 @@ fail_and_stop — supply a value and keep going. Two triggers:
 How to supply the value depends on the control:
 
 DROPDOWNS — the option list is fixed; you cannot invent one:
-    1. Click the required dropdown's combobox input to OPEN it.
-    2. Look at what options are ACTUALLY LISTED in the dropdown.
-    3. Select the first available option from the visible list.
-    4. If the task specifies which value to use (e.g. based on
-       a setting like "Client Review = Account Manager"), select
-       the matching option. If no specific value is required by
-       the task, select any appropriate available option.
+    1. Call select_dropdown(index, text) with the task-given
+       value. If it errors listing the ACTUAL options, pick the
+       matching one from that list; if the task names no value,
+       pick any appropriate listed option.
+    2. Only if select_dropdown fails twice: click the combobox
+       input to OPEN it, read the options from the fresh state,
+       and click one by index in a new step.
 
   • If the dropdown shows "No options" after clearing the search:
     click the combobox input again (don't type anything) and wait

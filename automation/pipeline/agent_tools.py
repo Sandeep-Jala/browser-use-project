@@ -46,6 +46,7 @@ Two behaviours here exist to keep authored runs COMPILABLE into replay scripts
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -506,6 +507,309 @@ async def _select_state(handle) -> tuple[str, str] | None:
     return (str(state.get("value") or ""), str(state.get("label") or ""))
 
 
+# ------------------------------- custom-combobox picks -------------------------------
+# The app's dropdowns are react-select comboboxes, not native <select>s: an
+# <input role=combobox id=react-select-N-input> that browser-use renders NAMELESS (the
+# visible "Monthly"/"Select employee" label lives in a sibling div), a menu that opens on
+# mousedown, and option divs that select on mousedown. Observed live (payroll run
+# 20260803_112915): with no tool owning that transaction the agent hand-rolled it across
+# batched actions — typed filter text made the input itself match its own find_by_text
+# query, a Save click batched into the same step closed the menu, and the run died after
+# 17 steps of dropdown thrashing. select_dropdown's non-native branch below owns the whole
+# open → list → pick → verify sequence in ONE action, and on a miss reports the options
+# that ACTUALLY exist so the agent can course-correct instead of hunting phantom text.
+
+_CB_STAMP = "data-ao-cb-root"
+
+# Run ON the agent-indexed node (this = element): resolve the combobox the agent means.
+# Accepts the combobox <input> itself, anything INSIDE the widget (placeholder/value div,
+# container), or a small wrapper around it — but refuses an ancestor holding SEVERAL
+# comboboxes: guessing between adjacent widgets is exactly the wrong-target bug this tool
+# exists to kill (the employee name typed into the Monthly frequency dropdown).
+_CB_RESOLVE_JS = """
+function () {
+  var SEL = 'input[role=combobox], input[id^="react-select"][id$="-input"]';
+  var isCb = function (e) {
+    if (!e || e.tagName !== 'INPUT') return false;
+    return (e.getAttribute('role') || '').toLowerCase() === 'combobox' ||
+           /^react-select-.+-input$/.test(e.id || '');
+  };
+  var input = null, root = null;
+  if (isCb(this)) {
+    input = this;
+    root = input.parentElement || input;
+    for (var i = 0; i < 4; i++) {
+      var p = root.parentElement;
+      if (!p || p.querySelectorAll(SEL).length !== 1) break;
+      root = p;
+    }
+  } else {
+    var el = this;
+    for (var hops = 0; el && hops < 8; hops++, el = el.parentElement) {
+      if (!el.querySelectorAll) continue;
+      var found = el.querySelectorAll(SEL);
+      if (found.length === 1) { input = found[0]; root = el; break; }
+      if (found.length > 1) return { error: 'ambiguous', count: found.length };
+    }
+  }
+  if (!input) return { error: 'none' };
+  if (!input.id) input.id = 'ao-cb-' + (++window.__ao_cb_seq || (window.__ao_cb_seq = 1));
+  document.querySelectorAll('[STAMP]').forEach(function (n) { n.removeAttribute('STAMP'); });
+  root.setAttribute('STAMP', '1');
+  return { input_id: input.id };
+}
+""".replace("STAMP", _CB_STAMP)
+
+# Document-level ops on the resolved combobox, addressed by the input's id.
+#   open    — focus the input and fire a real pointer+mouse sequence on it (react-select
+#             opens on the control's mousedown; a bare .focus() or .click() does nothing).
+#   options — the menu's CURRENT options: react-select instance-prefixed ids first, then
+#             the input's aria-controls/owns listbox, then any [role=option]. Options with
+#             no id get one stamped so a later 'pick' can address them.
+#   pick    — dispatch the pointer+mouse sequence on ONE option (by stamped id). react-select
+#             selects on the option's mousedown — this is the click el.click() never was.
+#   state   — menu-open flag + the widget root's visible text (the read-back source).
+_CB_OPS_JS = """
+(function () {
+  var ID = %(id)s, OP = %(op)s, WANTED = %(wanted)s;
+  var input = document.getElementById(ID);
+  if (!input) return { error: 'input-gone' };
+  var fire = function (el, kinds) {
+    kinds.forEach(function (t) {
+      try {
+        var ev = (t.indexOf('pointer') === 0 && window.PointerEvent)
+          ? new PointerEvent(t, { bubbles: true, cancelable: true, view: window })
+          : new MouseEvent(t, { bubbles: true, cancelable: true, view: window });
+        el.dispatchEvent(ev);
+      } catch (e) {}
+    });
+  };
+  var SEQ = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+  if (OP === 'open') {
+    try { input.focus(); } catch (e) {}
+    fire(input, SEQ);
+    return { ok: true };
+  }
+  var optionNodes = function () {
+    var m = (input.id || '').match(/^(react-select-\\d+)-input$/);
+    var nodes = [];
+    if (m) {
+      nodes = document.querySelectorAll('[id^="' + m[1] + '-option"]');
+      if (nodes.length) return Array.prototype.slice.call(nodes);
+    }
+    var owns = input.getAttribute('aria-controls') || input.getAttribute('aria-owns');
+    var box = owns && document.getElementById(owns);
+    if (box) {
+      nodes = box.querySelectorAll('[role=option], [id*="-option"]');
+      if (nodes.length) return Array.prototype.slice.call(nodes);
+    }
+    return Array.prototype.slice.call(document.querySelectorAll('[role=option]'));
+  };
+  var opts = optionNodes().filter(function (o) { return (o.innerText || '').trim(); });
+  opts.forEach(function (o, i) { if (!o.id) o.id = ID + '-ao-opt-' + i; });
+  var listing = opts.map(function (o) {
+    return { id: o.id, text: (o.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 120) };
+  });
+  if (OP === 'options') return { options: listing };
+  if (OP === 'pick') {
+    var target = null;
+    for (var i = 0; i < opts.length; i++) {
+      if (opts[i].id === WANTED) { target = opts[i]; break; }
+    }
+    if (!target) return { error: 'option-gone', options: listing };
+    try { target.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    fire(target, SEQ);
+    var attrs = {};
+    ['id', 'role', 'class', 'aria-label'].forEach(function (a) {
+      var v = target.getAttribute(a);
+      if (v) attrs[a] = v;
+    });
+    return { clicked: true, tag: target.tagName.toLowerCase(), attrs: attrs };
+  }
+  if (OP === 'state') {
+    var root = document.querySelector('[STAMP]');
+    var display = root ? (root.innerText || '').replace(/\\s+/g, ' ').trim() : '';
+    return { menu_open: listing.length > 0, display: display.slice(0, 200) };
+  }
+  return { error: 'bad-op' };
+})()
+""".replace("STAMP", _CB_STAMP)
+
+
+def _choose_option(options: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
+    """The option the agent means: exact normalized-text match first; else the UNIQUE
+    option containing the target as a word-aligned phrase (react-select option cards pad
+    the label with detail lines). Ambiguity returns None — the caller lists the options
+    rather than guessing (guessing is how the wrong employee got picked in live runs)."""
+    want = _norm_phrase(target)
+    if not want:
+        return None
+    for opt in options:
+        if _norm_phrase(str(opt.get("text") or "")) == want:
+            return opt
+    partial = [o for o in options
+               if f" {want} " in f" {_norm_phrase(str(o.get('text') or ''))} "]
+    return partial[0] if len(partial) == 1 else None
+
+
+def _cb_option_lines(options: list[dict[str, Any]], limit: int = 10) -> str:
+    shown = ", ".join(f"'{str(o.get('text') or '')[:60]}'" for o in options[:limit])
+    more = f" (+{len(options) - limit} more)" if len(options) > limit else ""
+    return shown + more
+
+
+async def _cb_op(browser_session, op: str, input_id: str, wanted: str | None = None):
+    expr = _CB_OPS_JS % {"id": json.dumps(input_id), "op": json.dumps(op),
+                         "wanted": json.dumps(wanted)}
+    return await _eval_js(browser_session, expr)
+
+
+async def _cb_poll_options(browser_session, input_id: str,
+                           timeout: float) -> list[dict[str, Any]]:
+    """The menu's options, polling until they render (react-select mounts the menu a beat
+    after the open mousedown; server-backed lists take longer). Empty list on timeout."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        try:
+            got = await _cb_op(browser_session, "options", input_id)
+        except Exception as exc:  # noqa: BLE001 - keep polling; the page may be re-rendering
+            logger.debug("combobox options poll failed: %s", exc)
+            got = None
+        opts = (got or {}).get("options") if isinstance(got, dict) else None
+        if opts:
+            return opts
+        if asyncio.get_event_loop().time() >= deadline:
+            return []
+        await asyncio.sleep(0.25)
+
+
+async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
+                           handle) -> ActionResult:
+    """select_dropdown's non-native branch: one action that opens the custom combobox,
+    reads what the menu ACTUALLY lists, picks the matching option with the pointer+mouse
+    sequence the widget listens for, and read-back-verifies the widget now shows it.
+    Same fail-honest contract as the native path — and a miss reports the real option
+    texts, which is the receipt that redirects a wrong-semantics agent."""
+    target = (params.text or "").strip()
+    info = None
+    if handle is not None:
+        try:
+            info = await _call_on_field(handle, _CB_RESOLVE_JS)
+        except Exception as exc:  # noqa: BLE001 - resolution failure reads as "no combobox"
+            logger.debug("combobox resolve failed: %s", exc)
+    if not isinstance(info, dict) or not info.get("input_id"):
+        if isinstance(info, dict) and info.get("error") == "ambiguous":
+            return ActionResult(error=(
+                f"select_dropdown at index {params.index}: that element contains "
+                f"{info.get('count')} different comboboxes — cannot know which one you "
+                "mean. Locate the dropdown by its VISIBLE placeholder/current value with "
+                "find_by_text (e.g. 'Select employee', 'Monthly') and call select_dropdown "
+                "on THAT index."))
+        return ActionResult(error=(
+            f"select_dropdown at index {params.index}: the element is not a native "
+            "<select> and no combobox input (role=combobox / react-select) exists at or "
+            "around it. Pass the index of the dropdown's input, its placeholder/current-"
+            "value text, or its container."))
+    input_id = str(info["input_id"])
+
+    try:
+        await _cb_op(browser_session, "open", input_id)
+    except Exception as exc:  # noqa: BLE001 - report; the agent recovers via its receipt
+        return ActionResult(error=(
+            f"select_dropdown '{target}' at index {params.index}: could not open the "
+            f"combobox ({exc})."))
+    options = await _cb_poll_options(browser_session, input_id, timeout=4.0)
+
+    chosen = _choose_option(options, target)
+    filtered = False
+    if chosen is None:
+        # Not among the visible options (or none rendered): type the text into the filter
+        # input — CDP insertText fires the trusted input events React's filter needs —
+        # and give the narrowed/loaded list one more look.
+        try:
+            await _eval_js(browser_session,
+                           f"document.getElementById({json.dumps(input_id)}).focus()")
+            cdp_session = await browser_session.get_or_create_cdp_session()
+            await cdp_session.cdp_client.send.Input.insertText(
+                params={"text": target}, session_id=cdp_session.session_id)
+            filtered = True
+        except Exception as exc:  # noqa: BLE001 - a read-only combobox refuses typing
+            logger.debug("combobox filter typing failed: %s", exc)
+        refreshed = await _cb_poll_options(browser_session, input_id, timeout=2.0)
+        if refreshed:
+            options = refreshed
+        chosen = _choose_option(options, target)
+    if chosen is None:
+        listed = _cb_option_lines(options)
+        if options:
+            return ActionResult(error=(
+                f"select_dropdown '{target}' at index {params.index}: no such option. "
+                f"The dropdown ACTUALLY lists: {listed}. These are all that exist — "
+                f"re-read the task and pick one of these exact texts with "
+                f"select_dropdown(index={params.index}, text='<option>'). Do NOT hunt "
+                f"the page for '{target}'."))
+        return ActionResult(error=(
+            f"select_dropdown '{target}' at index {params.index}: the combobox opened "
+            "but no options rendered within the wait"
+            + (" (even after typing to filter)" if filtered else "")
+            + ". The list may load from the server — wait a moment and call "
+              "select_dropdown again with the same arguments."))
+
+    picked = None
+    try:
+        picked = await _cb_op(browser_session, "pick", input_id, wanted=str(chosen["id"]))
+    except Exception as exc:  # noqa: BLE001 - the read-back below is the real verdict
+        logger.debug("combobox pick dispatch failed: %s", exc)
+    if not (isinstance(picked, dict) and picked.get("clicked")):
+        last_seen = picked.get("options") if isinstance(picked, dict) else None
+        listed = _cb_option_lines(last_seen or options)
+        return ActionResult(error=(
+            f"select_dropdown '{target}' at index {params.index}: the option "
+            f"'{chosen.get('text')}' vanished before it could be clicked (menu re-render). "
+            f"Options last seen: {listed}. Call select_dropdown again with the same "
+            "arguments."))
+
+    # Read-back: the pick took when the menu is closed again AND the widget now shows the
+    # option. Poll briefly — the value lands after React commits.
+    display, took = "", False
+    deadline = asyncio.get_event_loop().time() + 2.0
+    want = _norm_phrase(str(chosen.get("text") or target))
+    while True:
+        try:
+            state = await _cb_op(browser_session, "state", input_id)
+        except Exception:  # noqa: BLE001 - a re-render mid-poll is fine, try again
+            state = None
+        if isinstance(state, dict):
+            display = str(state.get("display") or "")
+            if not state.get("menu_open") and \
+                    f" {want} " in f" {_norm_phrase(display)} ":
+                took = True
+                break
+        if asyncio.get_event_loop().time() >= deadline:
+            break
+        await asyncio.sleep(0.25)
+
+    # Record the OPTION's identity so the recording compiles to a replayable by-label
+    # click (script_compile routes non-native select_dropdown picks through the same
+    # react-select synthesis as recorded option clicks).
+    meta = {"interacted_element": {
+        "node_name": str(picked.get("tag") or "div").upper(),
+        "attributes": dict(picked.get("attrs") or {}),
+        "ax_name": str(chosen.get("text") or target).strip(),
+    }}
+    if took:
+        msg = (f"Selected '{chosen.get('text')}' in the combobox at index {params.index} — "
+               f"it now shows '{display}'. Do NOT set it again.")
+        logger.info("🔽 %s", msg)
+        return ActionResult(extracted_content=msg, include_in_memory=True,
+                            long_term_memory=msg, metadata=meta)
+    return ActionResult(error=(
+        f"select_dropdown '{target}' at index {params.index}: clicked the option "
+        f"'{chosen.get('text')}' but the combobox does not show it (reads: '{display}'). "
+        "Do not report it as set — re-check the field and call select_dropdown again if "
+        "it still shows the old value."))
+
+
 async def _press(handle, key: str, code: str, vk: int, *,
                  commands: list[str] | None = None, repeat: int = 1) -> None:
     """Dispatch `repeat` real keyDown/keyUp pairs at the focused element."""
@@ -646,7 +950,12 @@ def build_tools() -> Tools:
     # rule the `input` fill follows. Same param model, so recorded history keeps the exact
     # built-in shape and the compiler's native-select path needs no changes.
     @tools.action(
-        'Set the option of a <select> element.',
+        'Pick an option in ANY dropdown by its visible text: native <select> elements AND '
+        'custom comboboxes (react-select etc.). For a custom combobox, pass the index of '
+        'its input, its placeholder/current-value text element, or its container — the '
+        'tool opens the menu, picks the matching option, and verifies it took, all in one '
+        'action. If your text is not among the options, the error lists what the dropdown '
+        'ACTUALLY offers.',
         param_model=SelectDropdownOptionAction,
     )
     async def select_dropdown(params: SelectDropdownOptionAction,
@@ -661,6 +970,11 @@ def build_tools() -> Tools:
         # Resolve the element BEFORE dispatching: a post-selection re-render leaves a stale
         # object id, which must read as "cannot verify", not as a refused option.
         handle = await _field_handle(browser_session, node)
+        if str(getattr(node, "tag_name", "") or "").lower() != "select":
+            # Custom combobox (react-select & co.) — the built-in SelectDropdownOptionEvent
+            # only understands native <select>s, which is why this tool used to dead-end
+            # here and agents hand-rolled dropdown picks across batched steps.
+            return await _combobox_select(browser_session, params, handle)
 
         def _took(state: tuple[str, str] | None) -> bool:
             if state is None:
@@ -845,6 +1159,19 @@ def build_tools() -> Tools:
                     logger.info("🔎 %s", msg)
                     return ActionResult(extracted_content=msg, long_term_memory=msg,
                                         include_in_memory=True, metadata=meta)
+                if click_first and raw.get("refused"):
+                    # The raw path found only an INVISIBLE element whose name is not the
+                    # query — clicking it would be the wrong-control no-op that looped a
+                    # live run for 6 steps. Nothing was clicked; say what actually exists.
+                    msg = (f"find_by_text('{query}'): NOT clicked. The only match is a "
+                           f"0-size/hidden element named '{str(raw.get('name') or '').strip()}', "
+                           f"which is NOT '{query}' — almost certainly the wrong control. "
+                           f"No clickable control named '{query}' exists on this page right "
+                           f"now. If you expected a dropdown option: open the dropdown and "
+                           f"choose from the options it ACTUALLY lists instead of this text.")
+                    logger.info("🔎 %s", msg)
+                    return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                        include_in_memory=True, metadata={"no_click": True})
                 names = ", ".join(f"'{n}'" for n in (raw.get("names") or []) if n)
                 msg = (f"find_by_text('{query}'): {raw['count']} match(es) exist in the DOM but "
                        f"are NOT clickable via index (0-size/virtualized): {names}. Re-call "
@@ -907,6 +1234,39 @@ def build_tools() -> Tools:
                 logger.info("🔎 %s", msg)
                 return ActionResult(extracted_content=msg, long_term_memory=msg,
                                     include_in_memory=True, metadata={"no_click": True})
+            # Self-match: when the single match is a text-entry field whose IDENTITY
+            # (aria-label/title/placeholder/name/id) does not carry the query, the only
+            # reason it matched is the text sitting IN it — almost always what the agent
+            # itself just typed (observed live: the employee name typed into the wrong
+            # react-select matched only itself, and the "clicked the single match" receipt
+            # convinced the agent a dropdown option had been selected). Clicking it is a
+            # no-op; refuse instead. A field found by its placeholder/label stays clickable
+            # — that is the legitimate way to focus/open a combobox.
+            if tag == "textarea" or (
+                tag == "input"
+                and str(attrs_map.get("type") or "text").lower()
+                not in ("button", "submit", "reset", "checkbox", "radio", "image", "file")
+            ):
+                identity = " ".join(
+                    str(attrs_map.get(a) or "")
+                    for a in ("aria-label", "title", "placeholder", "name", "id")
+                )
+                identity = (identity + " " + (_descendant_icon_hints(node) or "")).lower()
+                if not all(t in identity for t in tokens):
+                    msg = (f"find_by_text('{query}'): found the single match "
+                           f"{_line(idx, node, label)} but did NOT click it — the only "
+                           f"'{query}' on this page is the text INSIDE that input field "
+                           f"(did you just type it there?), and clicking it selects "
+                           f"nothing. If you expected a dropdown option named '{query}', "
+                           f"the open menu does not list it ('No options' means the list "
+                           f"is empty) — you may have typed into the WRONG field. Clear "
+                           f"this field, open the intended control (find_by_text on its "
+                           f"placeholder/label text, click_first=true), and pick from the "
+                           f"options it ACTUALLY shows. Only click(index={idx}) if this "
+                           f"field itself is truly your target.")
+                    logger.info("🔎 %s", msg)
+                    return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                        include_in_memory=True, metadata={"no_click": True})
             try:
                 event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
                 await event

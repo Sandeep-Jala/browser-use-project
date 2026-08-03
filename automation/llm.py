@@ -41,8 +41,8 @@ def build_llm(config: Config) -> BaseChatModel:
             # causal-reasoning depth. The cap must rise with the effort: completion tokens
             # INCLUDE the hidden reasoning tokens, and medium effort at 4096 risks
             # finish_reason='length' with empty content (8192 is sized for medium).
-            reasoning_effort="medium",
-            max_completion_tokens=8192,
+            reasoning_effort="low",
+            max_completion_tokens=4096,
             # max_completion_tokens= 4096,
             # Best-effort determinism: at temperature 0, Azure still varies across backend
             # replicas; a fixed seed narrows step-to-step decision flakiness.
@@ -74,6 +74,6 @@ def build_expander_llm(config: Config) -> BaseChatModel | None:
         timeout=45.0,
         max_retries=5,
         reasoning_effort="medium",
-        max_completion_tokens=8192,
+        max_completion_tokens=16384,
         seed=42,
     )

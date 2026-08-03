@@ -166,7 +166,12 @@ FROZEN_TIDS = {
     # not click it again)" — the pay run completes async, the agent re-clicked while
     # waiting and ran 4 pay runs, committing a 4-click recording for a 1-click step
     # (0725aaf250fbb33f, archived). Orphans decomposition 31eb68f783fe19c8.
-    "payroll_rti_process": "8f5655d8d70671e6",
+    # Re-frozen 2026-08-03: the branch was hard-reset to 4523b58 ("few minor parameter
+    # change"), whose tasks.yaml predates the 07-30 PM popup/false-branch rewording this
+    # pin captured — the commit itself shipped with this test red. Pinned back to what
+    # the CURRENT prompts hash to (the 07-30 evening ids); today's runs already
+    # re-decomposed and executed these prompts (decomposition 287ea967fcab1973).
+    "payroll_rti_process": "853742267f5ce2ca",
     # Re-frozen 2026-07-27: the data-request tail was rewritten in ALL THREE copies that
     # carry it (here, crm_data_request, payroll_food_limited_e2e) against screenshots of the
     # real UI — the old "click on status sent ... select status Sent/Submitted, Note well
@@ -197,7 +202,8 @@ FROZEN_TIDS = {
     # Re-frozen 2026-07-30 PM: same two RTI-half edits as payroll_rti_process (popup
     # conditional false branch, single-click Save & Next clause), applied to this copy
     # deliberately to keep the shared wording identity. Orphans 994afb778ccdf6e3.
-    "payroll_food_limited_e2e_rti": "7ced6865d976ab1c",
+    # Re-frozen 2026-08-03: same rollback re-pin as payroll_rti_process above.
+    "payroll_food_limited_e2e_rti": "b7fefb3c078ff5b0",
 }
 
 

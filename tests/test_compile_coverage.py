@@ -1064,3 +1064,56 @@ def test_discovery_loop_notice_fires_on_pure_discovery_streaks():
                                       "list_actions", "search_page")) is None
     notice = discovery_loop_notice(acts(*(["search_page"] * 4)))
     assert "ALREADY CLICKED" in notice and "find_by_text" in notice
+
+
+# ------------------------- custom-combobox select_dropdown picks -------------------------
+# The combobox branch of select_dropdown records the OPTION element it clicked; compile
+# must turn that into the same replayable by-label steps as a recorded option click
+# instead of dropping the pick (the old warning path replayed the form with defaults).
+
+
+def test_custom_combobox_pick_compiles_to_type_and_by_label_click(tmp_path):
+    element = {"node_name": "DIV", "ax_name": "Existing employee",
+               "attributes": {"id": "react-select-22-option-5", "role": "option"}}
+    history = [_item(
+        {"select_dropdown": {"index": 7, "text": "Existing employee"}},
+        result=[{"extracted_content": "Selected 'Existing employee'"}],
+        element=element,
+    )]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps == [
+        {"action": "type", "text": "Existing employee",
+         "field_id": "react-select-22"},
+        {"action": "click", "selectors": [
+            'role=option[name="Existing employee"]',
+            'text="Existing employee"',
+            'css=[id$="-option-0"]',
+        ], "expect_text": "Existing employee"},
+    ]
+
+
+def test_generic_role_option_pick_compiles_to_by_label_click(tmp_path):
+    element = {"node_name": "DIV", "ax_name": "Weekly",
+               "attributes": {"id": "freq-ao-opt-1", "role": "option"}}
+    history = [_item(
+        {"select_dropdown": {"index": 3, "text": "Weekly"}},
+        result=[{"extracted_content": "Selected 'Weekly'"}],
+        element=element,
+    )]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps == [{"action": "click", "selectors": [
+        'role=option[name="Weekly"]', 'text="Weekly"'], "expect_text": "Weekly"}]
+
+
+def test_native_select_pick_still_compiles_to_select_step(tmp_path):
+    element = {"node_name": "SELECT", "ax_name": "Country",
+               "attributes": {"id": "country"}}
+    history = [_item(
+        {"select_dropdown": {"index": 2, "text": "United Kingdom"}},
+        result=[{"extracted_content": "Selected"}],
+        element=element,
+    )]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert len(steps) == 1
+    assert steps[0]["action"] == "select"
+    assert steps[0]["value"] == "United Kingdom"

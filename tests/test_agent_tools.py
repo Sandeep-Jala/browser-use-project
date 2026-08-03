@@ -418,6 +418,44 @@ async def test_find_by_text_reports_refused_click_instead_of_lying(monkeypatch):
     assert res.metadata == {"no_click": True}
 
 
+async def test_find_by_text_refuses_self_match_click_on_text_input():
+    """The live failure this guards (run 20260803_152301_114498): the agent typed the
+    employee name into the WRONG react-select (value/placeholder invisible in the
+    snapshot), then find_by_text(name, click_first=True) matched ONLY its own typed text
+    inside that input and "clicked" it — a no-op wearing a success receipt, so the agent
+    believed the employee was selected. A single match that is a text-entry field whose
+    identity (aria-label/title/placeholder/name/id) does NOT carry the query must refuse."""
+    fn, pm = _registered_action("find_by_text")
+    node = _FakeDomNode("Calum Findlay",
+                        attributes={"id": "react-select-2-input", "type": "text",
+                                    "role": "combobox"})
+    node.node_name = "INPUT"
+    node.tag_name = "input"
+    res = await fn(params=pm(text="Calum Findlay", click_first=True),
+                   browser_session=_FakeBrowserSession({18958: node}))
+
+    assert res.error is None
+    assert "did NOT click" in res.extracted_content
+    assert res.metadata == {"no_click": True}    # compiles to NOTHING, never a phantom click
+
+
+async def test_find_by_text_still_clicks_input_matched_by_placeholder(monkeypatch):
+    """The guard must NOT block the recovery path it steers toward: clicking an input
+    found by its placeholder/label (e.g. find_by_text('Select Employee')) is the
+    legitimate way to focus/open a combobox."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    fn, pm = _registered_action("find_by_text")
+    node = _FakeDomNode("", attributes={"placeholder": "Select Employee", "type": "text"})
+    node.node_name = "INPUT"
+    node.tag_name = "input"
+    res = await fn(params=pm(text="select employee", click_first=True),
+                   browser_session=_FakeClickSession({4: node}, result=None))
+
+    assert res.error is None
+    assert "clicked the single match" in res.extracted_content
+    assert res.metadata and "interacted_element" in res.metadata
+
+
 # ------------------------- select_dropdown read-back override -------------------------
 # The built-in trusts the picker's self-report; on an ad-heavy page the confirmation can
 # time out AFTER the selection took, and the empty failure receipt made the agent re-set
@@ -429,7 +467,9 @@ class _FakeSelectSession:
     def __init__(self, result=None, exc=None):
         from types import SimpleNamespace
 
-        self._node = object()
+        # tag_name matters since the custom-combobox branch: only a native <select>
+        # takes the SelectDropdownOptionEvent path these tests exercise.
+        self._node = SimpleNamespace(tag_name="select")
         self.event_bus = SimpleNamespace(dispatch=lambda _e: _FakeEvent(result, exc))
 
     async def get_element_by_index(self, _index):
@@ -488,3 +528,263 @@ async def test_select_dropdown_success_echoes_readback(monkeypatch):
     assert res.error is None
     assert "now reads 'United Kingdom'" in res.extracted_content
 
+
+
+# ------------------------------- custom-combobox picks -------------------------------
+# Motivating failure (payroll run 20260803_112915): react-select comboboxes have no
+# native-<select> path, so the agent hand-rolled open/type/click across batched steps and
+# died after 17 steps of dropdown thrashing on "Join with". select_dropdown's non-native
+# branch owns the whole transaction; these tests cover its option matcher, the in-page
+# JS contract (against a real react-select-like widget), and the decision ladder.
+
+_RS_PAGE = """
+<div class="field">
+  <label>Frequency</label>
+  <div class="rs" id="c1">
+    <div class="rs-control">
+      <div class="rs-value" id="v1">Monthly</div>
+      <input id="react-select-3-input" role="combobox">
+    </div>
+  </div>
+</div>
+<div class="field">
+  <label>Join with</label>
+  <div class="rs" id="c2">
+    <div class="rs-control">
+      <div class="rs-value" id="v2">Select...</div>
+      <input id="react-select-4-input" role="combobox">
+    </div>
+  </div>
+</div>
+<script>
+  // Faithful to react-select where it matters: the menu mounts on the CONTROL's
+  // mousedown, options select on the OPTION's mousedown (never on click), and the
+  // menu unmounts on selection.
+  document.querySelectorAll('.rs-control').forEach(function (ctl) {
+    ctl.addEventListener('mousedown', function () {
+      var container = ctl.parentElement;
+      if (container.querySelector('.rs-menu')) return;
+      var menu = document.createElement('div');
+      menu.className = 'rs-menu';
+      var instance = ctl.querySelector('input').id.replace('-input', '');
+      ['P45', 'P46', 'Existing employee'].forEach(function (t, i) {
+        var o = document.createElement('div');
+        o.id = instance + '-option-' + i;
+        o.textContent = t;
+        o.addEventListener('mousedown', function () {
+          container.querySelector('.rs-value').textContent = t;
+          menu.remove();
+          window.__picked = t;
+        });
+        menu.appendChild(o);
+      });
+      container.appendChild(menu);
+    });
+  });
+</script>
+"""
+
+
+def _cb_expr(op, input_id, wanted=None):
+    import json as _json
+    return agent_tools._CB_OPS_JS % {
+        "id": _json.dumps(input_id), "op": _json.dumps(op), "wanted": _json.dumps(wanted)}
+
+
+def _resolve_expr():
+    return "(el) => (" + agent_tools._CB_RESOLVE_JS + ").call(el)"
+
+
+def test_choose_option_exact_beats_partial():
+    opts = [{"id": "a", "text": "Existing employee record"},
+            {"id": "b", "text": "Existing employee"}]
+    assert agent_tools._choose_option(opts, "existing employee")["id"] == "b"
+
+
+def test_choose_option_unique_partial_matches_padded_cards():
+    # react-select option cards pad the label with detail lines (tax code, id, pay).
+    opts = [{"id": "a", "text": "AM Aaran Macleod Tax Code : 1257L Cum Employee ID : 5302"},
+            {"id": "b", "text": "HS Haiden Stevenson Tax Code : 1257L Cum"}]
+    assert agent_tools._choose_option(opts, "Haiden Stevenson")["id"] == "b"
+
+
+def test_choose_option_ambiguous_or_absent_returns_none():
+    opts = [{"id": "a", "text": "Existing employee A"},
+            {"id": "b", "text": "Existing employee B"}]
+    assert agent_tools._choose_option(opts, "Existing employee") is None
+    assert agent_tools._choose_option(opts, "New starter") is None
+    assert agent_tools._choose_option([], "anything") is None
+
+
+async def test_cb_resolve_from_input_placeholder_and_container():
+    from playwright.async_api import async_playwright
+
+    from tests.test_heal_promotion import _launch
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(_RS_PAGE)
+        # From the combobox input itself.
+        got = await page.eval_on_selector("#react-select-4-input", _resolve_expr())
+        assert got == {"input_id": "react-select-4-input"}
+        # From the visible placeholder/value div — the label-to-input association the
+        # snapshot can't provide (inputs render nameless).
+        got = await page.eval_on_selector("#v2", _resolve_expr())
+        assert got == {"input_id": "react-select-4-input"}
+        # From the widget container.
+        got = await page.eval_on_selector("#c1", _resolve_expr())
+        assert got == {"input_id": "react-select-3-input"}
+        # The root stamp lands on the resolved widget, not the page.
+        assert await page.eval_on_selector(
+            "#c1", "el => el.hasAttribute('data-ao-cb-root')")
+
+
+async def test_cb_resolve_refuses_multi_combobox_wrappers():
+    from playwright.async_api import async_playwright
+
+    from tests.test_heal_promotion import _launch
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(_RS_PAGE)
+        got = await page.eval_on_selector("body", _resolve_expr())
+        assert got["error"] == "ambiguous"
+        assert got["count"] == 2
+        got = await page.eval_on_selector("label", _resolve_expr())
+        # The 'Frequency' label's parent .field contains exactly one combobox — resolves.
+        assert got == {"input_id": "react-select-3-input"}
+
+
+async def test_cb_open_list_pick_verify_against_react_select_semantics():
+    """The full transaction the tool drives: open fires the control's mousedown, options
+    are read by instance prefix, pick fires the option's mousedown (el.click() would be
+    a no-op here), and state shows the committed value with the menu closed."""
+    from playwright.async_api import async_playwright
+
+    from tests.test_heal_promotion import _launch
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(_RS_PAGE)
+        await page.eval_on_selector("#v2", _resolve_expr())
+
+        assert (await page.evaluate(_cb_expr("open", "react-select-4-input")))["ok"]
+        got = await page.evaluate(_cb_expr("options", "react-select-4-input"))
+        assert [o["text"] for o in got["options"]] == ["P45", "P46", "Existing employee"]
+
+        chosen = agent_tools._choose_option(got["options"], "existing employee")
+        picked = await page.evaluate(
+            _cb_expr("pick", "react-select-4-input", chosen["id"]))
+        assert picked["clicked"] is True
+        assert picked["attrs"]["id"] == "react-select-4-option-2"
+        assert await page.evaluate("window.__picked") == "Existing employee"
+
+        state = await page.evaluate(_cb_expr("state", "react-select-4-input"))
+        assert state["menu_open"] is False
+        assert "Existing employee" in state["display"]
+
+
+def _scripted_combobox(monkeypatch, resolve, ops):
+    """Wire _combobox_select's collaborators to canned responses. `ops` maps op-name to
+    a value or a list consumed in order."""
+    async def call_on_field(_handle, _decl, args=None):
+        return resolve
+    monkeypatch.setattr(agent_tools, "_call_on_field", call_on_field)
+
+    async def eval_js(_session, expr, **_kw):
+        for op in ("open", "options", "pick", "state"):
+            if f'"{op}"' in expr.partition("var input")[0]:
+                v = ops.get(op)
+                if isinstance(v, list):
+                    return v.pop(0) if len(v) > 1 else v[0]
+                return v
+        return {"ok": True}  # the focus() expression
+    monkeypatch.setattr(agent_tools, "_eval_js", eval_js)
+
+
+class _CbNode:
+    tag_name = "div"
+    backend_node_id = 1
+    attributes: dict = {}
+
+
+class _CbSession:
+    async def get_element_by_index(self, _index):
+        return _CbNode()
+
+    async def get_or_create_cdp_session(self):
+        raise RuntimeError("no cdp in unit test")  # filter typing becomes a no-op
+
+
+def _cb_action():
+    fn, pm = _registered_action("select_dropdown")
+
+    async def run(monkeypatch, text="Existing employee"):
+        async def field_handle(_s, _n):
+            return ("cdp", "obj")
+        monkeypatch.setattr(agent_tools, "_field_handle", field_handle)
+        return await fn(params=pm(index=7, text=text), browser_session=_CbSession())
+    return run
+
+
+async def test_combobox_select_success_receipt_and_replayable_metadata(monkeypatch):
+    opts = {"options": [{"id": "react-select-4-option-2", "text": "Existing employee"}]}
+    _scripted_combobox(
+        monkeypatch, {"input_id": "react-select-4-input"},
+        {"open": {"ok": True}, "options": opts,
+         "pick": {"clicked": True, "tag": "div",
+                  "attrs": {"id": "react-select-4-option-2", "role": "option"}},
+         "state": {"menu_open": False, "display": "Join with Existing employee"}})
+    res = await _cb_action()(monkeypatch)
+    assert res.error is None
+    assert "Selected 'Existing employee'" in res.extracted_content
+    assert "Do NOT set it again" in res.extracted_content
+    el = res.metadata["interacted_element"]
+    assert el["attributes"]["id"] == "react-select-4-option-2"
+    assert el["ax_name"] == "Existing employee"
+
+
+async def test_combobox_select_lists_real_options_on_a_miss(monkeypatch):
+    # THE receipt that would have saved the live run: the agent hunted 'Aaran Macleod'
+    # while the menu only ever offered P45/P46/Existing employee.
+    opts = {"options": [{"id": "o0", "text": "P45"}, {"id": "o1", "text": "P46"},
+                        {"id": "o2", "text": "Existing employee"}]}
+    _scripted_combobox(
+        monkeypatch, {"input_id": "react-select-4-input"},
+        {"open": {"ok": True}, "options": opts})
+    res = await _cb_action()(monkeypatch, text="Aaran Macleod")
+    assert res.error is not None
+    assert "no such option" in res.error
+    assert "'P45', 'P46', 'Existing employee'" in res.error
+    assert "Do NOT hunt the page for 'Aaran Macleod'" in res.error
+
+
+async def test_combobox_select_read_back_mismatch_fails_honestly(monkeypatch):
+    opts = {"options": [{"id": "o2", "text": "Existing employee"}]}
+    _scripted_combobox(
+        monkeypatch, {"input_id": "react-select-4-input"},
+        {"open": {"ok": True}, "options": opts,
+         "pick": {"clicked": True, "tag": "div", "attrs": {"id": "o2"}},
+         "state": {"menu_open": False, "display": "Select..."}})
+    res = await _cb_action()(monkeypatch)
+    assert res.error is not None
+    assert "does not show it" in res.error
+    assert "Do not report it as set" in res.error
+
+
+async def test_combobox_select_ambiguous_container_guides_the_agent(monkeypatch):
+    _scripted_combobox(monkeypatch, {"error": "ambiguous", "count": 2}, {})
+    res = await _cb_action()(monkeypatch)
+    assert res.error is not None
+    assert "2 different comboboxes" in res.error
+    assert "find_by_text" in res.error
+
+
+async def test_combobox_select_non_combobox_element_says_so(monkeypatch):
+    _scripted_combobox(monkeypatch, {"error": "none"}, {})
+    res = await _cb_action()(monkeypatch)
+    assert res.error is not None
+    assert "no combobox input" in res.error

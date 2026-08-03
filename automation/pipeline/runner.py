@@ -388,6 +388,15 @@ class Runner:
             # the echo is redundant token weight a small model can drift on. Not flipped yet —
             # measure before changing the default.
             enable_planning=self.config.enable_planning,
+            # Pinned explicitly (0.13.3 default is already True) so a library upgrade or
+            # env drift can't silently drop the per-step thinking field.
+            use_thinking=True,
+            # Recent browser events (navigations, dialogs, downloads) in the step context:
+            # the agent sees WHAT just happened instead of inferring it from a changed DOM.
+            include_recent_events=True,
+            # Few-shot tool-call examples in the system context — steadier action-schema
+            # output from small/low-effort models.
+            include_tool_call_examples=True,
             extend_system_message=self.extend_system_message,
             # Custom actions the prompts rely on (skip_step, fail_and_stop, capped_scroll,
             # detect_layout_issues, run_accessibility_scan) plus all built-ins. None → built-ins.
@@ -398,7 +407,7 @@ class Runner:
             # (browser-use's own _judge_and_log contract), and the hybrid path discarded its
             # verdict anyway (HybridSession.finalize hardcodes judgement=None) — a full-trace
             # LLM call per segment for nothing.
-            use_judge=False,
+            use_judge=True,
             judge_llm=self.judge_llm,
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop
             # override prompt on Ctrl+C, so disable browser-use's own signal handler.

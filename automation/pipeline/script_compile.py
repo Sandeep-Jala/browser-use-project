@@ -615,6 +615,20 @@ def compile_recording(
                         _push_step(steps, _attach_fp(
                             {"action": "select", "selectors": sels, "value": option},
                             element))
+                elif option and element:
+                    # Custom-combobox pick: the tool records the OPTION element it clicked
+                    # (react-select option id + the option text as ax_name). Reuse the same
+                    # by-label synthesis as a recorded option click; for non-react-select
+                    # widgets fall back to a role=option click by name.
+                    synth = _dropdown_option_steps(element, steps,
+                                                   item.get("state_message") or "")
+                    if synth is None and option:
+                        synth = [{"action": "click", "selectors": [
+                            f'role=option[name="{_esc(option)}"]',
+                            f'text="{_esc(option)}"',
+                        ], "expect_text": option}]
+                    for s in synth:
+                        _push_step(steps, s)
                 elif option:
                     logger.warning(
                         "select_dropdown %r recorded without a <select> element identity; "
@@ -826,12 +840,28 @@ RAW_FIND_JS = r"""
       var v = (b.visible ? 1 : 0) - (a.visible ? 1 : 0);
       return v !== 0 ? v : a.rank - b.rank;
     });
-    var top = out[0], clicked = false;
-    if (DOCLICK) { try { top.el.scrollIntoView({ block: 'center' }); top.el.click(); clicked = true; } catch (e) {} }
+    var top = out[0], clicked = false, refused = '';
+    // An INVISIBLE candidate whose name does not match the query (rank 2+) is never the
+    // intended target — observed live: a 0-size background grid row "clicked" four times
+    // with a ✅ receipt while the agent hunted a dropdown option that never existed. The
+    // legit hidden-click cases (Fluent 0x0 icons) carry the query as their name (rank<=1).
+    if (DOCLICK && !top.visible && top.rank > 1) {
+      refused = 'invisible-name-mismatch';
+    } else if (DOCLICK) {
+      try {
+        top.el.scrollIntoView({ block: 'center' });
+        // Full mousedown→mouseup→click sequence: React widgets (react-select options)
+        // select on mousedown and ignore a bare .click().
+        ['mousedown', 'mouseup', 'click'].forEach(function (t) {
+          top.el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+        });
+        clicked = true;
+      } catch (e) {}
+    }
     var attrs = {};
     ['id', 'aria-label', 'title', 'name', 'placeholder', 'data-testid', 'href', 'role']
       .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
-    return { count: out.length, clicked: clicked, name: top.name,
+    return { count: out.length, clicked: clicked, refused: refused, name: top.name,
              names: out.slice(0, 8).map(function (o) { return o.name; }),
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs } };
   } catch (e) { return { error: String(e) }; }
