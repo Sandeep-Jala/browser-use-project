@@ -236,6 +236,9 @@ class Subtask:
     # whole-task step budget) — specialized framings are calibrated for FRAGMENTS and
     # derailed the blob runs (see whole_prompt_fallback).
     fallback: bool = False
+    # Declared deterministic checks (tuple of checks.Check) — tier-1 spec subtasks only;
+    # evaluated on top of the segment's base gate. Never cached (_as_cache drops them).
+    verify: tuple[Any, ...] | None = None
 
     @property
     def instantiated_prompt(self) -> str:
@@ -289,6 +292,7 @@ def _build_subtasks(raw: list[dict[str, Any]], marker: str | None,
             marker=d.get("marker"),
             postcondition=d.get("postcondition"),
             tab_url=d.get("tab_url"),
+            verify=d.get("verify") or None,
         )
         for i, d in enumerate(raw)
     ]
@@ -311,6 +315,8 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
         "source": source,
         "created": datetime.now().isoformat(timespec="seconds"),
         "subtasks": [
+            # Deliberately no "verify": declared checks re-attach from the spec on every
+            # load, so a stale cache can never resurrect superseded checks.
             {"template_prompt": s.template_prompt, "values": s.values,
              "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind,
              "tab_url": s.tab_url}
@@ -541,7 +547,8 @@ async def get_decomposition(
         raw = [
             {"template_prompt": d.prompt, "values": dict(d.values or {}),
              "marker": d.marker, "postcondition": d.postcondition,
-             "kind": getattr(d, "kind", None), "tab_url": getattr(d, "tab_url", None)}
+             "kind": getattr(d, "kind", None), "tab_url": getattr(d, "tab_url", None),
+             "verify": getattr(d, "verify", None)}
             for d in declared
         ]
         problem = _validate(raw, prompt)

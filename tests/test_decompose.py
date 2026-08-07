@@ -646,3 +646,29 @@ async def test_malformed_tab_url_rejected_then_corrected(library):
     assert llm.calls == 2
     assert len(subs) == 1 and subs[0].tab_url == "https://duckduckgo.com"
     assert "tab_url" in str(llm.seen[1][-1].content)
+
+
+# ------------------------------- declared verify checks -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spec_declared_verify_reaches_subtasks_and_cache_drops_it(library):
+    """Tier 1 threads each slice's parsed checks onto its Subtask; the saved
+    decomposition cache deliberately does NOT carry them (checks re-attach from
+    the spec every load, so a stale cache can never resurrect old checks)."""
+    from automation.pipeline.checks import Check
+
+    prompt = "go to the payroll module. add the employee and save"
+    spec = TaskSpec(key="k", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the payroll module.",
+                    verify=(Check(kind="url_contains", arg="payroll"),)),
+        SubtaskDecl(prompt="add the employee and save"),
+    ))
+    subs = await decompose.get_decomposition(prompt, llm=None, spec=spec)
+    assert subs[0].verify == (Check(kind="url_contains", arg="payroll"),)
+    assert subs[1].verify is None
+
+    cached = ss.load_decomposition(ss.task_id(prompt))
+    assert cached and all("verify" not in d for d in cached["subtasks"])
+    rebuilt = decompose._build_subtasks(cached["subtasks"], None, trust_kind=False)
+    assert all(s.verify is None for s in rebuilt)

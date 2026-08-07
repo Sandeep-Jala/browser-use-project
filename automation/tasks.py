@@ -30,6 +30,7 @@ from typing import Any
 
 import yaml
 
+from automation.pipeline.checks import Check, parse_verify
 from automation.pipeline.subtask_store import is_absolute_http_url
 
 
@@ -46,7 +47,9 @@ class SubtaskDecl:
     repeat-until action; judge and loop always run LLM-live and are never cached) —
     normally left None so decompose.node_kind decides. `tab_url` runs the
     subtask in a separate helper tab opened at that URL (same browser context) — the tab is
-    closed when the subtask ends and the main app page is never navigated.
+    closed when the subtask ends and the main app page is never navigated. `verify` is the
+    slice's declared deterministic checks (pipeline/checks.py), parsed and token-substituted
+    at load time; they gate the segment on top of its base gate and never touch identity.
     """
     prompt: str
     values: dict[str, str] | None = None
@@ -54,6 +57,7 @@ class SubtaskDecl:
     postcondition: dict[str, Any] | None = None
     kind: str | None = None
     tab_url: str | None = None
+    verify: tuple[Check, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,35 @@ def _instantiated(decl: SubtaskDecl) -> str:
     return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), decl.prompt)
 
 
+def _parsed_verify(key: str, i: int, d: dict[str, Any]) -> tuple[Check, ...] | None:
+    """One slice's `verify:` block → validated Check tuple, {{tokens}} substituted from
+    the slice's values. Substitution happens HERE (load time) because the downstream
+    token grammar (sstore.TOKEN_RE) is lowercase-only and would silently skip uppercase
+    names; a token that stays unresolved fails loud — a verify arg has no later closure
+    validation, and probing for literal braces would be a silent always-fail."""
+    raw = d.get("verify")
+    if raw is None:
+        return None
+    values = d.get("values") or {}
+
+    def _sub(text: str) -> str:
+        return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), text)
+
+    if isinstance(raw, (list, tuple)):
+        raw = [
+            {k: (_sub(v) if isinstance(v, str) else v) for k, v in item.items()}
+            if isinstance(item, dict) else item
+            for item in raw
+        ]
+    checks = parse_verify(raw, where=f"tasks.yaml entry {key!r} subtask {i} verify")
+    for c in checks:
+        if _DECL_TOKEN.search(c.arg):
+            raise ValueError(
+                f"tasks.yaml entry {key!r} subtask {i} verify: unresolved token in "
+                f"{c.kind} {c.arg!r} — add it to the subtask's values")
+    return checks
+
+
 def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
     """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
     registry must be caught at load, not as a silent no-marker/no-prompt run."""
@@ -93,8 +126,9 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
         subtasks = tuple(
             SubtaskDecl(prompt=str(d["prompt"]), values=d.get("values"),
                         marker=d.get("marker"), postcondition=d.get("postcondition"),
-                        kind=d.get("kind"), tab_url=d.get("tab_url"))
-            for d in entry["subtasks"]
+                        kind=d.get("kind"), tab_url=d.get("tab_url"),
+                        verify=_parsed_verify(key, i, d))
+            for i, d in enumerate(entry["subtasks"])
         )
         for i, s in enumerate(subtasks):
             if s.tab_url is not None and not is_absolute_http_url(s.tab_url):

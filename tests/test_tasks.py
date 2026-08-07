@@ -460,3 +460,59 @@ def test_prompt_and_subtasks_disagreement_fails_loud(tmp_path):
     )
     with pytest.raises(ValueError, match="disagree"):
         load_tasks(p)
+
+
+# ------------------------------- declared verify checks -------------------------------
+
+
+def test_subtask_verify_parsed_and_substituted():
+    """A verify: block parses into Check tuples at load time, with {{tokens}}
+    substituted from the slice's own values (load-time, because the downstream
+    token grammar is lowercase-only)."""
+    from automation.pipeline.checks import Check
+
+    entry = {"subtasks": [
+        {"prompt": "Add {{name}} then save.",
+         "values": {"name": "Alistair Allan"},
+         "verify": [{"text_visible": "{{name}}"},
+                    {"write_accepted": "Employees", "timeout_s": 5}]},
+    ]}
+    spec = tasks_mod._spec_from_entry("t", entry)
+    assert spec.subtasks[0].verify == (
+        Check(kind="text_visible", arg="Alistair Allan"),
+        Check(kind="write_accepted", arg="Employees", timeout_s=5.0),
+    )
+
+
+def test_subtask_without_verify_is_none():
+    entry = {"subtasks": [{"prompt": "Open payroll."}]}
+    spec = tasks_mod._spec_from_entry("t", entry)
+    assert spec.subtasks[0].verify is None
+
+
+def test_subtask_verify_invalid_fails_loud():
+    entry = {"subtasks": [{"prompt": "Open payroll.",
+                           "verify": [{"nope": "x"}]}]}
+    with pytest.raises(ValueError, match="nope"):
+        tasks_mod._spec_from_entry("t", entry)
+
+
+def test_subtask_verify_unresolved_token_fails_loud():
+    """A verify arg has no downstream closure validation, so a leftover {{token}}
+    must fail at load rather than probe for the literal braces at runtime."""
+    entry = {"subtasks": [{"prompt": "Open payroll.",
+                           "verify": [{"text_visible": "{{missing}}"}]}]}
+    with pytest.raises(ValueError, match="missing"):
+        tasks_mod._spec_from_entry("t", entry)
+
+
+def test_subtask_verify_does_not_change_identity():
+    """Ids derive from slice WORDING only — adding verify: must never drift a
+    task_id (that would orphan decomposition caches and FROZEN_TIDS)."""
+    base = {"subtasks": [{"prompt": "Open payroll."}]}
+    with_verify = {"subtasks": [{"prompt": "Open payroll.",
+                                 "verify": [{"url_contains": "payroll"}]}]}
+    a = tasks_mod._spec_from_entry("t", base)
+    b = tasks_mod._spec_from_entry("t", with_verify)
+    assert a.prompt == b.prompt
+    assert ss.task_id(a.prompt) == ss.task_id(b.prompt)
