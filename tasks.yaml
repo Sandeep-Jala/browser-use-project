@@ -790,10 +790,12 @@ payroll_food_limited_e2e_rti:
         - text_visible: "3,500.00"
     - prompt: >-
         Once the pay rows are loaded, set the pay of Dec-26 to 5000, then set the net pay of
-        Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. At any point during
-        these two changes, if a value does not load or a field keeps its old value after you
-        change it, refresh the page, enter the employee name in the combobox again, and redo
-        that specific change; repeat this until the change has been applied.
+        Feb-27 to 4000 using the Net to Gross option: click the pencil icon at the right end
+        of the Feb-27 row, and in the 'Salary to take home' popup that opens, type 4000 into
+        the Net amount field and click Calculate. At any point during these two changes, if a
+        value does not load or a field keeps its old value after you change it, refresh the
+        page, enter the employee name in the combobox again, and redo whichever of the two
+        changes is no longer showing in the grid; repeat this until both changes are visible.
       kind: loop
     - prompt: >-
         Then click Download and select PDF, then click Download again and select Excel.

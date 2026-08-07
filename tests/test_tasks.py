@@ -254,7 +254,11 @@ FROZEN_TIDS = {
     # slices; test_e2e_rti_declared_subtasks_survive_validation enforces it).
     # Re-frozen 2026-08-07: the user reworded the e2e slices at 09:55 (run
     # 20260807_095537 already ran under this id).
-    "payroll_food_limited_e2e_rti": "f3bd8b35ccb044a9",
+    # Re-frozen 2026-08-07 evening: seg-4 slice reworded to name the real Net-to-Gross
+    # controls (pencil icon -> 'Salary to take home' popup -> Net amount -> Calculate)
+    # and to redo BOTH pay changes after a refresh (a reload wipes client-staged edits) —
+    # root-caused from run 20260807_161823's video ("Could not locate Save button").
+    "payroll_food_limited_e2e_rti": "bf59faa084b3a2af",
 }
 
 
