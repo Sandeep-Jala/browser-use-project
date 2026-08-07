@@ -179,6 +179,27 @@ def discovery_loop_notice(actions: list[dict[str, Any]]) -> str | None:
     )
 
 
+def _save_interrupted_history(agent: Any, record_path: Path | None) -> Path | None:
+    """Best-effort save of an interrupted segment's partial agent history.
+
+    Ctrl+C mid-segment used to lose the step log entirely (the recording is written only
+    at segment end) — four killed runs on 2026-08-05 left video-only forensics. The
+    partial history lands under a distinct `.interrupted.json` suffix so the on-success
+    promotion path can never adopt it. Returns the path written, or None (no record path
+    was requested, or the agent has nothing saveable yet) — never raises."""
+    if record_path is None:
+        return None
+    try:
+        target = Path(record_path).with_suffix("")
+        target = target.with_name(target.name + ".interrupted.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        agent.save_history(str(target))
+        return target if target.exists() else None
+    except Exception as exc:  # noqa: BLE001 - evidence write must never mask the abort
+        logger.debug("could not save interrupted history: %s", exc)
+        return None
+
+
 def restore_result_metadata(history: Any, record_path: Path) -> bool:
     """Re-inject ActionResult.metadata into a saved recording (True if anything landed).
 
@@ -401,13 +422,14 @@ class Runner:
             # Custom actions the prompts rely on (skip_step, fail_and_stop, capped_scroll,
             # detect_layout_issues, run_accessibility_scan) plus all built-ins. None → built-ins.
             tools=self.tools,
-            # browser-use's end-of-run judge (use_judge defaults True) is OFF: the hybrid
-            # engine's segment gates (marker/download/postcondition — network ground truth)
-            # are the verdict, the judge never overrides the agent's self-reported success
-            # (browser-use's own _judge_and_log contract), and the hybrid path discarded its
-            # verdict anyway (HybridSession.finalize hardcodes judgement=None) — a full-trace
-            # LLM call per segment for nothing.
-            use_judge=True,
+            # browser-use's end-of-run judge (use_judge defaults True) is OFF — the
+            # 2026-07-30 decision: the hybrid engine's segment gates are the verdict, the
+            # judge never overrides the agent's self-reported success, and the hybrid path
+            # discards its verdict anyway (HybridSession.finalize hardcodes judgement=None).
+            # Found regressed to True on 2026-08-07: every authored segment ended with a
+            # full-trace judgement on the medium-effort expander deployment (240s timeout,
+            # 5 retries) — minutes of dead air between subtasks, verdict thrown away.
+            use_judge=False,
             judge_llm=self.judge_llm,
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop
             # override prompt on Ctrl+C, so disable browser-use's own signal handler.
@@ -611,11 +633,22 @@ class Runner:
                     success_marker,
                 )
             )
+        # Live network bridge: click receipts report the write requests they fired (with
+        # the server's body verdict) — the ground truth that was sitting unshown in the
+        # collector while the agent re-submitted an already-accepted FPS.
+        if network_collector is not None:
+            agent_tools.set_live_network(network_collector)
 
         try:
             history = await agent.run(max_steps=max_steps, on_step_start=_track_step)
+        except KeyboardInterrupt:
+            saved = _save_interrupted_history(agent, record_path)
+            if saved is not None:
+                logger.info("⏸ interrupted — partial segment history saved to %s", saved)
+            raise
         finally:
             agent_tools.clear_save_probe()
+            agent_tools.clear_live_network()
             if hitl_active:
                 try:
                     signal.signal(signal.SIGINT, prev_sigint)

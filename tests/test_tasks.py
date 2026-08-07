@@ -171,7 +171,43 @@ FROZEN_TIDS = {
     # pin captured — the commit itself shipped with this test red. Pinned back to what
     # the CURRENT prompts hash to (the 07-30 evening ids); today's runs already
     # re-decomposed and executed these prompts (decomposition 287ea967fcab1973).
-    "payroll_rti_process": "853742267f5ce2ca",
+    # Re-frozen 2026-08-05: full imperative rewrite of the RTI flow — per-employee loop
+    # steps spelled out (read the name first; explicit stop / minimum-wage / disabled
+    # branches; "Keep repeating ... until X is the employee shown"), start month
+    # May-26 -> Apr-26, stop employees retargeted (Owen Millar -> Alan Marshall,
+    # David Williamson -> Bruce Wright), FPS checkbox rewording, and the "next month"
+    # parenthetical corrected June-26 -> May-26 (leftover from the May start). The
+    # rewrite dropped every judge phrase, which silently demoted both employee loops to
+    # cacheable actions — a frozen Save & Next replay then saved the stop-target
+    # employee — until node_kind grew the judge-free loop net (see
+    # test_node_kind_loop_detection). Orphans decompositions 1171ff661871481a /
+    # 8f5212530e16673c (still usable as derived-match value-swap parents).
+    # Re-frozen 2026-08-05 PM (catch-up): the imperative rewrite kept being edited after
+    # the freeze above — combobox-named period selection ("in the combobox select Monthly
+    # and the combobox next to it select May-26", the ambiguous-referent rule), FPS line
+    # now "tick the employees checkbox, tick the checkbox of Alan Marshall", explicit
+    # "(May-26)" next-month parenthetical, and a closing "take no further actions"
+    # sentence. Run 20260805_123407_334719 executed THIS wording and its decomposition
+    # (02498b06d4cd44da) is already cached; no cache ever existed for 98b95b62d114b4c7,
+    # so nothing is orphaned.
+    # Re-frozen 2026-08-05 later PM, twice-over (user edits between runs): first the
+    # expense/FPS target employee moved Alan Marshall -> Aleksander Millar (Alan carries
+    # the morning runs' duplicate rows) — run 20260805_142523_388784 executed that
+    # wording (6db7d88c88a0e6b1, decomposition cached, now orphaned as a value-swap
+    # parent); then, after the FPS-redo forensics, Aleksander Millar -> Alistair Allan
+    # and the self-contradictory "change the date to the next month (May-26)" became the
+    # explicit "combobox value for period to Jun-26". No cache yet for this id — the
+    # next run decomposes fresh.
+    # Re-frozen 2026-08-05 evening: further user edits between runs (the FPS header-
+    # checkbox line and RTI polish continued to evolve alongside the e2e_rti rewording).
+    "payroll_rti_process": "3f1186abde58a1ea",
+    # Added 2026-08-05: the pre-rewrite RTI wording, kept deliberately for comparison
+    # while the imperative rewrite above beds in (its stop employees were retargeted to
+    # Alan Marshall / Bruce Wright and the FPS checkbox rewording applied here too).
+    # Re-frozen 2026-08-05 later PM: same employee retargets as the main copy
+    # (Alan Marshall -> Aleksander Millar -> Alistair Allan), applied here deliberately
+    # to keep the shared wording identity.
+    "payroll_rti_process_old": "20d8ead8c7cc6a87",
     # Re-frozen 2026-07-27: the data-request tail was rewritten in ALL THREE copies that
     # carry it (here, crm_data_request, payroll_food_limited_e2e) against screenshots of the
     # real UI — the old "click on status sent ... select status Sent/Submitted, Note well
@@ -203,7 +239,22 @@ FROZEN_TIDS = {
     # conditional false branch, single-click Save & Next clause), applied to this copy
     # deliberately to keep the shared wording identity. Orphans 994afb778ccdf6e3.
     # Re-frozen 2026-08-03: same rollback re-pin as payroll_rti_process above.
-    "payroll_food_limited_e2e_rti": "b7fefb3c078ff5b0",
+    # Re-frozen 2026-08-05: two RTI-half edits applied to this copy (its wording stays
+    # the OLD style — the imperative rewrite touched only payroll_rti_process): second
+    # pass's stop employee David Williamson -> Bruce Wright, and the FPS bulk-upload
+    # line reworded to "click on employee checkbox, click on the checkboxof the
+    # employee we added earlier" (sic — the missing space is in tasks.yaml).
+    # Re-frozen 2026-08-05 later PM: the same Alan Marshall -> Aleksander Millar ->
+    # Alistair Allan retargets applied to this copy's RTI half.
+    # Re-frozen 2026-08-05 evening: the user rewrote the e2e half into the polished
+    # imperative wording (the 16:19 run executed it as 0af549f75a1a352f) and the RTI half
+    # carries the Alistair Allan retargets. This entry now also declares its 19-subtask
+    # split in tasks.yaml (Tier 1) — declarations do not change the task id, but any
+    # prompt reword MUST update the declared slices in lockstep (they are verbatim
+    # slices; test_e2e_rti_declared_subtasks_survive_validation enforces it).
+    # Re-frozen 2026-08-07: the user reworded the e2e slices at 09:55 (run
+    # 20260807_095537 already ran under this id).
+    "payroll_food_limited_e2e_rti": "f3bd8b35ccb044a9",
 }
 
 
@@ -311,7 +362,6 @@ def test_subtask_tab_url_parses_and_rejects_relative(tmp_path):
     p = tmp_path / "t.yaml"
     p.write_text(
         "aux_task:\n"
-        "  prompt: search the web for the thing\n"
         "  subtasks:\n"
         "    - prompt: 'search DuckDuckGo for the thing'\n"
         "      tab_url: https://duckduckgo.com\n"
@@ -321,7 +371,6 @@ def test_subtask_tab_url_parses_and_rejects_relative(tmp_path):
 
     p.write_text(
         "aux_task:\n"
-        "  prompt: search the web for the thing\n"
         "  subtasks:\n"
         "    - prompt: 'search DuckDuckGo for the thing'\n"
         "      tab_url: duckduckgo.com\n"
@@ -331,12 +380,14 @@ def test_subtask_tab_url_parses_and_rejects_relative(tmp_path):
 
 
 def test_entry_fields_parse(tmp_path):
+    # A prompt kept alongside subtasks must AGREE with their join (2026-08-05: the
+    # slices are the source of truth; the prompt here pins block-scalar folding).
     p = tmp_path / "t.yaml"
     p.write_text(
         "My_Task:\n"
         "  prompt: >-\n"
-        "    do the thing\n"
-        "    across two lines\n"
+        "    open settings\n"
+        "    save it\n"
         "  marker: Things\n"
         "  tags: [a, b]\n"
         "  subtasks:\n"
@@ -347,9 +398,65 @@ def test_entry_fields_parse(tmp_path):
     )
     tasks = load_tasks(p)
     spec = tasks["my_task"]  # keys are lowercased
-    assert spec.prompt == "do the thing across two lines"  # block-scalar folding collapsed
+    assert spec.prompt == "open settings save it"  # block-scalar folding collapsed
     assert spec.marker == "Things" and spec.tags == ("a", "b")
     assert spec.subtasks == (
         SubtaskDecl(prompt="open {{page}}", values={"page": "settings"}),
         SubtaskDecl(prompt="save it", marker="Things"),
     )
+
+
+async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatch):
+    """The declared split of the e2e_rti mega-task must pass Tier 1 validation and never
+    degrade to the whole-prompt fallback (the LLM decomposer rejected its own splits 3x
+    per run on 2026-08-05 and every run degenerated to one blob). The declared prompts
+    are VERBATIM slices whose concatenation reproduces the task prompt exactly — the
+    identity contract that keeps shared RTI-half sids aligned with payroll_rti_process."""
+    from automation.pipeline import decompose
+
+    monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path / "library")
+    monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "library" / "manifest.json")
+    monkeypatch.setattr(ss, "DECOMPOSITIONS_DIR", tmp_path / "decompositions")
+    spec = load_tasks()["payroll_food_limited_e2e_rti"]
+
+    joined = " ".join(" ".join(d.prompt.split()) for d in spec.subtasks)
+    assert joined == spec.prompt          # verbatim partition, no reword drift
+
+    subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
+    assert len(subs) == 19                # Tier 1 won; no fallback blob
+    assert not any(getattr(s, "fallback", False) for s in subs)
+    assert [s.kind for s in subs].count("loop") == 4
+    assert decompose.is_conditional_guard(subs[11].template_prompt)   # the popup guard
+    assert "download" in subs[5].template_prompt.lower()              # download subtask
+
+
+def test_prompt_derived_from_declared_subtasks(tmp_path):
+    """A task with `subtasks:` needs no `prompt:` — the spec's prompt is the single-space
+    join of the instantiated slices (tokens substituted). One edit surface: the user
+    rewords a slice, never a parallel prompt copy."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "derived:\n"
+        "  subtasks:\n"
+        "    - prompt: 'open the {{page}} page.'\n"
+        "      values: {page: settings}\n"
+        "    - prompt: 'click save'\n"
+    )
+    spec = load_tasks(p)["derived"]
+    assert spec.prompt == "open the settings page. click save"
+    assert spec.subtasks and len(spec.subtasks) == 2
+
+
+def test_prompt_and_subtasks_disagreement_fails_loud(tmp_path):
+    """Keeping BOTH a prompt and subtasks is allowed only while they agree — a mismatch
+    is silent drift waiting to poison identities, so the registry load refuses it."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "drifted:\n"
+        "  prompt: open the settings page. click SUBMIT\n"
+        "  subtasks:\n"
+        "    - prompt: 'open the settings page.'\n"
+        "    - prompt: 'click save'\n"
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        load_tasks(p)

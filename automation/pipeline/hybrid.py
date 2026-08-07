@@ -147,6 +147,12 @@ def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Ga
         return Gate(kind="marker", marker=sub.marker)
     if sub.postcondition:
         return Gate(kind="postcondition", postcondition=sub.postcondition)
+    if getattr(sub, "fallback", False):
+        # A whole-prompt fallback blob mentions "download" mid-task, but its deliverable
+        # is the WHOLE task — the download gate would also inject the FILE DOWNLOAD
+        # prompt block at the top, which sent the blob runs hunting a Download control
+        # from step 1. The blob's arbiter is the end-of-run judge; degrade to steps.
+        return Gate(kind="steps")
     if downloads_file(sub.template_prompt):
         return Gate(kind="download")
     end_context = (entry or {}).get("end_context")
@@ -191,14 +197,21 @@ _MARKER_EXTRA_STEPS = 10
 _LOOP_EXTRA_STEPS = 35
 
 
-def segment_step_budget(gate: Gate, base: int, kind: str = "action") -> int:
+# Extra agent steps for the whole-prompt FALLBACK blob: one segment must cover the entire
+# task (a mega-task blob at the flat 25-step base would die a third of the way in).
+_FALLBACK_EXTRA_STEPS = 75
+
+
+def segment_step_budget(gate: Gate, base: int, kind: str = "action",
+                        fallback: bool = False) -> int:
     """Max agent steps for one segment: the configured base, plus fix-and-resave headroom
     when the segment owns the marker (its save must be verified and possibly repaired),
     plus repeat-until headroom when the node is a loop (one budget must cover every
-    iteration)."""
+    iteration), plus whole-task headroom for a fallback blob (the segment IS the task)."""
     return (int(base)
             + (_MARKER_EXTRA_STEPS if gate.kind == "marker" else 0)
-            + (_LOOP_EXTRA_STEPS if kind == "loop" else 0))
+            + (_LOOP_EXTRA_STEPS if kind == "loop" else 0)
+            + (_FALLBACK_EXTRA_STEPS if fallback else 0))
 
 
 # Postcondition settle window: an SPA can still be re-rendering/navigating when a
@@ -786,7 +799,8 @@ class HybridSession:
             out = await self.runner.run_agent_segment(
                 prompt, self.session, self.collectors,
                 max_steps=segment_step_budget(gate, self.runner.config.subtask_max_steps,
-                                              kind),
+                                              kind,
+                                              fallback=getattr(sub, "fallback", False)),
                 record_path=record_path, success_marker=gate.marker,
                 request_offset=watermark,
             )
@@ -1571,6 +1585,11 @@ async def run_hybrid_task(
                         skip_reason = "reauthor"
                         print(f"[*] subtask {i} [{sid}]: --reauthor -> authoring with the "
                               f"agent (entry replaced only on success)")
+                    elif getattr(sub, "fallback", False):
+                        skip_reason = "fallback"
+                        print(f"[*] subtask {i} [{sid}]: whole-prompt fallback node -> "
+                              f"agent runs the ENTIRE task as one segment (decomposition "
+                              f"unavailable), whole-task step budget, never cached")
                     elif is_judge:
                         skip_reason = "judge"
                         print(f"[*] subtask {i} [{sid}]: judge node (verification) -> agent "
@@ -1613,8 +1632,13 @@ async def run_hybrid_task(
                                                 findings=findings, run_values=run_values,
                                                 start_url=raw_start_url,
                                                 dynamic=is_consumer,
+                                                # A fallback blob never commits: a whole-
+                                                # task recording replayed blind is the
+                                                # pre-hybrid behavior this mode degrades
+                                                # FROM, not a library asset.
                                                 commit=not is_judge and not is_loop
-                                                and not is_conditional)
+                                                and not is_conditional
+                                                and not getattr(sub, "fallback", False))
                     seg.skip_reason = skip_reason
             finally:
                 if aux_url:
@@ -1637,6 +1661,22 @@ async def run_hybrid_task(
                 run_values.update({str(k): str(v) for k, v in seg.extracted.items()})
             if seg.finding:
                 findings.append(f"{sub.instantiated_prompt[:80]}: {seg.finding}")
+    except KeyboardInterrupt:
+        # Second Ctrl+C aborts mid-segment. Four killed runs on 2026-08-05 left
+        # progress.json stuck at "running" with the in-flight segment unrecorded —
+        # video-only forensics. Stub the segment, flush (which also writes the
+        # collectors), and propagate the abort.
+        try:
+            segments.append(Segment(
+                index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
+                context=context, mode="authored",
+                kind=getattr(sub, "kind", "action"), ok=False,
+                error="interrupted by user (Ctrl+C)"))
+        except Exception:  # noqa: BLE001 - interrupted before the loop bound its vars
+            pass
+        _write_progress(hs, task=task, tid=tid, subtasks=subtasks, segments=segments,
+                        status="interrupted", is_successful=False)
+        raise
     finally:
         result = await hs.finalize(task, marker)
 

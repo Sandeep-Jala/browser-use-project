@@ -661,7 +661,19 @@ def compile_recording(
                 # made with the old tool — compile exactly as they ran.
                 md = (results[i].get("metadata")
                       if i < len(results) and isinstance(results[i], dict) else None)
+                if isinstance(md, dict) and md.get("no_fill"):
+                    # The tool typed NOTHING (dropdown-filter refusal, agent_tools) —
+                    # compiling this would bake a phantom fill into the replay, the
+                    # fill-shaped twin of the no_click phantom click above.
+                    continue
                 enter_after = isinstance(md, dict) and bool(md.get("auto_enter"))
+                # Date pickers never get the mirrored Enter, whatever the recording says:
+                # recordings from the brief window when the live tool pressed Enter after
+                # dates (2026-08-07 morning) would otherwise bake that press into every
+                # replay. Same rule as the live path — the date commits on blur.
+                if (str((element.get("attributes") or {}).get("aria-haspopup") or "")
+                        .strip().lower() == "dialog"):
+                    enter_after = False
                 # Miscapture repair: a fill recorded against a non-editable container means the
                 # element identity is wrong (agent typed at a td/div index). Recover the real
                 # field from this step's state_message instead of compiling the container.
@@ -786,6 +798,42 @@ def save_steps(
     return steps
 
 
+# Composed-tree helpers, spliced verbatim into BOTH raw finders below. The app renders
+# some surfaces (the Add Expenses or Benefits modal) behind an OPEN shadow root; a
+# body-scoped querySelectorAll cannot see them, so find_by_text answered "the element is
+# not in this page's DOM" for a label visibly on screen (run 20260805_123407_334719) and
+# the agent fell back to guessing anonymous combobox indexes. walkAll descends through
+# open shadow roots (closed ones expose no .shadowRoot and stay invisible by
+# construction); composedParent/composedContains cross the same boundaries the walk does.
+# No literal '%' may appear here — the host templates are %-formatted.
+_COMPOSED_WALK_JS = """\
+    var walkAll = function (visit) {
+      var stack = [document.body], n, kids, i;
+      while (stack.length) {
+        n = stack.pop();
+        if (n.shadowRoot) stack.push(n.shadowRoot);
+        kids = n.children || [];
+        for (i = 0; i < kids.length; i++) stack.push(kids[i]);
+        if (n !== document.body && n.nodeType === 1) visit(n);
+      }
+    };
+    var composedParent = function (e) {
+      if (!e) return null;
+      if (e.parentElement) return e.parentElement;
+      var r = e.getRootNode ? e.getRootNode() : null;
+      return (r && r.host) ? r.host : null;
+    };
+    var composedContains = function (a, b) {
+      for (var p = composedParent(b); p; p = composedParent(p)) {
+        if (p === a) return true;
+      }
+      return false;
+    };
+    var inShadowTree = function (e) {
+      return !!(e.getRootNode && e.getRootNode() !== document);
+    };
+"""
+
 # The raw-DOM find+click algorithm, SHARED between find_by_text (authoring, agent_tools)
 # and the `find_click` replay step: token match over title/aria-label/name/text plus child
 # icon hints, ranked visible-first then by NAME SPECIFICITY (exact > word-aligned prefix >
@@ -802,8 +850,10 @@ RAW_FIND_JS = r"""
     var TOKENS = %s, DOCLICK = %s;
     var sel = 'button,a,[role=button],[role=menuitem],[role=tab],[role=link],' +
               'input[type=button],input[type=submit],[data-is-focusable],[onclick]';
+__WALK__
     var out = [];
-    document.querySelectorAll(sel).forEach(function (e) {
+    walkAll(function (e) {
+      if (!e.matches || !e.matches(sel)) return;
       var hay = [e.getAttribute('title'), e.getAttribute('aria-label'), e.getAttribute('name'),
                  e.innerText].filter(Boolean).join(' ');
       e.querySelectorAll('[data-icon-name],[title],[aria-label]').forEach(function (c) {
@@ -866,7 +916,7 @@ RAW_FIND_JS = r"""
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs } };
   } catch (e) { return { error: String(e) }; }
 })()
-"""
+""".replace("__WALK__", _COMPOSED_WALK_JS)
 
 # Static-TEXT finder for extract_data and the `extract` replay step. RAW_FIND_JS above
 # deliberately scans only control-like elements (it exists to CLICK things); a value shown
@@ -896,13 +946,23 @@ RAW_TEXT_FIND_JS = r"""
     var TOKENS = %s;
     var body = document.body;
     if (!body) return { count: 0 };
-    var whole = (body.textContent || '').toLowerCase();
-    if (!TOKENS.every(function (t) { return whole.indexOf(t) !== -1; })) return { count: 0 };
+__WALK__
     // OPTION/OPTGROUP are skipped so a <select> stays the DEEPEST match for its own
     // option text (options are zero-rect while the menu is closed and would otherwise
     // knock the select out of the deepest-only filter below, losing the match entirely).
     var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, OPTION: 1, OPTGROUP: 1 };
-    var all = body.querySelectorAll('*');
+    // One composed pass collects the candidate elements AND the whole-page text for the
+    // every-token gate (body.textContent alone misses shadow content).
+    var all = [], whole = '';
+    walkAll(function (e) {
+      all.push(e);
+      var cn = e.childNodes;
+      for (var k = 0; k < cn.length; k++) {
+        if (cn[k].nodeType === 3) whole += cn[k].data + ' ';
+      }
+    });
+    whole = whole.toLowerCase();
+    if (!TOKENS.every(function (t) { return whole.indexOf(t) !== -1; })) return { count: 0 };
     var matches = [];
     for (var i = 0; i < all.length; i++) {
       var e = all[i];
@@ -916,9 +976,10 @@ RAW_TEXT_FIND_JS = r"""
     }
     if (!matches.length) return { count: 0 };
     // Deepest only: every match's ancestors also match (their text is a superset), so drop
-    // any element that contains another match.
+    // any element that contains another match. Containment must cross shadow boundaries
+    // the same way the walk does, or a host and its shadow content both survive.
     var deepest = matches.filter(function (e) {
-      return !matches.some(function (o) { return o !== e && e.contains(o); });
+      return !matches.some(function (o) { return o !== e && composedContains(e, o); });
     });
     var scored = [];
     deepest.forEach(function (e) {
@@ -949,7 +1010,7 @@ RAW_TEXT_FIND_JS = r"""
       };
       var queryNorm = TOKENS.join(' ');
       if (normText(top.text) === queryNorm) {
-        var anc = top.el.parentElement;
+        var anc = composedParent(top.el);
         while (anc && anc !== document.body) {
           var ancText = (anc.innerText || '').replace(/\s+/g, ' ').trim();
           if (normText(ancText) !== queryNorm) {
@@ -959,7 +1020,7 @@ RAW_TEXT_FIND_JS = r"""
             }
             break;
           }
-          anc = anc.parentElement;
+          anc = composedParent(anc);
         }
       }
     }
@@ -976,14 +1037,179 @@ RAW_TEXT_FIND_JS = r"""
       return xp(e.parentElement) + '/' + e.tagName.toLowerCase() +
              (n > 1 ? '[' + ix + ']' : '');
     };
+    // A positional xpath resolves against the DOCUMENT at replay time; for a shadow-tree
+    // element it would land on some unrelated light-DOM node. No anchor is honest — a
+    // wrong-element anchor is not.
     var xpath = '';
-    try { xpath = xp(top.el); } catch (e) {}
+    if (!inShadowTree(top.el)) {
+      try { xpath = xp(top.el); } catch (e) {}
+    }
     return { count: scored.length, name: top.text.slice(0, 1000), expanded: expanded,
              names: scored.slice(0, 5).map(function (o) { return o.text.slice(0, 80); }),
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs, xpath: xpath } };
   } catch (e) { return { error: String(e) }; }
 })()
+""".replace("__WALK__", _COMPOSED_WALK_JS)
+
+# Live-twin re-find for stale fills (agent_tools `input`). When an earlier action in the
+# same step re-renders a form (dropdown picks re-mounting a modal's type-specific fields
+# — the observed duplicate-add loop, run 20260805_131827_339055), the fill's index points
+# at a DETACHED node: its CDP object id still resolves, keystrokes land in whatever holds
+# focus, and a read-back on the dead node either reads '' (false "did NOT take") or the
+# typed text (false clean receipt). This finds the CURRENT element with the same tag and
+# identity attribute — composed-tree walk, so shadow-rooted forms work — and, op 'focus',
+# focuses it (selecting existing text when CLEAR) so a CDP Input.insertText lands there;
+# op 'read' reads it back. Exactly one visible match or the caller refuses: a guessed
+# twin is the wrong-field bug this exists to kill.
+# Placeholders (named): %(tag)s %(attr)s %(value)s %(op)s %(clear)s — all json.dumps'd.
+FIELD_REFIND_JS = r"""
+(function () {
+  try {
+    var TAG = %(tag)s, ATTR = %(attr)s, VALUE = %(value)s, OP = %(op)s, CLEAR = %(clear)s;
+__WALK__
+    var matches = [];
+    walkAll(function (e) {
+      if (String(e.tagName || '').toLowerCase() !== TAG) return;
+      if (String(e.getAttribute(ATTR) || '') !== VALUE) return;
+      var r = e.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return;
+      matches.push(e);
+    });
+    if (matches.length !== 1) return { count: matches.length };
+    var el = matches[0];
+    if (OP === 'focus') {
+      try { el.focus(); } catch (e) {}
+      if (CLEAR && el.select) { try { el.select(); } catch (e) {} }
+      else if (!CLEAR && el.setSelectionRange) {
+        try {
+          var L = (el.value || '').length;
+          el.setSelectionRange(L, L);
+        } catch (e) {}
+      }
+      var attrs = {};
+      ['id', 'role', 'aria-autocomplete', 'placeholder', 'aria-label', 'name', 'type']
+        .forEach(function (a) { var v = el.getAttribute(a); if (v) attrs[a] = v; });
+      var root = el.getRootNode ? el.getRootNode() : document;
+      return { count: 1, focused: root.activeElement === el, attrs: attrs,
+               label: el.getAttribute('placeholder') || el.getAttribute('aria-label') ||
+                      el.getAttribute('name') || el.getAttribute('id') || TAG };
+    }
+    if (OP === 'read') {
+      return { count: 1,
+               value: el.value !== undefined ? String(el.value) : (el.textContent || '') };
+    }
+    return { error: 'bad-op' };
+  } catch (e) { return { error: String(e) }; }
+})()
+""".replace("__WALK__", _COMPOSED_WALK_JS)
+
+# Dialog probes for the click receipt's DIALOG OUTCOME (agent_tools click override).
+# A modal Save in this app closes the dialog and writes over a channel the network
+# collector cannot see; with no receipt saying "the dialog closed", the agent re-opened
+# and re-saved the same benefit ten times. DIALOG_COUNT_JS counts VISIBLE dialogs
+# (role=dialog/alertdialog, aria-modal, or a modal/dialog class token — Fluent's
+# ms-Modal/ms-Dialog), composed-tree so shadow-rooted dialogs count too.
+DIALOG_COUNT_JS = r"""
+(function () {
+  try {
+__WALK__
+    var n = 0;
+    walkAll(function (e) {
+      var role = String(e.getAttribute('role') || '').toLowerCase();
+      var modal = String(e.getAttribute('aria-modal') || '').toLowerCase() === 'true';
+      var cls = String(e.getAttribute('class') || '');
+      if (!(role === 'dialog' || role === 'alertdialog' || modal ||
+            /(^|[\s-])(modal|dialog)([\s-]|$)/i.test(cls))) return;
+      var r = e.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) n = n + 1;
+    });
+    return { open: n };
+  } catch (e) { return { error: String(e) }; }
+})()
+""".replace("__WALK__", _COMPOSED_WALK_JS)
+
+# Runs ON the clicked node (this = element, via Runtime.callFunctionOn): is it inside a
+# dialog? Ancestor walk crossing shadow boundaries the same way the walker does.
+DIALOG_ANCESTOR_JS = r"""
+function () {
+  var composedParent = function (e) {
+    if (!e) return null;
+    if (e.parentElement) return e.parentElement;
+    var r = e.getRootNode ? e.getRootNode() : null;
+    return (r && r.host) ? r.host : null;
+  };
+  for (var p = this; p; p = composedParent(p)) {
+    if (!p.getAttribute) continue;
+    var role = String(p.getAttribute('role') || '').toLowerCase();
+    if (role === 'dialog' || role === 'alertdialog') return true;
+    if (String(p.getAttribute('aria-modal') || '').toLowerCase() === 'true') return true;
+    if (/(^|[\s-])(modal|dialog)([\s-]|$)/i.test(String(p.getAttribute('class') || ''))) {
+      return true;
+    }
+  }
+  return false;
+}
 """
+
+# Identity-tracked variant: the global dialog COUNT lies when panels CHAIN — this app's
+# Save closes its dialog and immediately opens the next panel (Add-Request → Send-Email,
+# run 20260807_095537), so count-delta reported "STILL OPEN" against a save that
+# succeeded and the agent redid it. Stamp THE dialog the clicked element lives in;
+# the post-click question is then "did THAT dialog close", immune to whatever opened.
+DIALOG_WATCH_ATTR = "data-ao-dialog-watch"
+
+# Runs ON the clicked node (this = element): sweep stale stamps everywhere, then stamp
+# the node's dialog ancestor (same predicate as DIALOG_ANCESTOR_JS).
+DIALOG_STAMP_JS = r"""
+function () {
+  try {
+__WALK__
+    walkAll(function (e) {
+      if (e.hasAttribute && e.hasAttribute('WATCH')) e.removeAttribute('WATCH');
+    });
+    for (var p = this; p; p = composedParent(p)) {
+      if (!p.getAttribute) continue;
+      var role = String(p.getAttribute('role') || '').toLowerCase();
+      var modal = String(p.getAttribute('aria-modal') || '').toLowerCase() === 'true';
+      var cls = String(p.getAttribute('class') || '');
+      if (role === 'dialog' || role === 'alertdialog' || modal ||
+          /(^|[\s-])(modal|dialog)([\s-]|$)/i.test(cls)) {
+        p.setAttribute('WATCH', '1');
+        return { stamped: true };
+      }
+    }
+    return { stamped: false };
+  } catch (e) { return { error: String(e) }; }
+}
+""".replace("__WALK__", _COMPOSED_WALK_JS).replace("WATCH", DIALOG_WATCH_ATTR)
+
+# Document-level: is the stamped dialog still mounted with layout? Unmounted or zero-rect
+# means THE dialog closed, regardless of chained panels or toasts.
+DIALOG_STAMPED_OPEN_JS = r"""
+(function () {
+  try {
+__WALK__
+    var found = null, n = 0;
+    walkAll(function (e) {
+      if (!e.getAttribute) return;
+      if (!found && e.hasAttribute && e.hasAttribute('WATCH')) {
+        var fr = e.getBoundingClientRect();
+        if (fr.width > 0 && fr.height > 0) found = e;
+      }
+      var role = String(e.getAttribute('role') || '').toLowerCase();
+      var modal = String(e.getAttribute('aria-modal') || '').toLowerCase() === 'true';
+      var cls = String(e.getAttribute('class') || '');
+      if (!(role === 'dialog' || role === 'alertdialog' || modal ||
+            /(^|[\s-])(modal|dialog)([\s-]|$)/i.test(cls))) return;
+      var r = e.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) n = n + 1;
+    });
+    // `open` (same predicate as DIALOG_COUNT_JS) corroborates a missing stamp: React
+    // re-renders REPLACE the stamped node, so "stamp gone" alone cannot mean "closed".
+    return { present: !!found, open: n };
+  } catch (e) { return { error: String(e) }; }
+})()
+""".replace("__WALK__", _COMPOSED_WALK_JS).replace("WATCH", DIALOG_WATCH_ATTR)
 
 # Reveal stylesheet: the app hides several REAL controls until hover by collapsing their
 # wrappers to 0-size (the Reviews "Send NPS survey request" / "Add reviews" icons). Zero-

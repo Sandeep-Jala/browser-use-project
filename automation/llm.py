@@ -28,7 +28,6 @@ def build_llm(config: Config) -> BaseChatModel:
             api_key=config.azure_api_key,
             base_url=config.azure_base_url,
             temperature=0.0,
-            timeout=45.0,
             # Reliability params pinned rather than inherited from browser-use defaults
             # (these ARE 0.13.3's defaults — pinned so an upgrade can't silently move them).
             # frequency_penalty is deliberately left at its 0.3 default: it exists to stop
@@ -71,7 +70,9 @@ def build_expander_llm(config: Config) -> BaseChatModel | None:
         api_key=config.azure_api_key,
         base_url=config.azure_base_url,
         temperature=0.0,
-        timeout=45.0,
+        # Medium reasoning effort takes ~3 minutes for full-coverage output on long task
+        # prompts; 45s guarantees "Request timed out" on every attempt. Sized with headroom.
+        timeout=240.0,
         max_retries=5,
         reasoning_effort="medium",
         max_completion_tokens=16384,

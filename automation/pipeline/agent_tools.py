@@ -50,7 +50,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from browser_use import Tools
@@ -62,6 +64,10 @@ from browser_use.dom.views import DOMInteractedElement
 from browser_use.tools.views import InputTextAction, SelectDropdownOptionAction
 
 from automation.pipeline.script_compile import (
+    DIALOG_COUNT_JS as _DIALOG_COUNT_JS,
+    DIALOG_STAMP_JS as _DIALOG_STAMP_JS,
+    DIALOG_STAMPED_OPEN_JS as _DIALOG_STAMPED_OPEN_JS,
+    FIELD_REFIND_JS as _FIELD_REFIND_JS,
     RAW_FIND_JS as _RAW_FIND_JS,
     RAW_TEXT_FIND_JS as _RAW_TEXT_FIND_JS,
     REVEAL_CSS_JS as _REVEAL_CSS_JS,
@@ -416,10 +422,22 @@ def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
         return None
 
 
+# A combobox whose popup is a dialog is a date/time picker (Fluent DatePicker), not an
+# option filter: typed text IS its value and reads back verifiably.
+def _is_date_picker(node: Any) -> bool:
+    attrs = getattr(node, "attributes", None) or {}
+    return (attrs.get("aria-haspopup") or "").strip().lower() == "dialog"
+
+
 # A dropdown/combobox filter input: Enter there commits the focused option instead of
 # submitting a search, so the auto-Enter `input` replacement must not fire it.
 def _is_dropdown_filter(node: Any) -> bool:
     attrs = getattr(node, "attributes", None) or {}
+    # Date pickers must never get the filter refusal (run 20260807_093003: the DOB
+    # refusal forced calendar navigation to 1982 and killed the run) — but they keep
+    # their own Enter suppression via _is_date_picker (see the fill path).
+    if _is_date_picker(node):
+        return False
     if _RS_FILTER_ID.match(attrs.get("id") or ""):
         return True
     if (attrs.get("role") or "").strip().lower() == "combobox":
@@ -487,6 +505,115 @@ async def _field_value(handle) -> str | None:
         logger.debug("field readback failed (node likely re-rendered): %s", exc)
         return None
     return "" if value is None else str(value)
+
+
+async def _field_connected(handle) -> bool | None:
+    """Whether the element is still attached to a live document. False for a node an
+    earlier action re-rendered away: its CDP object id keeps resolving, so fills and
+    read-backs against it look normal while the USER-visible field never changes. None
+    when the element can't be asked — callers then trust the normal path."""
+    try:
+        return bool(await _call_on_field(handle, "function(){ return this.isConnected; }"))
+    except Exception as exc:  # noqa: BLE001 - an unprobeable node is not proof of staleness
+        logger.debug("connectivity probe failed: %s", exc)
+        return None
+
+
+# Identity ladder for re-finding a detached field's live twin; first attr the stale node
+# actually carries wins. Class is deliberately absent (framework hashes churn per render).
+_REFIND_IDENTITY_ATTRS = ("id", "name", "placeholder", "aria-label")
+
+
+async def _refind_fill(browser_session, node, params: InputTextAction) -> ActionResult:
+    """Land a fill whose target index went STALE mid-step on the live twin instead.
+
+    The observed loop (run 20260805_131827_339055): dropdown picks batched before the
+    fill re-mounted the modal, the fill's node detached, keystrokes went to whatever held
+    focus, and the dead-node read-back produced a false "did NOT take" warning that drove
+    ten duplicate saves. Here the CURRENT element with the same tag + identity attribute
+    is found (composed-tree walk), focused, and filled via CDP insertText, with the same
+    value_took read-back — or the action refuses honestly with the no_fill stamp. The
+    recorded interacted_element keeps the stale node's attrs, which are the twin's too,
+    so compiled replays are unaffected."""
+    attrs = getattr(node, "attributes", None) or {}
+    tag = str(getattr(node, "node_name", "") or "").lower()
+    ident = next(((a, str(attrs.get(a)).strip()) for a in _REFIND_IDENTITY_ATTRS
+                  if str(attrs.get(a) or "").strip()), None)
+    stale = (f"STALE INDEX — element {params.index} was re-rendered away by an earlier "
+             "action in this step and is no longer in the document; nothing was typed "
+             "(keystrokes to a dead element land in whatever holds focus). Re-read the "
+             "page and retype at the FRESH index — do not batch fills into the same step "
+             "as dropdown picks.")
+    if not ident or not tag:
+        # All refusals below ride the error channel: multi_act stops the remaining
+        # queued actions of this step on it, so nothing (a Save, an Enter, another
+        # fill) executes on top of a fill that never landed.
+        return ActionResult(error=stale, metadata={"no_fill": True})
+    attr, value = ident
+
+    def _expr(op: str) -> str:
+        return _FIELD_REFIND_JS % {
+            "tag": json.dumps(tag), "attr": json.dumps(attr), "value": json.dumps(value),
+            "op": json.dumps(op), "clear": json.dumps(bool(params.clear))}
+
+    try:
+        found = await _eval_js(browser_session, _expr("focus"))
+    except Exception as exc:  # noqa: BLE001 - refusal is the safe degradation
+        logger.debug("stale-fill re-find failed: %s", exc)
+        found = None
+    if not (isinstance(found, dict) and found.get("count") == 1):
+        n = found.get("count") if isinstance(found, dict) else None
+        msg = stale if not n else \
+            stale + f" ({n} candidates share {attr}='{value}' — cannot pick one safely.)"
+        logger.info("⛔ %s", msg)
+        return ActionResult(error=msg, metadata={"no_fill": True})
+    label = str(found.get("label") or value)
+    if (params.text or "").strip() and \
+            _is_dropdown_filter(SimpleNamespace(attributes=dict(found.get("attrs") or {}))):
+        # The refusal must hold through re-resolution too, or staleness becomes a side
+        # door into exactly the typed-filter no-op the refusal exists to kill.
+        msg = (f"REFUSED — did NOT type '{params.text}': element {params.index} "
+               f"re-rendered into a dropdown/combobox filter ('{label}'), and typed "
+               "filter text selects NOTHING. Re-read the page and call "
+               f"select_dropdown(index=<fresh index>, text='{params.text}') instead.")
+        logger.info("⛔ %s", msg)
+        return ActionResult(error=msg, metadata={"no_fill": True})
+    try:
+        cdp_session = await browser_session.get_or_create_cdp_session()
+        await cdp_session.cdp_client.send.Input.insertText(
+            params={"text": params.text}, session_id=cdp_session.session_id)
+        got = await _eval_js(browser_session, _expr("read"))
+    except Exception as exc:  # noqa: BLE001 - report; the agent recovers via its receipt
+        msg = stale + f" (typing into the live '{label}' field failed: {exc})"
+        return ActionResult(error=msg, metadata={"no_fill": True})
+    verified = None
+    if isinstance(got, dict) and got.get("value") is not None:
+        verified = str(got["value"])
+    if verified is None or not _value_took(params.text, verified):
+        shows = "(unreadable)" if verified is None else f"'{verified}'"
+        msg = (f"element {params.index} had re-rendered (stale index); re-typed "
+               f"'{params.text}' into the live '{label}' field but it now reads {shows} "
+               "— the value did NOT take. Do NOT report this field as set; re-read the "
+               "page and retype at the fresh index.")
+        logger.warning("⚠️ %s", msg)
+        return ActionResult(error=msg, metadata={"no_fill": True})
+    if _is_date_picker(SimpleNamespace(attributes=dict(found.get("attrs") or {}))):
+        # Same date-picker rule as the main fill path: no Enter, blur commits.
+        meta = {"auto_enter": False}
+    else:
+        meta = {"auto_enter": True}
+        try:
+            enter = browser_session.event_bus.dispatch(SendKeysEvent(keys="Enter"))
+            await enter
+            await enter.event_result(raise_if_any=True, raise_if_none=False)
+        except Exception as exc:  # noqa: BLE001 - the fill already landed and verified
+            logger.debug("Enter after re-found fill failed: %s", exc)
+            meta = {"auto_enter": False}
+    msg = (f"element {params.index} had re-rendered (stale index) — typed '{params.text}' "
+           f"into the live '{label}' field instead; it now reads '{verified}'.")
+    logger.info("🩹 %s", msg)
+    return ActionResult(extracted_content=msg, long_term_memory=msg,
+                        include_in_memory=True, metadata=meta)
 
 
 async def _select_state(handle) -> tuple[str, str] | None:
@@ -568,6 +695,8 @@ function () {
 #             no id get one stamped so a later 'pick' can address them.
 #   pick    — dispatch the pointer+mouse sequence on ONE option (by stamped id). react-select
 #             selects on the option's mousedown — this is the click el.click() never was.
+#   escape  — keydown/keyup Escape on the input: close the menu and clear the typed filter
+#             (react-select resets inputValue on Escape) for the zero-options recovery cycle.
 #   state   — menu-open flag + the widget root's visible text (the read-back source).
 _CB_OPS_JS = """
 (function () {
@@ -588,6 +717,18 @@ _CB_OPS_JS = """
   if (OP === 'open') {
     try { input.focus(); } catch (e) {}
     fire(input, SEQ);
+    return { ok: true };
+  }
+  if (OP === 'escape') {
+    // react-select's own Escape handling: closes the menu and clears the typed filter
+    // (a stuck filter is why a dead combobox keeps showing 'No options' for any text).
+    try { input.focus(); } catch (e) {}
+    ['keydown', 'keyup'].forEach(function (t) {
+      try {
+        input.dispatchEvent(new KeyboardEvent(t, { key: 'Escape', code: 'Escape',
+                                                   bubbles: true, cancelable: true }));
+      } catch (e) {}
+    });
     return { ok: true };
   }
   var optionNodes = function () {
@@ -739,6 +880,46 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         if refreshed:
             options = refreshed
         chosen = _choose_option(options, target)
+    if chosen is None and not options:
+        # ZERO options even after typing: one recovery cycle before concluding anything.
+        # A reloaded SPA page can mount the combobox before its option source binds — the
+        # filter then shows 'No options' for ANY text and retyping never recovers it
+        # (run 20260807_110530: 'Daniel Bruce' → 'No options' on every retry while the
+        # employee-list GET kept returning 200). Escape clears the stuck filter, a fresh
+        # open shows the UNFILTERED truth about the source.
+        try:
+            await _cb_op(browser_session, "escape", input_id)
+            await _cb_op(browser_session, "open", input_id)
+        except Exception as exc:  # noqa: BLE001 - the receipt below still tells the truth
+            logger.debug("combobox zero-options recovery reopen failed: %s", exc)
+        options = await _cb_poll_options(browser_session, input_id, timeout=4.0)
+        if not options:
+            # The source binds LATE after a page load (run 20260807_120553: identical
+            # post-reload attempts found options at idx 183/348 and nothing at 264/429 —
+            # a race, not a dead endpoint). One paused second attempt catches the late
+            # bind without handing the agent a retry loop.
+            await asyncio.sleep(2.0)
+            try:
+                await _cb_op(browser_session, "escape", input_id)
+                await _cb_op(browser_session, "open", input_id)
+            except Exception as exc:  # noqa: BLE001 - same degradation as above
+                logger.debug("combobox second recovery reopen failed: %s", exc)
+            options = await _cb_poll_options(browser_session, input_id, timeout=3.0)
+        chosen = _choose_option(options, target)
+        if options and chosen is None:
+            try:
+                await _eval_js(browser_session,
+                               f"document.getElementById({json.dumps(input_id)}).focus()")
+                cdp_session = await browser_session.get_or_create_cdp_session()
+                await cdp_session.cdp_client.send.Input.insertText(
+                    params={"text": target}, session_id=cdp_session.session_id)
+                filtered = True
+            except Exception as exc:  # noqa: BLE001 - fall through to the miss listing
+                logger.debug("combobox recovery filter typing failed: %s", exc)
+            refreshed = await _cb_poll_options(browser_session, input_id, timeout=2.0)
+            if refreshed:
+                options = refreshed
+            chosen = _choose_option(options, target)
     if chosen is None:
         listed = _cb_option_lines(options)
         if options:
@@ -749,11 +930,15 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
                 f"select_dropdown(index={params.index}, text='<option>'). Do NOT hunt "
                 f"the page for '{target}'."))
         return ActionResult(error=(
-            f"select_dropdown '{target}' at index {params.index}: the combobox opened "
-            "but no options rendered within the wait"
-            + (" (even after typing to filter)" if filtered else "")
-            + ". The list may load from the server — wait a moment and call "
-              "select_dropdown again with the same arguments."))
+            f"select_dropdown '{target}' at index {params.index}: the combobox opened but "
+            "its option list NEVER rendered — even after clearing the filter, reopening "
+            "the menu, and waiting. The dropdown's data source did not load on this page "
+            "view; retyping into it as-is will keep showing no options. Recover the way "
+            "the task prescribes if it names a recovery (e.g. refresh the page and start "
+            "over); otherwise reload the page yourself. After the reload, WAIT for the "
+            "page to finish loading before touching the combobox, then re-run "
+            "select_dropdown — do NOT type into any other field until this selection has "
+            "succeeded and the record's data is on screen."))
 
     picked = None
     try:
@@ -853,11 +1038,357 @@ async def _keyboard_clear(handle) -> bool:
         return False
 
 
+# ------------------------------- dialog-outcome clicks -------------------------------
+# The duplicate-add loop (run 20260805_131827_339055): the modal's Save closes the dialog
+# silently; with no receipt saying so, the agent judged every (successful) save a failure
+# and re-added the same benefit ten times. Clicks on elements INSIDE a dialog now report
+# what happened to the dialog — the closed/still-open distinction is a did-it-actually-
+# save signal, and "STILL OPEN" also exposes silent client-side validation rejection.
+
+_DIALOG_SETTLE_S = 0.8
+
+# ------------------------------- network-outcome clicks -------------------------------
+# The FPS redo (run 20260805_142523_388784): the May submission POSTed and the server
+# answered `"isSubmitted": true` — while the agent, staring at a stale "No employees FPS
+# submitted so far" list, decided it had failed and re-submitted the whole company
+# against April (bounced: "already submitted"). Both verdicts sat in the live
+# NetworkCollector unshown. The runner registers that collector here per segment; every
+# click receipt then reports the WRITE requests the click fired — method, status, and a
+# short server-verdict extract from the captured response body — after waiting (bounded)
+# for them to settle. Condition-based by construction: a Save click's receipt arrives
+# when the request finishes, not after a guessed sleep, and an in-dialog click that fired
+# NO write says exactly that (the swallowed-save flag).
+
+_LIVE_NETWORK: Any = None
+_WRITE_SNIFF_S = 1.0     # window (from click dispatch) for a triggered write to START
+_WRITE_SETTLE_S = 8.0    # cap on waiting for started writes to finish (matches the
+                         # end-of-run in-flight-save poll)
+_BODY_POLL_S = 1.0       # extra grace for the async body capture after settle
+
+
+def set_live_network(collector: Any) -> None:
+    """Register the run's live NetworkCollector for click receipts (runner-owned)."""
+    global _LIVE_NETWORK
+    _LIVE_NETWORK = collector
+
+
+def clear_live_network() -> None:
+    global _LIVE_NETWORK
+    _LIVE_NETWORK = None
+
+
+def _write_verdict(record: dict[str, Any]) -> tuple[bool, str] | None:
+    """(negative, text) distilled from a captured JSON write body, or None.
+
+    Walks the body (bounded depth — the FPS success nests `isSubmitted` two levels down
+    in result.submitDetail) for the first failure signal (`errors`, `message` beside a
+    false `status`, false `success`) and, failing that, an affirmation. A 200 whose body
+    says "already submitted" is a REFUSAL, and the receipt must say so."""
+    body = record.get("body")
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+    found: dict[str, Any] = {}
+
+    def _scan(obj: Any, depth: int) -> None:
+        if depth > 4:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                lk = str(key).lower()
+                if lk in ("errors", "message", "status", "success", "issubmitted") \
+                        and lk not in found:
+                    found[lk] = value
+                _scan(value, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj[:10]:
+                _scan(item, depth + 1)
+
+    _scan(data, 0)
+
+    def _first_error_message() -> str | None:
+        errors = found.get("errors")
+        if isinstance(errors, list) and errors:
+            first = errors[0]
+            if isinstance(first, dict):
+                return str(first.get("message") or first)
+            return str(first)
+        return None
+
+    message = found.get("message")
+    err = _first_error_message()
+    if err or (message and found.get("status") is False):
+        return True, str(err or message)[:200]
+    if found.get("success") is False or found.get("status") is False:
+        return True, "the server returned a false status with no message"
+    if found.get("issubmitted") is True:
+        return False, "isSubmitted: true"
+    if found.get("success") is True:
+        return False, "success: true"
+    if message:
+        return False, f'server says: "{str(message)[:160]}"'
+    return None
+
+
+def _format_write(snapshot: dict[str, Any]) -> str:
+    record = snapshot["record"]
+    url = str(record.get("url") or "")
+    for prefix in ("https://", "http://"):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+            break
+    path = "/" + url.split("/", 1)[1] if "/" in url else url
+    if len(path) > 70:
+        path = "…" + path[-69:]
+    method = record.get("method") or "POST"
+    if record.get("failed"):
+        return f"{method} {path} FAILED ({record.get('errorText') or 'network error'})"
+    status = record.get("status")
+    if status is None:
+        return (f"{method} {path} is STILL IN FLIGHT (no response yet) — wait and "
+                "re-check before repeating anything")
+    verdict = _write_verdict(record)
+    if verdict is None:
+        return f"{method} {path} → {status}"
+    negative, text = verdict
+    if negative:
+        return f'{method} {path} → {status} but the server REFUSED it: "{text}"'
+    return f"{method} {path} → {status}; {text}"
+
+
+def _writes_accepted(writes: list[dict[str, Any]]) -> bool:
+    """True when the fired writes prove the action landed: at least one settled 2xx with
+    a non-negative server verdict, and NONE failed, refused, or still in flight. This is
+    the signal that must override the dialog pessimism — a receipt may not print
+    'POST → 200' and 'likely did NOT go through' about the same click."""
+    good = False
+    for w in writes:
+        record = w["record"]
+        if record.get("failed"):
+            return False
+        if not w["settled"] or record.get("status") is None:
+            return False  # still in flight — the receipt already says to wait
+        status = record.get("status")
+        if not (isinstance(status, int) and 200 <= status < 300):
+            return False
+        verdict = _write_verdict(record)
+        if verdict is not None and verdict[0]:
+            return False  # 2xx whose body is a refusal
+        good = True
+    return good
+
+
+async def _network_outcome(collector: Any, t0: float,
+                           expect_write: bool) -> tuple[str, bool, bool]:
+    """(receipt suffix, fired, accepted) for the write requests a click fired — suffix
+    empty when none fired and none were expected. Waits, bounded, for started writes to
+    settle and their bodies to land — the condition the agent used to approximate with
+    blind sleeps. `accepted` is _writes_accepted over the settled records."""
+    try:
+        writes = collector.writes_since(t0)
+        while not writes and time.monotonic() - t0 < _WRITE_SNIFF_S:
+            await asyncio.sleep(0.15)
+            writes = collector.writes_since(t0)
+        if not writes:
+            return ((" — no write request followed this click; if this was a save/submit, "
+                     "nothing reached the server." if expect_write else ""), False, False)
+        while any(not w["settled"] for w in writes) \
+                and time.monotonic() - t0 < _WRITE_SETTLE_S:
+            await asyncio.sleep(0.2)
+            writes = collector.writes_since(t0)
+        body_deadline = time.monotonic() + _BODY_POLL_S
+        while time.monotonic() < body_deadline and any(
+                w["settled"] and "body" not in w["record"]
+                and "json" in str((w["record"].get("response_headers") or {})
+                                  .get("content-type", "")).lower()
+                for w in writes):
+            await asyncio.sleep(0.1)
+        parts = [_format_write(w) for w in writes[:3]]
+        more = f" (+{len(writes) - 3} more write requests)" if len(writes) > 3 else ""
+        text = " — this click fired " + "; ".join(parts) + more + "."
+        return text, True, _writes_accepted(writes)
+    except Exception as exc:  # noqa: BLE001 - the receipt degrades, the click stands
+        logger.debug("network outcome probe failed: %s", exc)
+        return "", False, False
+
+
+async def _dialog_state(browser_session, node=None) -> dict[str, Any] | None:
+    """{'in_dialog': node sits inside an open dialog, 'open': visible dialog count,
+    'stamped': that dialog carries the watch stamp}, or None when the page can't be
+    probed — callers then skip the dialog receipt. Stamping the SPECIFIC dialog is what
+    lets the post-click check survive chained panels (save closes its dialog, the next
+    panel opens, the global count never drops)."""
+    try:
+        got = await _eval_js(browser_session, _DIALOG_COUNT_JS)
+    except Exception as exc:  # noqa: BLE001 - probe is best-effort, never fails the click
+        logger.debug("dialog count probe failed: %s", exc)
+        return None
+    if not isinstance(got, dict) or got.get("error") or "open" not in got:
+        return None
+    in_dialog, stamped = False, False
+    if node is not None:
+        handle = await _field_handle(browser_session, node)
+        if handle:
+            try:
+                mark = await _call_on_field(handle, _DIALOG_STAMP_JS)
+                stamped = bool(isinstance(mark, dict) and mark.get("stamped"))
+                in_dialog = stamped
+            except Exception as exc:  # noqa: BLE001 - unprobeable node reads as outside
+                logger.debug("dialog stamp probe failed: %s", exc)
+    return {"in_dialog": in_dialog, "open": int(got["open"]), "stamped": stamped}
+
+
+# Post-click close poll: cadence, and the longer cap used when the click fired a write
+# (the app closes the panel only after it has processed the response).
+_DIALOG_POLL_S = 0.25
+_DIALOG_WRITE_SETTLE_S = 3.0
+
+
+async def _stamped_dialog_open(browser_session) -> dict[str, Any] | None:
+    """{'present': stamped dialog mounted with layout, 'open': visible dialog count},
+    or None = unprobeable."""
+    try:
+        got = await _eval_js(browser_session, _DIALOG_STAMPED_OPEN_JS)
+    except Exception as exc:  # noqa: BLE001 - probe failure must not fail the click
+        logger.debug("stamped dialog probe failed: %s", exc)
+        return None
+    if not isinstance(got, dict) or got.get("error") or "present" not in got:
+        return None
+    return {"present": bool(got["present"]), "open": int(got.get("open") or 0)}
+
+
+async def _dialog_closed(browser_session, pre: dict[str, Any],
+                         fired_write: bool) -> bool | None:
+    """Did the dialog the clicked element lived in close? Stamped path polls THAT
+    dialog (early exit on close; longer cap after a write, whose processing is what
+    closes the panel). A MISSING stamp alone is not a close: React re-renders REPLACE
+    the stamped node, so the stamp vanishes while the dialog stays up (run
+    20260807_123259: two loan-toggle clicks and the final Save all read false-CLOSED
+    that way, the receipts said ACCEPTED, and an unsaved employee sailed through) —
+    closure needs the visible-dialog count to have dropped too. Unstamped falls back
+    to the global count delta. None = could not tell — the receipt then stays silent
+    rather than guessing."""
+    if pre.get("stamped"):
+        deadline = time.monotonic() + \
+            (_DIALOG_WRITE_SETTLE_S if fired_write else _DIALOG_SETTLE_S)
+        verdict: bool | None = None
+        while True:
+            got = await _stamped_dialog_open(browser_session)
+            if got is not None:
+                if not got["present"] and got["open"] < pre["open"]:
+                    return True        # THE dialog left AND the page has one fewer
+                verdict = False        # still present, or re-rendered stamp loss
+            if time.monotonic() >= deadline:
+                return verdict
+            await asyncio.sleep(_DIALOG_POLL_S)
+    await asyncio.sleep(_DIALOG_SETTLE_S)
+    post = await _dialog_state(browser_session)
+    if not isinstance(post, dict):
+        return None
+    return post["open"] < pre["open"]
+
+
+async def _click_outcome_suffix(browser_session, t0: float,
+                                pre: dict[str, Any] | None) -> str:
+    """The NETWORK OUTCOME (write requests fired, with server verdicts) + DIALOG OUTCOME
+    receipt suffix for a click dispatched at t0 whose pre-click dialog state was `pre`.
+    Shared by the `click` override and find_by_text's click branch — a Save clicked via
+    find_by_text used to fire its POST with no receipt at all (run 20260807_095537 seg6:
+    the unreceipted DataRequest create was re-clicked into a duplicate)."""
+    in_dialog = bool(isinstance(pre, dict) and pre.get("in_dialog"))
+    suffix, fired, accepted = "", False, False
+    if _LIVE_NETWORK is not None:
+        text, fired, accepted = await _network_outcome(_LIVE_NETWORK, t0,
+                                                       expect_write=in_dialog)
+        suffix += text
+    if in_dialog:
+        closed = await _dialog_closed(browser_session, pre, fired)
+        if closed is True:
+            if accepted:
+                suffix += (" — the dialog CLOSED after this click and the server "
+                           "ACCEPTED the write above: this save is DONE — do NOT "
+                           "reopen the dialog or enter the data again.")
+            else:
+                # Closed with no (clearly accepted) write: staged client-side saves
+                # legitimately look like this, but so does a silently discarded form
+                # (run 20260807_123259: Add Employee closed with no create POST, the
+                # old unconditional "ACCEPTED" advisory waved it through, and the
+                # whole run chased an employee that never existed).
+                if fired:
+                    why = ", but the write above did not clearly succeed"
+                elif _LIVE_NETWORK is not None:
+                    why = ", but NO write request fired"
+                else:
+                    why = ""
+                suffix += (" — the dialog CLOSED after this click" + why +
+                           ". If this was a save/submit, VERIFY the record/change "
+                           "now exists (look it up in the list or on the page) "
+                           "before reporting this step done — and only re-enter "
+                           "the data if it is genuinely absent.")
+        elif closed is False and accepted:
+            # The write receipt above is ground truth; the still-open panel is NOT
+            # evidence of failure (it may be a follow-up panel the save opened).
+            suffix += (" — the dialog is STILL OPEN after this click, but the write "
+                       "above SUCCEEDED: do NOT click this again and do NOT redo the "
+                       "save/send. The open panel may be a FOLLOW-UP dialog the action "
+                       "opened (e.g. an email panel after a save) or may close on its "
+                       "own — re-read the page and continue from what it actually "
+                       "shows.")
+        elif closed is False:
+            suffix += (" — the dialog is STILL OPEN after this click. If this was a "
+                       "save/submit it likely did NOT go through: look for validation "
+                       "messages inside the dialog before doing anything else.")
+    return suffix
+
+
+async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> ActionResult:
+    """Delegate the click to the built-in unchanged, then append the network+dialog
+    outcome suffix. Plain clicks that fired no writes, probe failures, and error
+    results pass through untouched."""
+    node = None
+    index = getattr(params, "index", None)
+    if browser_session is not None and index:
+        try:
+            node = await browser_session.get_element_by_index(index)
+        except Exception:  # noqa: BLE001 - the built-in will report the real lookup error
+            node = None
+    pre = await _dialog_state(browser_session, node) if node is not None else None
+    t0 = time.monotonic()
+    res = await builtin_click(params=params, browser_session=browser_session)
+    if res is None or getattr(res, "error", None) \
+            or not getattr(res, "extracted_content", None):
+        return res
+    suffix = await _click_outcome_suffix(browser_session, t0, pre)
+    if not suffix:
+        return res
+    update: dict[str, Any] = {"extracted_content": res.extracted_content + suffix}
+    if getattr(res, "long_term_memory", None):
+        update["long_term_memory"] = res.long_term_memory + suffix
+    return res.model_copy(update=update)
+
+
 def build_tools() -> Tools:
     """Return a browser-use `Tools` registry with our custom actions added, `evaluate`
     removed (JS form-fills are unrecordable — see module docstring), and the built-in
     `input` overridden by the auto-Enter variant."""
     tools = Tools(exclude_actions=["evaluate"])
+
+    # Same-name override of `click` that DELEGATES to the built-in (same param model and
+    # description, so recorded history and the compiler's click branch are untouched) and
+    # adds the dialog-outcome receipt suffix. Captured BEFORE registering the wrapper —
+    # same-name registration replaces the entry, not the captured function. Note:
+    # browser-use re-registers `click` when set_coordinate_clicking flips (claude-* /
+    # gemini-3-pro model names); the configured agent models (gpt-4.1-mini, llama-4)
+    # never trigger that, but a model switch would silently drop this wrapper.
+    _builtin_click = tools.registry.registry.actions["click"]
+    _builtin_click_fn = _builtin_click.function
+
+    @tools.action(_builtin_click.description, param_model=_builtin_click.param_model)
+    async def click(params, browser_session=None) -> ActionResult:
+        return await _click_with_dialog_outcome(_builtin_click_fn, params, browser_session)
 
     # Same name/param model as the built-in: same-name registration OVERRIDES it (excluding
     # "input" would drop this replacement too), and the recorder still captures the
@@ -877,11 +1408,38 @@ def build_tools() -> Tools:
             logger.warning("⚠️ %s", msg)
             return ActionResult(extracted_content=msg)
         dropdown = _is_dropdown_filter(node)
+        if dropdown and (params.text or "").strip():
+            # Typing into a dropdown/combobox filter selects NOTHING: the text only
+            # narrows the menu and is discarded when the menu closes, and the widget's
+            # value lives outside the input, so the read-back below can never verify a
+            # pick (observed live: 'Assets transferred' typed, no option clicked, field
+            # reported as set, Save silently rejected). Refuse up front and name the
+            # action that picks AND verifies — the fill-shaped twin of find_by_text's
+            # <select> refusal. text="" (a pure clear) stays allowed for stuck filters.
+            msg = (f"REFUSED — did NOT type '{params.text}': element {params.index} is a "
+                   "dropdown/combobox filter, and typed filter text selects NOTHING (it "
+                   "is discarded when the menu closes). Call "
+                   f"select_dropdown(index={params.index}, text='{params.text}') instead "
+                   "— it opens the menu, clicks the matching option, and verifies the "
+                   "value took, all in one action.")
+            logger.info("⛔ %s", msg)
+            # error channel: multi_act stops the remaining queued actions on it — a
+            # refused fill must not let an already-queued Send/Save fire against the
+            # value that never landed (run 20260807_095537 seg7: the refused From-fill's
+            # queued Send went out with the wrong sender).
+            return ActionResult(error=msg, metadata={"no_fill": True})
         # Clear with real keystrokes ourselves when we can reach the element, and hand
         # browser-use clear=False so its JS `value = ""` (invisible to React — see the
         # stubborn-field notes above) never runs. `params.clear` is left untouched: the
         # compiler reads it to decide whether the replayed fill clears too.
         handle = await _field_handle(browser_session, node)
+        # Stale-index guard: a node an earlier action in THIS step re-rendered away still
+        # resolves over CDP, so the clear/type below would run against a detached element
+        # — keystrokes land in whatever holds focus and the read-back reads the dead node
+        # (the false "did NOT take" that drove the duplicate-add loop). Route to the live
+        # twin before any keystroke goes out.
+        if handle and params.text and await _field_connected(handle) is False:
+            return await _refind_fill(browser_session, node, params)
         kbd_cleared = bool(handle) and params.clear and await _keyboard_clear(handle)
         try:
             event = browser_session.event_bus.dispatch(TypeTextEvent(
@@ -910,7 +1468,20 @@ def build_tools() -> Tools:
                     repaired = True
                 else:
                     verified = await _field_value(handle)  # readback after the last repair
-            if not dropdown:
+            # Mid-step detach: the type/read-back ran against a node that has since LEFT
+            # the document — the read-back is self-consistent but the live form never saw
+            # the value (the false-CLEAN twin of the guard above). Land it on the live
+            # field, and never press Enter into a random focus target.
+            if handle and params.text and await _field_connected(handle) is False:
+                return await _refind_fill(browser_session, node, params)
+            # Date pickers keep the pre-08-05 sequence that always filled them cleanly
+            # (4523b58 parity, user-requested): clear → type → read-back → NO Enter; the
+            # date commits when focus moves on. With the calendar callout open, Enter is
+            # handled by the picker itself (it can commit the callout's highlighted date
+            # over the typed text) — and the read-back above runs BEFORE Enter, so such a
+            # clobber would wear a clean receipt.
+            date_picker = _is_date_picker(node)
+            if not dropdown and not date_picker:
                 enter = browser_session.event_bus.dispatch(SendKeysEvent(keys="Enter"))
                 await enter
                 await enter.event_result(raise_if_any=True, raise_if_none=False)
@@ -921,10 +1492,13 @@ def build_tools() -> Tools:
         meta.pop("actual_value", None)  # stale once we repaired; `verified` supersedes it
         # The compiler's signal to mirror the Enter as a replay `press` step; a structured
         # flag, not the receipt text, so rewording the message can't change replays.
-        meta["auto_enter"] = not dropdown
+        meta["auto_enter"] = not dropdown and not date_picker
         if dropdown:
             msg = (f"Typed '{params.text}' (dropdown filter — Enter suppressed; "
                    "click the option you want)")
+        elif date_picker:
+            msg = (f"Typed '{params.text}' (date picker — Enter suppressed; the date "
+                   "commits when you move to the next field. Do NOT open the calendar.)")
         else:
             msg = f"Typed '{params.text}' and pressed Enter"
         if verified is not None and not _value_took(params.text, verified):
@@ -1179,6 +1753,29 @@ def build_tools() -> Tools:
                 logger.info("🔎 %s", msg)
                 return ActionResult(extracted_content=msg, long_term_memory=msg,
                                     include_in_memory=True, metadata={"no_click": True})
+            # Last probe before claiming absence: the query may exist as STATIC text — a
+            # label/heading with no control shape ('Period to' in the shadow-DOM modal,
+            # run 20260805_123407_334719). The old receipt asserted "not in this page's
+            # DOM" for text visibly on screen, and the agent left to hunt other pages.
+            static = None
+            try:
+                static = await _eval_js(browser_session,
+                                        _RAW_TEXT_FIND_JS % json.dumps(tokens))
+            except Exception as exc:  # noqa: BLE001 - probe is best-effort
+                logger.debug("find_by_text static-text probe failed: %s", exc)
+            if isinstance(static, dict) and not static.get("error") and static.get("count"):
+                found = " ".join(str(static.get("name") or "").split())[:200]
+                msg = (f"find_by_text('{query}'): no clickable control matches, but the "
+                       f"text EXISTS on this page as STATIC text: '{found}'. It is a "
+                       "label/heading, not a control — the section IS on this page; do "
+                       "NOT navigate away or scroll-hunt for it. To operate the field "
+                       "NEXT TO this label, use the element indexes from the page state "
+                       "(for a dropdown, call select_dropdown on the combobox input's "
+                       "index). Nothing was clicked.")
+                logger.info("🔎 %s", msg)
+                # no_click: a probe that touched nothing — same compile rule as below.
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
             msg = (
                 f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
                 "The element is not in this page's DOM. FIRST check: is this the page you think "
@@ -1218,6 +1815,10 @@ def build_tools() -> Tools:
             # phantom "clicked" receipts on the country <select> convinced the agent its
             # already-applied selection kept failing). Refuse up front, naming the action
             # that actually works, and stamp no_click so nothing compiles from this.
+            # Click refusals ride the error channel: multi_act stops the remaining
+            # queued actions of the step, so nothing executes on top of a click that
+            # never happened (the content-channel refusal let a queued Send fire after
+            # a refused fill in run 20260807_095537 seg7 — same hazard here).
             if tag == "select":
                 msg = (f"find_by_text('{query}'): found the single match "
                        f"{_line(idx, node, label)} but did NOT click it — it is a native "
@@ -1225,15 +1826,13 @@ def build_tools() -> Tools:
                        f"to list its options, then select_dropdown(index={idx}, "
                        f"text='<option>') to pick one.")
                 logger.info("🔎 %s", msg)
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return ActionResult(error=msg, metadata={"no_click": True})
             if tag == "input" and str(attrs_map.get("type") or "").lower() == "file":
                 msg = (f"find_by_text('{query}'): found the single match "
                        f"{_line(idx, node, label)} but did NOT click it — it is a file "
                        f"input; use upload_file on index {idx} instead.")
                 logger.info("🔎 %s", msg)
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return ActionResult(error=msg, metadata={"no_click": True})
             # Self-match: when the single match is a text-entry field whose IDENTITY
             # (aria-label/title/placeholder/name/id) does not carry the query, the only
             # reason it matched is the text sitting IN it — almost always what the agent
@@ -1265,8 +1864,9 @@ def build_tools() -> Tools:
                            f"options it ACTUALLY shows. Only click(index={idx}) if this "
                            f"field itself is truly your target.")
                     logger.info("🔎 %s", msg)
-                    return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                        include_in_memory=True, metadata={"no_click": True})
+                    return ActionResult(error=msg, metadata={"no_click": True})
+            pre = await _dialog_state(browser_session, node)
+            t0 = time.monotonic()
             try:
                 event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
                 await event
@@ -1281,14 +1881,18 @@ def build_tools() -> Tools:
                        f"{_line(idx, node, label)} but the click was REFUSED: "
                        f"{res['validation_error']} Nothing was clicked.")
                 logger.info("🔎 %s", msg)
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return ActionResult(error=msg, metadata={"no_click": True})
             # Record WHAT we clicked so script_compile can turn this custom action into a real
             # click step (a custom action carries no index, so browser-use captures no
             # interacted_element for it). Same DOMInteractedElement shape a built-in click records.
             captured = _captured_element(node, label)
             meta = {"interacted_element": captured} if captured else None
-            msg = f"find_by_text('{query}'): clicked the single match {_line(idx, node, label)}"
+            # Same network+dialog receipts as the click override: a Save clicked through
+            # find_by_text fired its POST invisibly (run 20260807_095537 seg6) and the
+            # agent, seeing nothing, clicked Save again — a duplicate create.
+            suffix = await _click_outcome_suffix(browser_session, t0, pre)
+            msg = (f"find_by_text('{query}'): clicked the single match "
+                   f"{_line(idx, node, label)}" + suffix)
             logger.info("🔎 %s", msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg,
                                 include_in_memory=True, metadata=meta)

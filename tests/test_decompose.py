@@ -320,6 +320,22 @@ async def test_no_llm_no_cache_gives_whole_prompt_fallback(library):
     assert subs[0].template_prompt == "just do the thing"
     assert subs[0].marker is None
     assert subs[0].kind == "action"
+    assert subs[0].fallback is True
+
+
+async def test_fallback_blob_never_takes_loop_kind(library):
+    """A whole-task blob contains repeat+stop cues somewhere in its text (the pay-forecast
+    retry clause), which classified the ENTIRE mega-task as a loop — the loop framing then
+    told the agent it was mid-iteration and it hunted end-of-task controls from step 1
+    (runs 20260805_155515/160602: 'Download' on /admin) and once declared the whole task
+    done because the first repeat-until's stop condition held on a wandered-to page.
+    Fallback blobs keep only the judge verdict; loop collapses to neutral action."""
+    prompt = ("go to the section and add the record. keep repeating the check until the "
+              "rows are shown. then download the report and save")
+    subs = await decompose.get_decomposition(prompt, llm=None, marker=None)
+    assert len(subs) == 1
+    assert subs[0].fallback is True
+    assert subs[0].kind == "action"
 
 
 # ------------------------------- node kinds (action | judge) -------------------------------
@@ -358,12 +374,12 @@ def test_node_kind_heuristic():
                                tab_url="https://duckduckgo.com") == "judge"
 
 
-# The two RTI employee loops, mirroring the live tasks.yaml wording (refreshed
-# 2026-07-30): imperative actions with the verification folded inside. Judge framing
-# made the agent declare them done after ONE Save & Next (the observed wrong-employee
-# bug) — they must classify "loop". The second pass's "check that" clause is
-# load-bearing: the 07-29 reword dropped it and the pass silently became a cacheable
-# fixed-click action.
+# The two RTI employee loops in the ORIGINAL wording (now carried by
+# payroll_rti_process_old / payroll_food_limited_e2e_rti): imperative actions with the
+# verification folded inside. Judge framing made the agent declare them done after ONE
+# Save & Next (the observed wrong-employee bug) — they must classify "loop". Their
+# "check that" clause used to be load-bearing: the 07-29 reword dropped it and the pass
+# silently became a cacheable fixed-click action.
 LOOP_OWEN = ("Process the existing employees one at a time by clicking Save & Next, and "
              "after each click check that the next employee has loaded, if the Save & "
              "Next button is disabled, Move on to the next employee. stopping as soon as "
@@ -372,6 +388,28 @@ LOOP_DAVID = ("Continue clicking Save & Next one employee at a time in the same 
               "after each click check that the next employee has loaded, if the Save and "
               "next is disabled move on to the next employee, until {{employee}} is the "
               "employee shown")
+
+# The same two loops in the 2026-08-05 imperative rewrite (live payroll_rti_process
+# wording, verbatim templates): NO judge vocabulary anywhere. The judge-first gate
+# demoted them to cacheable actions, and the frozen Save & Next replay saved the
+# stop-target employee — they must classify "loop" on repetition + stop cues alone.
+LOOP_ALAN = (
+    "Now process the existing employees one at a time by repeating the following steps "
+    "for each employee: first read the name of the employee currently shown; if the "
+    "employee shown is {{employee}}, stop repeating and do not click Save & Next again; "
+    "otherwise, if the error '{{error_message}}' is shown, click Add Payment, set Amount "
+    "to {{amount}}, and click Save & Next; if Save & Next is disabled for this employee, "
+    "do not click it and instead select the next employee in the list directly; in all "
+    "other cases click Save & Next and wait until the next employee has fully loaded "
+    "before doing anything else. Keep repeating those steps until {{employee}} is the "
+    "employee shown")
+LOOP_BRUCE = (
+    "After saving, continue processing employees one at a time by repeating exactly the "
+    "same steps as before: read the name of the employee currently shown; if the "
+    "employee shown is {{employee}}, stop repeating and do not click Save & Next again; "
+    "otherwise handle the minimum wage error and a disabled Save & Next the same way as "
+    "before, and in all other cases click Save & Next and wait for the next employee to "
+    "load. Keep repeating until {{employee}} is the employee shown")
 
 
 def test_node_kind_loop_detection():
@@ -384,13 +422,28 @@ def test_node_kind_loop_detection():
         None) == "judge"
     assert decompose.node_kind("verify that each filter narrows the results",
                                None) == "judge"
-    # Cue-free verification stays judge; judge-free iteration stays action.
+    # Cue-free verification stays judge; cue-free iteration stays action.
     assert decompose.node_kind("verify the CC field matches", None) == "judge"
     assert decompose.node_kind(
         "Then go to Payroll & RTI, using the period dropdown in the top bar, change the "
         "period to the next month, and click Save & Next 3 times", None) == "action"
+    # Judge-free loops: repetition cue + stop cue is a loop signature with NO judge
+    # phrase (the 2026-08-05 rewrite; a frozen replay of it saved the stop-target
+    # employee when this classified action).
+    assert decompose.node_kind(LOOP_ALAN, None) == "loop"
+    assert decompose.node_kind(LOOP_BRUCE, None) == "loop"
+    # Either cue alone is everyday action filler, not a loop: a fixed click count with
+    # "after each click ... stopping", and a bare "wait until X loads".
+    assert decompose.node_kind(
+        "change the date to the next month ({{date}}), and click Save & Next exactly "
+        "{{times}} times, waiting for the screen to update after each click and "
+        "stopping after the third click", None) == "action"
+    assert decompose.node_kind(
+        "click Save & Next and wait until the next employee has fully loaded",
+        None) == "action"
     # Marker precedence is unchanged: machine ground truth caches safely.
     assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
+    assert decompose.node_kind(LOOP_ALAN, "Payroll") == "action"
     # Explicit declarations still win in both directions.
     assert decompose.node_kind("go to the reviews section", None,
                                declared="loop") == "loop"

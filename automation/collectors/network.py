@@ -206,6 +206,34 @@ class NetworkCollector(Collector):
         except Exception as exc:  # noqa: BLE001
             logger.exception("requestfailed handler error: %s", exc)
 
+    # ---------------- live queries ----------------
+
+    # Write methods the live-receipt probe reports (DELETE included: a destructive click
+    # deserves a receipt too; the body-capture set above stays creates-only).
+    _RECEIPT_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def writes_since(self, t0: float) -> list[dict[str, Any]]:
+        """Fetch/xhr WRITE requests that STARTED at/after monotonic `t0`, oldest first,
+        as {"record", "started", "settled"}. `record` is the LIVE aggregation dict —
+        status/body may land after this call, so callers re-poll rather than copy. This
+        is the click receipt's ground truth: the server's own answer to "did my save
+        actually happen", available mid-run instead of only in network.json afterwards."""
+        out: list[dict[str, Any]] = []
+        for request, started in list(self._started_at.items()):
+            if started < t0 or request in self._skipped:
+                continue
+            record = self._records.get(request)
+            if record is None:
+                continue
+            if record.get("method") not in self._RECEIPT_WRITE_METHODS:
+                continue
+            if record.get("resourceType") not in ("fetch", "xhr"):
+                continue
+            settled = record.get("duration_ms") is not None or bool(record.get("failed"))
+            out.append({"record": record, "started": started, "settled": settled})
+        out.sort(key=lambda w: w["started"])
+        return out
+
     # ---------------- results ----------------
 
     def results(self) -> dict[str, Any]:

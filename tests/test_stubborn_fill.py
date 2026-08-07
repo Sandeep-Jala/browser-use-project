@@ -107,8 +107,13 @@ class _FakeCdp:
         return {"object": {"objectId": "obj-1"}} if self.resolvable else {"object": {}}
 
     async def _call(self, params, session_id=None):
-        if "focus()" in params["functionDeclaration"]:
+        decl = params["functionDeclaration"]
+        if "focus()" in decl:
             return {"result": {"value": True}}
+        if "isConnected" in decl:
+            # Stale-node probe: live fields answer True; tests model a re-rendered
+            # (detached) node by setting field.connected = False.
+            return {"result": {"value": getattr(self.field, "connected", True)}}
         return {"result": {"value": self.field.value}}
 
     async def _key(self, params, session_id=None):
@@ -259,11 +264,14 @@ async def test_search_box_that_empties_on_submit_is_not_called_a_failure():
 
 
 async def test_dropdown_filter_still_suppresses_enter():
+    # Typed filter text is now REFUSED outright (test_auto_enter_input's refusal tests
+    # own that contract) — refusal keeps Enter out of the combobox, the invariant this
+    # test has always pinned.
     session = _FakeSession(_FakeField(""), node_attrs={"role": "combobox"})
     res = await _type(session, text="Bailey Stevenson")
 
     assert session.enters == 0
-    assert "Enter suppressed" in res.extracted_content
+    assert "REFUSED" in res.error
 
 
 # --------------------------------- replay tests ---------------------------------

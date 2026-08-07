@@ -523,6 +523,83 @@ async def test_progress_json_survives_mid_run_crash(stores, monkeypatch):
     assert progress["is_successful"] is None
 
 
+async def test_ctrl_c_flushes_interrupted_progress(stores, monkeypatch):
+    """A second Ctrl+C aborts via KeyboardInterrupt — four killed runs on 2026-08-05 left
+    progress.json stuck at "running" with the in-flight segment unrecorded (video-only
+    forensics). The abort path now stubs the in-flight segment, writes
+    status="interrupted" (which also flushes collectors), and re-raises."""
+
+    class _Interrupter(FakeSession):
+        async def agent_segment(self, sub, *args, **kwargs):
+            if self.agent_calls >= 1:
+                raise KeyboardInterrupt
+            return await super().agent_segment(sub, *args, **kwargs)
+
+    fake = _Interrupter(_runner(), agents=[_seg(True, mode="authored")],
+                        run_dir=stores / "artifacts")
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    with pytest.raises(KeyboardInterrupt):
+        await _run(fake)
+
+    progress = json.loads((stores / "artifacts" / "progress.json").read_text())
+    assert progress["status"] == "interrupted"
+    assert progress["is_successful"] is False
+    assert len(progress["segments"]) == 2        # completed segment 0 + the stub
+    stub = progress["segments"][1]
+    assert stub["ok"] is False
+    assert "interrupted" in (stub["error"] or "")
+
+
+def test_interrupted_segment_saves_partial_history(tmp_path):
+    """The runner leg of the Ctrl+C flush: the in-flight agent's history lands next to
+    the recording path under a distinct .interrupted.json suffix (the promotion path
+    must never adopt it), best-effort — a failing save returns None, never raises."""
+    from automation.pipeline import runner as runner_mod
+
+    class _FakeAgent:
+        def save_history(self, path):
+            Path(path).write_text(json.dumps({"history": []}))
+
+    record = tmp_path / "sid.recording.new.json"
+    saved = runner_mod._save_interrupted_history(_FakeAgent(), record)
+    assert saved is not None and saved.exists()
+    assert saved.name.endswith(".interrupted.json")
+    assert not record.exists()                    # never the promotable temp name
+
+    class _Boom:
+        def save_history(self, path):
+            raise RuntimeError("no history yet")
+
+    assert runner_mod._save_interrupted_history(_Boom(), record) is None
+    assert runner_mod._save_interrupted_history(_FakeAgent(), None) is None
+
+
+# --------------------------- fallback-blob degradation ---------------------------
+# Runs 20260805_155515/160602/161958: a whole-prompt fallback blob took the download
+# gate (its wording contains "download" mid-task) and the loop kind, so the agent hunted
+# a Download control from step 1 and once declared the mega-task done on the first
+# repeat-until's stop condition. Fallback blobs degrade to the steps gate with a
+# whole-task step budget instead.
+
+
+def test_fallback_blob_gets_steps_gate():
+    sub = Subtask(index=0, fallback=True,
+                  template_prompt="do the flow then download the export and save")
+    assert segment_gate(sub, None, "/x").kind == "steps"
+    # The same wording WITHOUT the fallback flag keeps the authoritative download gate.
+    normal = Subtask(index=0,
+                     template_prompt="do the flow then download the export and save")
+    assert segment_gate(normal, None, "/x").kind == "download"
+
+
+def test_fallback_blob_gets_whole_task_step_budget():
+    sub = Subtask(index=0, fallback=True, template_prompt="do everything")
+    gate = segment_gate(sub, None, "/x")
+    budget = hybrid.segment_step_budget(gate, 25, sub.kind, fallback=True)
+    assert budget == 25 + hybrid._FALLBACK_EXTRA_STEPS
+    assert hybrid.segment_step_budget(gate, 25, "action") == 25   # non-fallback unchanged
+
+
 # ------------------------------- aux-tab subtasks -------------------------------
 
 

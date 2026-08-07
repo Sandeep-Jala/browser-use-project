@@ -1,13 +1,19 @@
 """Declarative task registry, loaded from tasks.yaml at the repo root.
 
-Adding a task is ONE entry in tasks.yaml — no Python change. Per entry: `prompt` (required,
-written like a user would type it, WITHOUT login steps — the framework logs in itself);
-`marker`, the network ground-truth URL fragment (a successful POST/PUT/PATCH to a URL
-containing it proves the record saved) — OMITTED for tasks with no known create-write
-(verification / read-only flows), which then run with the gate disabled instead of being
-force-failed; `tags` as free grouping metadata; `assertions` for per-task assertion
-overrides (see pipeline/assertions.py); and `subtasks` as a rarely-needed escape hatch when
-the LLM decomposer keeps splitting a specific task wrongly.
+Adding a task is ONE entry in tasks.yaml — no Python change. Per entry: `prompt` (written
+like a user would type it, WITHOUT login steps — the framework logs in itself); `marker`,
+the network ground-truth URL fragment (a successful POST/PUT/PATCH to a URL containing it
+proves the record saved) — OMITTED for tasks with no known create-write (verification /
+read-only flows), which then run with the gate disabled instead of being force-failed;
+`tags` as free grouping metadata; `assertions` for per-task assertion overrides (see
+pipeline/assertions.py); and `subtasks` as an escape hatch when the LLM decomposer keeps
+splitting a specific task wrongly.
+
+A task that declares `subtasks:` may OMIT `prompt:` entirely — the prompt is then DERIVED
+by joining the instantiated slices, making the subtask blocks the single edit surface (no
+prompt/slice lockstep to maintain). Keeping both is allowed only while they agree
+verbatim; a mismatch fails the load loudly, because silent drift between the two texts
+would fork the task's identity.
 
 CRITICAL: prompts are identity. subtask_store.task_id hashes the prompt to key the task's
 cached subtask decomposition, so editing a prompt's text (whitespace is normalized, words are
@@ -17,6 +23,7 @@ tests/test_tasks.py pins every prompt's task id for exactly this reason.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,11 +73,21 @@ class TaskSpec:
 TASKS_FILE = Path("tasks.yaml")
 
 
+_DECL_TOKEN = re.compile(r"\{\{(\w+)\}\}")
+
+
+def _instantiated(decl: SubtaskDecl) -> str:
+    """The slice's concrete text: {{tokens}} replaced from its values (unknown tokens are
+    left verbatim — _validate rejects them later with the closure error)."""
+    values = decl.values or {}
+    return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), decl.prompt)
+
+
 def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
     """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
     registry must be caught at load, not as a silent no-marker/no-prompt run."""
-    if not isinstance(entry, dict) or not str(entry.get("prompt") or "").strip():
-        raise ValueError(f"tasks.yaml entry {key!r} must be a mapping with a non-empty 'prompt'")
+    if not isinstance(entry, dict):
+        raise ValueError(f"tasks.yaml entry {key!r} must be a mapping")
     subtasks = None
     if entry.get("subtasks"):
         subtasks = tuple(
@@ -84,11 +101,31 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
                 raise ValueError(
                     f"tasks.yaml entry {key!r} subtask {i}: tab_url must be an absolute "
                     f"http(s) URL, got {s.tab_url!r}")
+    # Collapse the YAML block-scalar line wrapping. task_id normalizes whitespace the
+    # same way, so re-wrapping a prompt in the file can never change its identity.
+    prompt = " ".join(str(entry.get("prompt") or "").split())
+    if subtasks:
+        # Declared slices are the single source of truth: the whole-task prompt is their
+        # join, so rewording a slice IS rewording the prompt (same identity semantics).
+        derived = " ".join(" ".join(_instantiated(s).split()) for s in subtasks)
+        if prompt and prompt != derived:
+            diverge = next((i for i, (a, b) in enumerate(
+                zip(prompt.split(), derived.split())) if a != b),
+                min(len(prompt.split()), len(derived.split())))
+            context_p = " ".join(prompt.split()[max(0, diverge - 3):diverge + 5])
+            context_d = " ".join(derived.split()[max(0, diverge - 3):diverge + 5])
+            raise ValueError(
+                f"tasks.yaml entry {key!r}: prompt and subtasks disagree around word "
+                f"{diverge}: prompt says '…{context_p}…' but the slices join to "
+                f"'…{context_d}…'. Drop the 'prompt:' key (it is derived from the "
+                f"slices) or fix the diverging slice.")
+        prompt = derived
+    if not prompt:
+        raise ValueError(
+            f"tasks.yaml entry {key!r} must have a non-empty 'prompt' or 'subtasks'")
     return TaskSpec(
         key=key,
-        # Collapse the YAML block-scalar line wrapping. task_id normalizes whitespace the
-        # same way, so re-wrapping a prompt in the file can never change its identity.
-        prompt=" ".join(str(entry["prompt"]).split()),
+        prompt=prompt,
         marker=entry.get("marker") or None,
         assertions=entry.get("assertions"),
         tags=tuple(str(t) for t in (entry.get("tags") or ())),

@@ -72,6 +72,22 @@ _LOOP_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Loop signature that needs NO judge phrase. The judge-first gate in node_kind misses
+# imperative rewrites ("keep repeating ... until X is shown") that carry no verification
+# vocabulary — observed 2026-08-05: the RTI employee loop reworded without "check that"
+# classified action, was committed to the library, and its frozen Save & Next replay
+# saved the stop-target employee. BOTH cues are required: "each"/"until"/"stopping"
+# alone are everyday action filler ("after each click", "wait until the page loads",
+# "stopping after the third click").
+_LOOP_REPEAT_RE = re.compile(
+    r"\b(?:at a time|repeat(?:ing|ed|s)?|for each|(?:keep|continue)\s+\w+ing)\b",
+    re.IGNORECASE,
+)
+_LOOP_STOP_RE = re.compile(
+    r"\b(?:until|as soon as|stop(?:ping|s)?)\b",
+    re.IGNORECASE,
+)
+
 # A judge phrase that IS the subtask's head directive ("Verify that each filter...", "Then
 # check that entries do not repeat...") keeps the node a judge even when iteration cues
 # appear in WHAT it checks — only a leading imperative action with verification folded
@@ -99,20 +115,28 @@ def node_kind(template_prompt: str, marker: str | None,
     is shown"): that is a loop node. A loop must ACT (observation framing made the agent
     declare the loop done after one iteration), yet can never be cached: the iteration
     count is live page state, so a replayed loop would walk a fixed number of steps and
-    land anywhere. A false positive here only costs caching (the segment authors every
-    run); a false negative would cost correctness (hollow replay), so the wording net is
-    cast deliberately wide.
+    land anywhere. Loop wording needs no judge phrase, though: an imperative rewrite
+    ("keep repeating ... until X is shown") carries none, and routing it through the
+    judge gate demoted it to a cacheable action whose frozen Save & Next replay saved
+    the stop-target employee (2026-08-05) — so a repetition cue PLUS a stop cue is a
+    loop signature on its own. A false positive here only costs caching (the segment
+    authors every run); a false negative costs correctness (hollow replay / frozen
+    iteration count), so the wording net is cast deliberately wide.
     """
     if declared in ("action", "judge", "loop"):
         return declared
     if marker or tab_url:
         return "action"
-    if not _JUDGE_RE.search(template_prompt):
-        return "action"
-    if _LOOP_CUE_RE.search(template_prompt) \
+    if _JUDGE_RE.search(template_prompt):
+        if _LOOP_CUE_RE.search(template_prompt) \
+                and not _LEADING_JUDGE_RE.match(template_prompt):
+            return "loop"
+        return "judge"
+    if _LOOP_REPEAT_RE.search(template_prompt) \
+            and _LOOP_STOP_RE.search(template_prompt) \
             and not _LEADING_JUDGE_RE.match(template_prompt):
         return "loop"
-    return "judge"
+    return "action"
 
 
 # Wording that CONSUMES data noted by an EARLIER subtask ("using the noted generated name
@@ -207,6 +231,11 @@ class Subtask:
     # cached) | "loop" (repeat-until: action framing, always LLM, never cached — see
     # node_kind). Assigned by _build_subtasks after markers are settled.
     kind: str = "action"
+    # True only for the whole-prompt fallback blob: the entire task as one subtask.
+    # Downstream it degrades gating/framing to neutral (steps gate, no download block,
+    # whole-task step budget) — specialized framings are calibrated for FRAGMENTS and
+    # derailed the blob runs (see whole_prompt_fallback).
+    fallback: bool = False
 
     @property
     def instantiated_prompt(self) -> str:
@@ -373,13 +402,20 @@ def coverage_gap(raw: list[dict[str, Any]], prompt: str) -> str | None:
 
 
 def whole_prompt_fallback(prompt: str, marker: str | None) -> list[Subtask]:
-    """A single subtask covering the entire prompt — hybrid degenerates safely to today's
-    whole-task behavior when decomposition is unavailable or invalid. The kind heuristic
-    still applies: a markerless verification task falls back to ONE judge node, so it is
-    never hollow-replayed even in degenerate form."""
+    """A single subtask covering the entire prompt — hybrid degenerates safely to
+    whole-task behavior when decomposition is unavailable or invalid.
+
+    The judge verdict is kept (a markerless verification task falls back to ONE judge
+    node, never hollow-replayed), but "loop" collapses to "action": repeat+stop cues
+    ANYWHERE in a mega-task's text classified the whole blob a loop, and the loop
+    framing — "you are mid-iteration; done when the stop condition holds" — made the
+    agent skip the task's opening and once declare the entire task complete because the
+    FIRST embedded repeat-until's stop condition held on a page it wandered onto
+    (runs 20260805_155515/161958). A blob is a whole procedure, not an iteration."""
     template = " ".join(prompt.split())
+    k = node_kind(template, marker)
     return [Subtask(index=0, template_prompt=template, marker=marker,
-                    kind=node_kind(template, marker))]
+                    kind=k if k == "judge" else "action", fallback=True)]
 
 
 # ------------------------------- derived matching (tier 3) -------------------------------

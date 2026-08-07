@@ -181,6 +181,9 @@ class _FakeBrowserSession:
         return SimpleNamespace(dom_state=SimpleNamespace(selector_map=self._nodes),
                                url="https://duckduckgo.com")
 
+    async def get_element_by_index(self, index):
+        return self._nodes.get(index)
+
 
 async def test_extract_data_captures_value_and_replayable_element_metadata():
     fn, pm = _registered_action("extract_data")
@@ -380,9 +383,10 @@ async def test_find_by_text_refuses_to_click_native_select():
     res = await fn(params=pm(text="united kingdom", click_first=True),
                    browser_session=_FakeBrowserSession({9: _FakeSelectDomNode()}))
 
-    assert res.error is None
-    assert "did NOT click" in res.extracted_content
-    assert "select_dropdown(index=9" in res.extracted_content
+    # error channel: multi_act stops the step's remaining queued actions on it, so
+    # nothing executes on top of a click that never happened.
+    assert "did NOT click" in res.error
+    assert "select_dropdown(index=9" in res.error
     assert res.metadata == {"no_click": True}    # compiles to NOTHING, never a phantom click
 
 
@@ -394,9 +398,8 @@ async def test_find_by_text_refuses_to_click_file_input():
     res = await fn(params=pm(text="csv upload", click_first=True),
                    browser_session=_FakeBrowserSession({4: node}))
 
-    assert res.error is None
-    assert "did NOT click" in res.extracted_content
-    assert "upload_file" in res.extracted_content
+    assert "did NOT click" in res.error
+    assert "upload_file" in res.error
     assert res.metadata == {"no_click": True}
 
 
@@ -412,9 +415,8 @@ async def test_find_by_text_reports_refused_click_instead_of_lying(monkeypatch):
     res = await fn(params=pm(text="continue", click_first=True),
                    browser_session=_FakeClickSession({4: node}, result=refusal))
 
-    assert res.error is None
-    assert "REFUSED" in res.extracted_content
-    assert "Nothing was clicked" in res.extracted_content
+    assert "REFUSED" in res.error
+    assert "Nothing was clicked" in res.error
     assert res.metadata == {"no_click": True}
 
 
@@ -434,8 +436,7 @@ async def test_find_by_text_refuses_self_match_click_on_text_input():
     res = await fn(params=pm(text="Calum Findlay", click_first=True),
                    browser_session=_FakeBrowserSession({18958: node}))
 
-    assert res.error is None
-    assert "did NOT click" in res.extracted_content
+    assert "did NOT click" in res.error
     assert res.metadata == {"no_click": True}    # compiles to NOTHING, never a phantom click
 
 
@@ -454,6 +455,256 @@ async def test_find_by_text_still_clicks_input_matched_by_placeholder(monkeypatc
     assert res.error is None
     assert "clicked the single match" in res.extracted_content
     assert res.metadata and "interacted_element" in res.metadata
+
+
+# ------------------------- dialog-outcome click receipts -------------------------
+# The live failure these guard (run 20260805_131827_339055, the duplicate-add loop): Save
+# silently closes the modal and appends a row; with no receipt saying so, the agent
+# re-opened the dialog and re-added the same benefit ten times. Clicks on elements inside
+# a dialog now report whether the dialog closed — the missing did-it-actually-save signal.
+
+
+def _dialog_states(monkeypatch, pre, post):
+    """Feed _click_with_dialog_outcome its pre/post probes in order."""
+    seq = [pre, post]
+
+    async def fake_state(_session, node=None):
+        return seq.pop(0) if seq else None
+
+    monkeypatch.setattr(agent_tools, "_dialog_state", fake_state)
+    monkeypatch.setattr(agent_tools, "_DIALOG_SETTLE_S", 0)
+
+
+async def _fake_builtin_click(params=None, browser_session=None):
+    from browser_use.agent.views import ActionResult
+
+    return ActionResult(extracted_content='Clicked button "Save"')
+
+
+async def test_click_inside_dialog_reports_dialog_closed(monkeypatch):
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert 'Clicked button "Save"' in res.extracted_content
+    assert "dialog CLOSED" in res.extracted_content
+    # Without an accepted write the close alone is NOT proof of acceptance.
+    assert "VERIFY the record" in res.extracted_content
+
+
+async def test_click_inside_dialog_reports_still_open(monkeypatch):
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": True, "open": 1})
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert "STILL OPEN" in res.extracted_content
+    assert "validation" in res.extracted_content
+
+
+async def test_click_outside_dialog_keeps_receipt_unchanged(monkeypatch):
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert res.extracted_content == 'Clicked button "Save"'
+
+
+async def test_click_error_result_gets_no_dialog_suffix(monkeypatch):
+    from types import SimpleNamespace
+
+    from browser_use.agent.views import ActionResult
+
+    async def failing_builtin(params=None, browser_session=None):
+        return ActionResult(error="element vanished")
+
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": False, "open": 0})
+    res = await agent_tools._click_with_dialog_outcome(
+        failing_builtin, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert res.error == "element vanished"
+    assert not res.extracted_content
+
+
+def test_click_action_is_overridden_with_dialog_outcome_wrapper():
+    from automation.pipeline.agent_tools import build_tools
+
+    action = build_tools().registry.registry.actions["click"]
+    assert action.function.__module__ == "automation.pipeline.agent_tools"
+
+
+def _stamped_dialog(monkeypatch, probe):
+    """Pre-probe says the clicked node's dialog was STAMPED (pre count 1); the post poll
+    then asks the stamped probe for {'present': that dialog still up, 'open': count}."""
+    async def fake_pre(_session, node=None):
+        return {"in_dialog": True, "open": 1, "stamped": True}
+
+    async def fake_open(_session):
+        return dict(probe)
+
+    monkeypatch.setattr(agent_tools, "_dialog_state", fake_pre)
+    monkeypatch.setattr(agent_tools, "_stamped_dialog_open", fake_open)
+    monkeypatch.setattr(agent_tools, "_DIALOG_SETTLE_S", 0)
+    monkeypatch.setattr(agent_tools, "_DIALOG_WRITE_SETTLE_S", 0)
+
+
+class _AcceptedNet:
+    def writes_since(self, t0):
+        record = {"url": "https://api.app/DataRequest?yearId=27", "method": "POST",
+                  "status": 200, "failed": False, "body": '{"success": true}',
+                  "response_headers": {"content-type": "application/json"}}
+        return [{"record": record, "started": 0.0, "settled": True}]
+
+
+async def test_chained_panel_with_accepted_write_says_do_not_redo(monkeypatch):
+    """The seg6 chain (run 20260807_095537): Save closed its dialog and the NEXT panel
+    opened, so the count never dropped — by DOM shape alone indistinguishable from a
+    re-render that ate the stamp (run 20260807_123259). The accepted write carries the
+    truth: succeeded, do NOT redo, the open panel may be the follow-up."""
+    from types import SimpleNamespace
+
+    _stamped_dialog(monkeypatch, {"present": False, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _AcceptedNet())
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    msg = res.extracted_content
+    assert "SUCCEEDED" in msg and "do NOT redo" in msg and "FOLLOW-UP" in msg
+    assert "dialog CLOSED" not in msg
+
+
+async def test_rerendered_stamp_loss_is_not_reported_closed(monkeypatch):
+    """Run 20260807_123259: loan-toggle clicks re-rendered the panel, the stamp died
+    with the replaced node, and 'stamp gone' was read as 'closed' — three false
+    ACCEPTED receipts in a row and an unsaved employee sailed through. Stamp gone
+    with the count unchanged must NOT claim closure."""
+    from types import SimpleNamespace
+
+    _stamped_dialog(monkeypatch, {"present": False, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert "dialog CLOSED" not in res.extracted_content
+    assert "STILL OPEN" in res.extracted_content
+
+
+async def test_closed_without_write_demands_verification(monkeypatch):
+    """Run 20260807_123259's Save: the panel truly closed but NO create POST fired —
+    the old unconditional 'form was ACCEPTED' advisory waved the unsaved employee
+    through. A close without an accepted write now demands the agent verify the
+    record exists before calling the step done."""
+    from types import SimpleNamespace
+
+    _stamped_dialog(monkeypatch, {"present": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    msg = res.extracted_content
+    assert "dialog CLOSED" in msg
+    assert "VERIFY the record" in msg
+    assert "ACCEPTED" not in msg
+
+
+async def test_closed_with_accepted_write_confirms_done(monkeypatch):
+    from types import SimpleNamespace
+
+    _stamped_dialog(monkeypatch, {"present": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _AcceptedNet())
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    msg = res.extracted_content
+    assert "dialog CLOSED" in msg and "ACCEPTED" in msg and "DONE" in msg
+    assert "VERIFY the record" not in msg
+
+
+async def test_stamped_still_open_without_write_keeps_the_warning(monkeypatch):
+    from types import SimpleNamespace
+
+    _stamped_dialog(monkeypatch, {"present": True, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert "STILL OPEN" in res.extracted_content
+    assert "validation" in res.extracted_content
+
+
+async def test_find_by_text_click_carries_outcome_receipts(monkeypatch):
+    """A Save clicked via find_by_text used to fire its POST with NO receipt (run
+    20260807_095537 seg6: the unreceipted DataRequest create was re-clicked into a
+    duplicate). The click branch now appends the same network+dialog suffix as the
+    click override."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    _stamped_dialog(monkeypatch, {"present": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _AcceptedNet())
+    fn, pm = _registered_action("find_by_text")
+    node = _FakeDomNode("Save", attributes={"id": "btn-save-1"})
+    node.node_name = "BUTTON"
+    node.tag_name = "button"
+    res = await fn(params=pm(text="save", click_first=True),
+                   browser_session=_FakeClickSession({4: node}, result=None))
+
+    msg = res.extracted_content
+    assert "clicked the single match" in msg
+    assert "this click fired POST" in msg and "DataRequest" in msg and "200" in msg
+    assert "dialog CLOSED" in msg
+
+
+async def test_find_by_text_miss_reports_static_text_instead_of_not_in_dom(monkeypatch):
+    """A label that exists as STATIC text (the shadow-DOM modal's 'Period to', run
+    20260805_123407_334719) used to get 'the element is not in this page's DOM' — a lie
+    that sent the agent hunting other pages and guessing combobox indexes. The miss
+    branch now probes the static-text finder and reports what actually exists."""
+    async def raw(_session, expr):
+        if "DOCLICK" in expr:                      # control finder: nothing control-shaped
+            return {"count": 0}
+        return {"count": 1, "name": "Period to",   # static-text finder: the label
+                "element": {"tag": "div", "attrs": {}, "xpath": ""}}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Period to"),
+                   browser_session=_FakeBrowserSession({}))
+
+    msg = res.extracted_content
+    assert "not in this page's DOM" not in msg
+    assert "STATIC text" in msg
+    assert "Period to" in msg
+    assert (res.metadata or {}).get("no_click") is True   # a probe — compiles to NOTHING
+
+
+async def test_find_by_text_true_miss_still_says_not_in_dom(monkeypatch):
+    async def raw(_session, _expr):
+        return {"count": 0}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Ghost Section"),
+                   browser_session=_FakeBrowserSession({}))
+
+    assert "not in this page's DOM" in res.extracted_content
+    assert (res.metadata or {}).get("no_click") is True
 
 
 # ------------------------- select_dropdown read-back override -------------------------
@@ -788,3 +1039,49 @@ async def test_combobox_select_non_combobox_element_says_so(monkeypatch):
     res = await _cb_action()(monkeypatch)
     assert res.error is not None
     assert "no combobox input" in res.error
+
+
+async def _instant_sleep(_seconds):
+    return None
+
+
+async def test_combobox_select_zero_options_recovers_via_escape_reopen(monkeypatch):
+    # Run 20260807_110530: after a full page reload the employee combobox showed
+    # 'No options' for every retyped query. The zero-options branch now runs one
+    # Escape (clear stuck filter) + reopen cycle and looks at the UNFILTERED list.
+    polls = [[], [], [{"id": "o7", "text": "Daniel Bruce"}]]
+
+    async def poll(_s, _id, timeout):
+        return polls.pop(0) if polls else [{"id": "o7", "text": "Daniel Bruce"}]
+    monkeypatch.setattr(agent_tools, "_cb_poll_options", poll)
+    _scripted_combobox(
+        monkeypatch, {"input_id": "react-select-4-input"},
+        {"open": {"ok": True},
+         "pick": {"clicked": True, "tag": "div",
+                  "attrs": {"id": "o7", "role": "option"}},
+         "state": {"menu_open": False, "display": "Daniel Bruce"}})
+    res = await _cb_action()(monkeypatch, text="Daniel Bruce")
+    assert res.error is None
+    assert "Selected 'Daniel Bruce'" in res.extracted_content
+
+
+async def test_combobox_select_dead_source_receipt_prescribes_reload_and_wait(monkeypatch):
+    # When the option list never renders even after both recovery cycles, the receipt
+    # must defer to the task's own recovery (refresh-and-retry wording) or a reload—
+    # NOT steer away from reloading (run 20260807_120553: an anti-reload receipt made
+    # the agent wander to the frequency dropdown and then type into the unloaded
+    # template grid instead of following the task's refresh loop).
+    async def poll(_s, _id, timeout):
+        return []
+    monkeypatch.setattr(agent_tools, "_cb_poll_options", poll)
+    monkeypatch.setattr(agent_tools.asyncio, "sleep", _instant_sleep)
+    _scripted_combobox(monkeypatch, {"input_id": "react-select-4-input"},
+                       {"open": {"ok": True}})
+    res = await _cb_action()(monkeypatch, text="Daniel Bruce")
+    assert res.error is not None
+    assert "NEVER rendered" in res.error
+    assert "did not load on this page view" in res.error
+    assert "the task prescribes" in res.error
+    assert "WAIT for the page to finish loading" in res.error
+    assert "WITHOUT a full browser reload" not in res.error
+    assert "wait a moment" not in res.error
