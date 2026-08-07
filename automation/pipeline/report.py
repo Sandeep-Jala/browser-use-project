@@ -353,6 +353,9 @@ def _render_subtasks(subtasks: list[dict[str, Any]] | None) -> str:
                    else c.get("error") or c.get("evidence") or "not satisfied")
             line = f"{mark} {c.get('kind')} \"{c.get('arg')}\" — {why}"
             p.append(f"<div class='obs-reason'><code>{_esc(line[:300])}</code></div>")
+        for reason in gate.get("rollup") or []:
+            p.append(f"<div class='obs-reason'><code>{_esc(('✗ ' + str(reason))[:300])}"
+                     "</code></div>")
         if s.get("error"):
             p.append(f"<div class='obs-reason'><code>{_esc(str(s['error'])[:300])}</code></div>")
         p.append("</div>")

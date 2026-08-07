@@ -296,3 +296,90 @@ async def test_results_preserve_order_and_shape():
     assert [r["kind"] for r in results] == ["url_contains", "control_exists"]
     for r in results:
         assert set(r) == {"kind", "arg", "ok", "evidence", "error"}
+
+
+# ------------------------------- receipt roll-up -------------------------------
+# Two conservative rules only: a trailing error-channel refusal, and a final fired-but-
+# not-accepted write with nothing accepted anywhere in the segment's window.
+
+
+class _R:
+    """ActionResult-shaped: is_done / error / metadata are all the roll-up reads."""
+
+    def __init__(self, is_done=False, error=None, metadata=None):
+        self.is_done, self.error, self.metadata = is_done, error, metadata
+
+
+class _Item:
+    def __init__(self, *results):
+        self.result = list(results)
+
+
+class _Hist:
+    def __init__(self, *items):
+        self.history = list(items)
+
+
+def test_rollup_empty_history_passes():
+    assert ck.receipt_rollup(_Hist(), []) == (True, [])
+
+
+def test_rollup_trailing_error_channel_refusal_fails():
+    hist = _Hist(
+        _Item(_R(error="input: the only match is the text INSIDE that input",
+                 metadata={"no_click": True})),
+        _Item(_R(is_done=True)),
+    )
+    ok, reasons = ck.receipt_rollup(hist, [])
+    assert ok is False
+    assert "REFUSED" in reasons[0]
+
+
+def test_rollup_content_channel_no_click_does_not_trip():
+    """Candidate listings / static-text probes stamp no_click WITHOUT an error — they
+    are answers, not refused actions, and must not fail the segment."""
+    hist = _Hist(_Item(_R(metadata={"no_click": True})), _Item(_R(is_done=True)))
+    assert ck.receipt_rollup(hist, []) == (True, [])
+
+
+def test_rollup_refusal_then_recovery_passes():
+    hist = _Hist(
+        _Item(_R(error="no_fill: dropdown filter", metadata={"no_fill": True})),
+        _Item(_R()),  # the recovery action the receipt steered to
+        _Item(_R(is_done=True)),
+    )
+    assert ck.receipt_rollup(hist, [])[0] is True
+
+
+def test_rollup_refused_final_write_with_nothing_accepted_fails():
+    hist = _Hist(
+        _Item(_R(metadata={"write_outcome": {"fired": True, "accepted": False,
+                                             "t0": 0.0}})),
+        _Item(_R(is_done=True)),
+    )
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": json.dumps({"status": False, "message": "already submitted"})}]
+    ok, reasons = ck.receipt_rollup(hist, window)
+    assert ok is False
+    assert "write" in reasons[0]
+
+
+def test_rollup_refused_receipt_waived_by_any_accepted_write():
+    """Duplicate-save shape: an earlier write in the window was accepted; the refused
+    re-submit last is proof of completion, not failure."""
+    hist = _Hist(
+        _Item(_R(metadata={"write_outcome": {"fired": True, "accepted": False,
+                                             "t0": 5.0}})),
+        _Item(_R(is_done=True)),
+    )
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200}]
+    assert ck.receipt_rollup(hist, window)[0] is True
+
+
+def test_rollup_accepted_final_write_passes():
+    hist = _Hist(
+        _Item(_R(metadata={"write_outcome": {"fired": True, "accepted": True,
+                                             "t0": 0.0}})),
+        _Item(_R(is_done=True)),
+    )
+    assert ck.receipt_rollup(hist, [])[0] is True

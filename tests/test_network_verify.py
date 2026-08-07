@@ -259,3 +259,63 @@ async def test_no_bridge_means_no_change(monkeypatch):
         _FakeBrowserSession({4: _FakeDomNode("Save")}))
 
     assert res.extracted_content == 'Clicked button "Submit FPS"'
+
+
+# ------------------- structured write_outcome stamping (roll-up source) -------------------
+# The gate's receipt roll-up must never regex-parse receipt prose; the click paths stamp
+# a small structured verdict instead.
+
+
+async def _fake_builtin_click_with_meta(**kwargs):
+    from browser_use.agent.views import ActionResult
+
+    return ActionResult(extracted_content='Clicked button "Save"',
+                        metadata={"hidden_click": True})
+
+
+async def test_click_stamps_refused_write_outcome(monkeypatch):
+    _speed(monkeypatch)
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK",
+                        _FakeLiveNetwork([_write_snapshot(body=_APRIL_BODY)]))
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Submit FPS")}))
+    wo = (res.metadata or {}).get("write_outcome")
+    assert wo is not None
+    assert wo["fired"] is True and wo["accepted"] is False
+    assert isinstance(wo["t0"], float)
+
+
+async def test_click_stamps_accepted_write_outcome_and_merges_metadata(monkeypatch):
+    _speed(monkeypatch)
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK",
+                        _FakeLiveNetwork([_write_snapshot(
+                            body=_MAY_BODY, url="https://api.app/E/PayrollCalculation")]))
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click_with_meta, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save & Next")}))
+    assert res.metadata["hidden_click"] is True          # sibling preserved (merge, not replace)
+    assert res.metadata["write_outcome"]["accepted"] is True
+
+
+async def test_plain_click_without_write_stamps_nothing(monkeypatch):
+    _speed(monkeypatch)
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _FakeLiveNetwork([]))
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Expand row")}))
+    assert not (getattr(res, "metadata", None) or {}).get("write_outcome")
+
+
+def test_with_write_outcome_merges_not_replaces():
+    outcome = {"fired": True, "accepted": False, "t0": 1.0}
+    merged = agent_tools._with_write_outcome({"interacted_element": {"a": 1}}, outcome)
+    assert merged["interacted_element"] == {"a": 1}
+    assert merged["write_outcome"] is outcome
+    assert agent_tools._with_write_outcome(None, None) is None
+    assert agent_tools._with_write_outcome({"x": 1}, None) == {"x": 1}
+    assert agent_tools._with_write_outcome(None, outcome) == {"write_outcome": outcome}

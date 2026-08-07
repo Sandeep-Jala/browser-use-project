@@ -1352,3 +1352,32 @@ def test_report_renders_check_verdicts():
     }])
     assert "write_accepted" in html and "text_visible" in html
     assert "POST /api/Employees" in html and "not found" in html
+
+
+# ------------------------------- unit: receipt roll-up wiring -------------------------------
+
+
+async def test_rollup_demotes_passing_gate_and_records_reasons():
+    ok, detail = await evaluate_gate(
+        Gate(kind="steps"), steps_ok=True, page=None, requests_window=[],
+        rollup=(False, ["receipts contradict success: X"]))
+    assert ok is False
+    assert detail["rollup"] == ["receipts contradict success: X"]
+
+    ok, detail = await evaluate_gate(
+        Gate(kind="steps"), steps_ok=True, page=None, requests_window=[],
+        rollup=(True, []))
+    assert ok is True and detail == {"kind": "steps"}
+
+
+def test_rollup_applies_only_to_selfreport_gates():
+    assert hybrid._rollup_applies(Gate(kind="steps")) is True
+    assert hybrid._rollup_applies(
+        Gate(kind="postcondition", postcondition={"url_contains": "x"})) is True
+    assert hybrid._rollup_applies(Gate(kind="marker", marker="m")) is False
+    assert hybrid._rollup_applies(Gate(kind="download")) is False
+
+
+def test_check_failure_reason_covers_rollup():
+    detail = {"kind": "steps", "rollup": ["receipts contradict success: Y"]}
+    assert hybrid._check_failure_reason(detail) == "receipts contradict success: Y"

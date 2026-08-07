@@ -169,6 +169,46 @@ def _probe_write(requests_window: list[dict[str, Any]],
         return True, _format_write({"record": r}), None, False
     if refusal is not None:
         return False, None, f'the server REFUSED the write: "{refusal}"', False
+    matching = f' matching "{frag}"' if frag else ""
     return (False, None,
-            f'no accepted create-write matching "{frag}" in this segment\'s traffic',
+            f"no accepted create-write{matching} in this segment's traffic",
             False)
+
+
+def receipt_rollup(history: Any, requests_window: list[dict[str, Any]],
+                   ) -> tuple[bool, list[str]]:
+    """Does the agent's own receipt trail contradict its success claim? (ok, reasons).
+
+    Deliberately conservative — exactly two rules, both on FINAL state only, applied
+    by the caller only to gates that trust self-report (steps/postcondition):
+    1. The segment's last non-done action was an error-channel refusal (no_click/no_fill
+       stamp + error set). Content-channel stamps (candidate listings, static-text
+       probes) are answers, not refused actions, and never trip this.
+    2. The last write_outcome-stamped receipt fired a write that was not accepted, AND
+       nothing accepted exists anywhere in the segment's window at gate time (re-scan
+       of the live records — an in-flight write that settled after the receipt, or an
+       earlier accepted save before a refused duplicate re-submit, waives the rule).
+    """
+    results = [r for item in getattr(history, "history", None) or []
+               for r in getattr(item, "result", None) or []]
+    reasons: list[str] = []
+    actions = [r for r in results if not getattr(r, "is_done", False)]
+    if actions:
+        last = actions[-1]
+        meta = getattr(last, "metadata", None) or {}
+        if getattr(last, "error", None) and (meta.get("no_click") or meta.get("no_fill")):
+            reasons.append(
+                "receipts contradict success: the segment's final action was REFUSED — "
+                f"{str(last.error)[:200]}")
+    stamped = [r for r in results
+               if (getattr(r, "metadata", None) or {}).get("write_outcome")]
+    if stamped:
+        outcome = (stamped[-1].metadata or {})["write_outcome"]
+        if outcome.get("fired") and not outcome.get("accepted"):
+            ok_any, _, err, _ = _probe_write(requests_window, "")
+            if not ok_any:
+                why = f" — {err}" if err and "REFUSED" in err else ""
+                reasons.append(
+                    "receipts contradict success: the segment's final write was not "
+                    f"accepted and nothing accepted followed it{why}")
+    return (not reasons), reasons

@@ -1291,10 +1291,23 @@ async def _dialog_closed(browser_session, pre: dict[str, Any],
     return post["open"] < pre["open"]
 
 
+def _with_write_outcome(meta: dict[str, Any] | None,
+                        outcome: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Merge a write_outcome stamp into existing ActionResult metadata WITHOUT replacing
+    siblings (the compiler reads metadata["interacted_element"]; a stamp must never
+    clobber it). None-in-None-out keeps unstamped results byte-identical."""
+    if outcome is None:
+        return meta
+    return {**(meta or {}), "write_outcome": outcome}
+
+
 async def _click_outcome_suffix(browser_session, t0: float,
-                                pre: dict[str, Any] | None) -> str:
+                                pre: dict[str, Any] | None,
+                                ) -> tuple[str, dict[str, Any] | None]:
     """The NETWORK OUTCOME (write requests fired, with server verdicts) + DIALOG OUTCOME
-    receipt suffix for a click dispatched at t0 whose pre-click dialog state was `pre`.
+    receipt suffix for a click dispatched at t0 whose pre-click dialog state was `pre`,
+    plus the structured write_outcome stamp ({"fired","accepted","t0"}, None when no
+    write fired) that the gate's receipt roll-up reads instead of parsing prose.
     Shared by the `click` override and find_by_text's click branch — a Save clicked via
     find_by_text used to fire its POST with no receipt at all (run 20260807_095537 seg6:
     the unreceipted DataRequest create was re-clicked into a duplicate)."""
@@ -1341,13 +1354,14 @@ async def _click_outcome_suffix(browser_session, t0: float,
             suffix += (" — the dialog is STILL OPEN after this click. If this was a "
                        "save/submit it likely did NOT go through: look for validation "
                        "messages inside the dialog before doing anything else.")
-    return suffix
+    outcome = {"fired": True, "accepted": accepted, "t0": t0} if fired else None
+    return suffix, outcome
 
 
 async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> ActionResult:
     """Delegate the click to the built-in unchanged, then append the network+dialog
-    outcome suffix. Plain clicks that fired no writes, probe failures, and error
-    results pass through untouched."""
+    outcome suffix and stamp the structured write_outcome. Plain clicks that fired no
+    writes, probe failures, and error results pass through untouched."""
     node = None
     index = getattr(params, "index", None)
     if browser_session is not None and index:
@@ -1361,12 +1375,16 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
     if res is None or getattr(res, "error", None) \
             or not getattr(res, "extracted_content", None):
         return res
-    suffix = await _click_outcome_suffix(browser_session, t0, pre)
-    if not suffix:
+    suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre)
+    if not suffix and outcome is None:
         return res
     update: dict[str, Any] = {"extracted_content": res.extracted_content + suffix}
     if getattr(res, "long_term_memory", None):
         update["long_term_memory"] = res.long_term_memory + suffix
+    merged = _with_write_outcome(getattr(res, "metadata", None), outcome)
+    if merged is not None:
+        # model_copy REPLACES the metadata field wholesale — merged carries the siblings.
+        update["metadata"] = merged
     return res.model_copy(update=update)
 
 
@@ -1382,7 +1400,9 @@ def build_tools() -> Tools:
     # same-name registration replaces the entry, not the captured function. Note:
     # browser-use re-registers `click` when set_coordinate_clicking flips (claude-* /
     # gemini-3-pro model names); the configured agent models (gpt-4.1-mini, llama-4)
-    # never trigger that, but a model switch would silently drop this wrapper.
+    # never trigger that, but a model switch would silently drop this wrapper — and with
+    # it the write_outcome stamps the gate's receipt roll-up reads (fail-safe: the
+    # roll-up simply finds no stamps and goes inert).
     _builtin_click = tools.registry.registry.actions["click"]
     _builtin_click_fn = _builtin_click.function
 
@@ -1890,7 +1910,8 @@ def build_tools() -> Tools:
             # Same network+dialog receipts as the click override: a Save clicked through
             # find_by_text fired its POST invisibly (run 20260807_095537 seg6) and the
             # agent, seeing nothing, clicked Save again — a duplicate create.
-            suffix = await _click_outcome_suffix(browser_session, t0, pre)
+            suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre)
+            meta = _with_write_outcome(meta, outcome)
             msg = (f"find_by_text('{query}'): clicked the single match "
                    f"{_line(idx, node, label)}" + suffix)
             logger.info("🔎 %s", msg)

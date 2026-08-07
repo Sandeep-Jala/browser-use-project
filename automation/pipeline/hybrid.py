@@ -56,7 +56,7 @@ from automation.browser.recording import start_run_recording, stop_run_recording
 from automation.pipeline import adapt
 from automation.pipeline import router
 from automation.pipeline import subtask_store as sstore
-from automation.pipeline.checks import evaluate_checks
+from automation.pipeline.checks import evaluate_checks, receipt_rollup
 from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloads_file,
                                            get_decomposition, is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
@@ -263,21 +263,34 @@ async def _settled(check: Any, steps_ok: bool) -> bool:
     return False
 
 
+def _rollup_applies(gate: Gate) -> bool:
+    """Receipt roll-up guards only the gate kinds that TRUST self-report. Marker and
+    download verdicts are already deterministic in both directions — rolling receipts
+    into them would false-fail the proven-save-then-refused-duplicate pattern (an
+    "already submitted" bounce after a marker-proven save is completion, not failure)."""
+    return gate.kind in ("steps", "postcondition")
+
+
 async def evaluate_gate(
     gate: Gate, *, steps_ok: bool, page: Page | None,
     requests_window: list[dict[str, Any]],
     downloads_window: list[str] | None = None,
+    rollup: tuple[bool, list[str]] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Evaluate a segment gate: the base kind (see _evaluate_base_gate), then any
-    declared verify checks on top. Checks are demote-only — they can fail a segment the
-    base gate passed (including authoritative marker/download passes) but never
-    resurrect a failed one; on a failed base they still get their single honest
-    evaluation so the detail lands in the report (the same convention the settle window
-    applies to a failed-steps postcondition). `detail["checks"]` appears only when the
-    gate declares checks — a bare gate's detail is byte-identical to before."""
+    """Evaluate a segment gate: the base kind (see _evaluate_base_gate), then the
+    receipt roll-up verdict (computed by the agent call site, None on replay), then any
+    declared verify checks. Roll-up and checks are demote-only — they can fail a segment
+    the base gate passed but never resurrect a failed one; checks on a failed base still
+    get their single honest evaluation so the detail lands in the report (the same
+    convention the settle window applies to a failed-steps postcondition).
+    `detail["checks"]`/`detail["rollup"]` appear only when declared/failing — a bare
+    gate's detail is byte-identical to before."""
     ok, detail = await _evaluate_base_gate(
         gate, steps_ok=steps_ok, page=page, requests_window=requests_window,
         downloads_window=downloads_window)
+    if rollup is not None and not rollup[0]:
+        detail["rollup"] = rollup[1]
+        ok = False
     if gate.checks:
         results = await evaluate_checks(page, requests_window, gate.checks, poll=ok)
         detail["checks"] = results
@@ -295,6 +308,9 @@ def _check_failure_reason(detail: dict[str, Any]) -> str | None:
             if r.get("evidence"):
                 why = f"{why} [{r['evidence']}]"
             return f'deterministic check failed: {r["kind"]} "{r["arg"]}" — {why}'
+    rollup = detail.get("rollup") or []
+    if rollup:
+        return str(rollup[0])
     return None
 
 
@@ -886,10 +902,13 @@ class HybridSession:
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         steps_ok = bool(history.is_successful())
+        rollup = (receipt_rollup(history, self.requests_since(watermark))
+                  if _rollup_applies(gate) else None)
         seg.ok, seg.gate = await evaluate_gate(
             gate, steps_ok=steps_ok, page=self.current_page(),
             requests_window=self.requests_since(watermark),
             downloads_window=seg.downloads,
+            rollup=rollup,
         )
         seg.write_step = seg.gate.get("write_step")
         if not seg.ok:
