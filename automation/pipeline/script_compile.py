@@ -1135,30 +1135,7 @@ __WALK__
 })()
 """.replace("__WALK__", _COMPOSED_WALK_JS)
 
-# Runs ON the clicked node (this = element, via Runtime.callFunctionOn): is it inside a
-# dialog? Ancestor walk crossing shadow boundaries the same way the walker does.
-DIALOG_ANCESTOR_JS = r"""
-function () {
-  var composedParent = function (e) {
-    if (!e) return null;
-    if (e.parentElement) return e.parentElement;
-    var r = e.getRootNode ? e.getRootNode() : null;
-    return (r && r.host) ? r.host : null;
-  };
-  for (var p = this; p; p = composedParent(p)) {
-    if (!p.getAttribute) continue;
-    var role = String(p.getAttribute('role') || '').toLowerCase();
-    if (role === 'dialog' || role === 'alertdialog') return true;
-    if (String(p.getAttribute('aria-modal') || '').toLowerCase() === 'true') return true;
-    if (/(^|[\s-])(modal|dialog)([\s-]|$)/i.test(String(p.getAttribute('class') || ''))) {
-      return true;
-    }
-  }
-  return false;
-}
-"""
-
-# Identity-tracked variant: the global dialog COUNT lies when panels CHAIN — this app's
+# Identity-tracked in-dialog probe: the global dialog COUNT lies when panels CHAIN — this app's
 # Save closes its dialog and immediately opens the next panel (Add-Request → Send-Email,
 # run 20260807_095537), so count-delta reported "STILL OPEN" against a save that
 # succeeded and the agent redid it. Stamp THE dialog the clicked element lives in;
@@ -1166,7 +1143,8 @@ function () {
 DIALOG_WATCH_ATTR = "data-ao-dialog-watch"
 
 # Runs ON the clicked node (this = element): sweep stale stamps everywhere, then stamp
-# the node's dialog ancestor (same predicate as DIALOG_ANCESTOR_JS).
+# the node's dialog ancestor (role dialog/alertdialog, aria-modal, or modal/dialog class,
+# walking composed parents so shadow-rendered dialogs count).
 DIALOG_STAMP_JS = r"""
 function () {
   try {

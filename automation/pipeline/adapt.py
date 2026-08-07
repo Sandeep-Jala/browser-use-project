@@ -281,11 +281,11 @@ def _template_regex(template_prompt: str, params: dict[str, str]) -> re.Pattern 
 
 
 def match_template(
-    new_prompt: str, candidates: list[dict[str, Any]], llm: Any = None
+    new_prompt: str, candidates: list[dict[str, Any]]
 ) -> TemplateMatch | None:
     """Match `new_prompt` against recorded templates; None means no value-only match.
 
-    Fully deterministic (`llm` is accepted for API compatibility but unused): a candidate
+    Fully deterministic: a candidate
     matches iff the new prompt equals its recorded prompt with only parameter values swapped,
     and the values are read straight out of the alignment. An earlier LLM-based matcher was
     unreliable in both directions — it matched prompts whose changes the template could not

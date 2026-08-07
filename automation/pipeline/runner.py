@@ -30,6 +30,9 @@ from automation.collectors.base import Collector
 from automation.config import Config
 from automation.llm import build_llm
 from automation.pipeline import agent_tools
+# React-select's filter input regex, shared with the compiler/tools: typing there is
+# dropdown filtering, NOT a list search — the search-Enter nudge must never fire on it.
+from automation.pipeline.script_compile import _RS_FILTER_ID
 
 logger = logging.getLogger("framework.runner")
 
@@ -98,9 +101,6 @@ def _first_create_write(requests: list[dict[str, Any]], marker: str) -> dict[str
     return None
 
 
-# React-select's filter input: typing there is dropdown filtering, NOT a list search — Enter
-# would select whatever option is focused, so the search-Enter nudge must never fire on it.
-_RS_FILTER_ID = re.compile(r"^react-select-\d+-input$")
 # Attributes whose value containing "search" marks a list/table search box.
 _SEARCHY_ATTRS = ("placeholder", "aria-label", "id", "name")
 

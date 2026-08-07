@@ -3,7 +3,7 @@
 Companions to tests/test_stale_fill.py (which fakes the JS): these prove the actual
 templates — FIELD_REFIND_JS locates the live twin of a re-rendered field (light DOM and
 open shadow roots), focuses it so keyboard insertion lands, and reads it back;
-DIALOG_COUNT_JS / DIALOG_ANCESTOR_JS see dialogs wherever they render."""
+DIALOG_COUNT_JS / DIALOG_STAMP_JS see dialogs wherever they render."""
 import json
 
 from automation.pipeline import script_compile as sc
@@ -102,23 +102,6 @@ async def test_dialog_count_sees_dialog_inside_open_shadow_root():
         """)
         got = await page.evaluate(sc.DIALOG_COUNT_JS)
         assert got["open"] == 1
-
-
-async def test_dialog_ancestor_probe_walks_composed_tree():
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as pw:
-        page = await _page(pw, """
-            <div role="dialog" style="width:300px;height:200px">
-              <button id="save">Save</button>
-            </div>
-            <button id="outside">Elsewhere</button>
-        """)
-        expr = "(el) => (%s).call(el)" % sc.DIALOG_ANCESTOR_JS
-        inside = await page.evaluate(expr, await page.query_selector("#save"))
-        outside = await page.evaluate(expr, await page.query_selector("#outside"))
-        assert inside is True
-        assert outside is False
 
 
 # ------------------------- dialog identity stamping -------------------------

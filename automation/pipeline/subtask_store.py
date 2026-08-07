@@ -14,7 +14,8 @@ when the subtask starts, disambiguating same-worded subtasks that begin on diffe
 cached decomposition and to label runs.
 
 Layout (LIBRARY_DIR):
-  {sid}.steps.json      compiled segment steps (concrete values from the authoring run)
+  {sid}.skill.py        tier-1 code skill transpiled from the committed steps (the
+                        transient {sid}.steps.json body is deleted after codegen)
   {sid}.template.json   adapt.parameterize output ({{param}} tokens + defaults)
   {sid}.recording.json  raw agent history of the authoring segment
   {sid}.meta.json       mutable per-run stats (uses/fail_count) — kept OUT of the manifest
