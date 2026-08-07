@@ -97,7 +97,7 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
         success_marker = spec.marker
     if success_marker is None:
         print("[*] no ground-truth marker (or --marker none): network gate disabled; "
-              "success comes from the segment gates + judge")
+              "success comes from the segment gates")
 
     # Files the prompt names ("upload X.csv ...") must exist NON-EMPTY in
     # automation/uploads/ BEFORE login: the resolved absolute paths become the agent's
@@ -151,7 +151,6 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
                     partial(ConsoleCollector, scope_hosts=log_scope),
                 ],
                 expander_llm=expander_llm,
-                judge_llm=expander_llm,  # feeds browser-use's built-in end-of-run judge
                 extend_system_message=SPEED_OPTIMIZATION_PROMPT,
                 tools=build_tools(),  # custom actions the prompts call (escape hatches, UI scans)
                 available_files=upload_files,
@@ -196,10 +195,6 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
                       f"{gt.get('create_write_seen')}"
                       + ("  (self-reported success OVERRIDDEN → FAIL)"
                          if gt.get("overrode_success") else ""))
-            j = result.judgement or {}
-            if j:
-                verdict = {True: "PASS", False: "FAIL"}.get(j.get("verdict"), "N/A")
-                print(f"   judge: {verdict}{(' — ' + j['failure_reason']) if j.get('failure_reason') else ''}")
             if result.usage:
                 print(f"   tokens: {result.usage.get('total_tokens')}  "
                       f"cost=${result.usage.get('total_cost', 0):.4f}")

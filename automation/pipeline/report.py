@@ -229,9 +229,6 @@ def _render_html(result: "RunResult") -> str:
     # ---- Telemetry assertions (pipeline/assertions.py) ----
     p.append(_render_assertions(assertion_results))
 
-    # ---- Judge verdict (browser-use's built-in judge) ----
-    p.append(_render_judgement(result.judgement, result.is_successful))
-
     # ---- UI & Accessibility scans (detect_layout_issues / run_accessibility_scan) ----
     p.append(_render_ui_scans(result.extracted_content))
 
@@ -397,43 +394,6 @@ def _render_assertions(assertion_results: list[dict[str, Any]]) -> str:
             p.append(f"<div class='obs-reason'><code>{_esc(line[:300])}</code></div>")
         p.append("</div>")
     p.append("</div></div>")
-    return "".join(p)
-
-
-def _render_judgement(judgement: dict[str, Any] | None, agent_success: Any) -> str:
-    """Render browser-use's built-in judge verdict, flagging agent-vs-judge disagreement."""
-    if not judgement:
-        return ""
-    verdict = judgement.get("verdict")
-    if verdict is True:
-        icon, color, label, badge = "check", "var(--success)", "PASS", "background:var(--success);color:#fff"
-    elif verdict is False:
-        icon, color, label, badge = "close", "var(--error)", "FAIL", "background:var(--error);color:#fff"
-    else:
-        icon, color, label, badge = "help", "var(--text-muted)", "N/A", "background:#1e293b;color:var(--text-muted)"
-
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>gavel</span>"
-             " Judge Verdict</div><div class='obs-list'><div class='obs-row'>")
-    p.append(
-        "<div class='obs-head'>"
-        f"<span class='material-icons' style='color:{color}'>{icon}</span>"
-        "<span class='obs-title'>Independent judge (browser-use)</span>"
-        f"<span class='badge' style='{badge}'>{label}</span></div>"
-    )
-    # Surface disagreement between the agent's self-report and the judge.
-    if verdict is False and agent_success is True:
-        p.append("<div class='obs-reason'><em>Note:</em> the agent reported success but the "
-                 "judge disagreed.</div>")
-    if judgement.get("failure_reason"):
-        p.append(f"<div class='obs-reason'><em>Failure reason:</em> "
-                 f"{_esc(judgement.get('failure_reason'))}</div>")
-    if judgement.get("reasoning"):
-        p.append(f"<div class='obs-reason'>{_esc(judgement.get('reasoning'))}</div>")
-    if judgement.get("reached_captcha"):
-        p.append("<div class='obs-reason'><em>⚠️ Captcha encountered during the run.</em></div>")
-    p.append("</div></div></div>")
     return "".join(p)
 
 

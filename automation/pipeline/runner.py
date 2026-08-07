@@ -1,6 +1,6 @@
 """Agent run wrapper.
 
-`Runner` holds the per-run configuration (LLM, collectors, custom tools, judge) and runs ONE
+`Runner` holds the per-run configuration (LLM, collectors, custom tools) and runs ONE
 agent segment at a time via `run_agent_segment`, returning the raw history/usage for the
 caller to distil into a `RunResult`.
 
@@ -270,9 +270,6 @@ class RunResult:
     screenshots: list[str | None] = field(default_factory=list)
     # Per-step progress timeline from the agent's own history: {n, evaluation, next_goal, url}.
     steps: list[dict[str, Any]] = field(default_factory=list)
-    # browser-use's built-in end-of-run judge verdict: {verdict, reasoning,
-    # failure_reason, reached_captcha}, or None if it didn't run.
-    judgement: dict[str, Any] | None = None
     # LLM token usage + cost for the run (browser-use UsageSummary as a dict), or None.
     usage: dict[str, Any] | None = None
     # Network ground-truth check: {"marker": str, "create_write_seen": bool}, or None if no
@@ -315,7 +312,6 @@ class Runner:
         llm: Any | None = None,
         collector_factories: list[CollectorFactory] | None = None,
         expander_llm: Any | None = None,
-        judge_llm: Any | None = None,
         extend_system_message: str | None = None,
         tools: Any | None = None,
         available_files: list[str] | None = None,
@@ -334,8 +330,6 @@ class Runner:
         self.collector_factories: list[CollectorFactory] = list(collector_factories or [])
         # Used by the subtask decomposer (decompose.py) and adapt.parameterize.
         self.expander_llm = expander_llm
-        # Optional post-run QA judge (a strong LLM scoring the run); None disables verdicts.
-        self.judge_llm = judge_llm
         # Resolved absolute paths of the task's upload files (validated at startup by
         # pipeline/files.py against automation/uploads/). Passed to every Agent as
         # browser-use's upload_file allowlist. (Under the inverted handoff the session is
@@ -381,7 +375,7 @@ class Runner:
         `request_offset` windows the save probe to requests captured from that index on, so
         a mid-task segment doesn't credit a create-write an earlier segment fired.
 
-        Returns {"history", "screenshots", "steps", "usage", "judgement"}.
+        Returns {"history", "screenshots", "steps", "usage"}.
         """
         if self.available_files:
             agent_task += _workspace_files_note(self.available_files)
@@ -423,14 +417,12 @@ class Runner:
             # detect_layout_issues, run_accessibility_scan) plus all built-ins. None → built-ins.
             tools=self.tools,
             # browser-use's end-of-run judge (use_judge defaults True) is OFF — the
-            # 2026-07-30 decision: the hybrid engine's segment gates are the verdict, the
-            # judge never overrides the agent's self-reported success, and the hybrid path
-            # discards its verdict anyway (HybridSession.finalize hardcodes judgement=None).
+            # 2026-07-30 decision: the hybrid engine's segment gates are the verdict, and
+            # the judge never overrides the agent's self-reported success.
             # Found regressed to True on 2026-08-07: every authored segment ended with a
             # full-trace judgement on the medium-effort expander deployment (240s timeout,
             # 5 retries) — minutes of dead air between subtasks, verdict thrown away.
             use_judge=False,
-            judge_llm=self.judge_llm,
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop
             # override prompt on Ctrl+C, so disable browser-use's own signal handler.
             enable_signal_handler=False,
@@ -704,17 +696,11 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             logger.exception("could not read token usage from history: %s", exc)
 
-        # browser-use's built-in judge runs at the end of the agent loop (use_judge) and
-        # attaches its verdict to the last done action result. Read it instead of running a
-        # second judge of our own.
-        judgement = self._extract_judgement(history)
-
         return {
             "history": history,
             "screenshots": screenshots,
             "steps": steps,
             "usage": usage,
-            "judgement": judgement,
         }
 
     def _prompt_and_inject(self, agent: Any) -> None:
@@ -769,22 +755,4 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not inject human instruction: %s", exc)
             print(f"❌ Could not inject instruction: {exc}", flush=True)
-
-    @staticmethod
-    def _extract_judgement(history: Any) -> dict[str, Any] | None:
-        """Pull browser-use's built-in judge verdict off the last done action result."""
-        try:
-            for item in reversed(history.history):
-                for res in reversed(getattr(item, "result", None) or []):
-                    j = getattr(res, "judgement", None)
-                    if j is not None:
-                        return {
-                            "verdict": getattr(j, "verdict", None),
-                            "reasoning": getattr(j, "reasoning", None),
-                            "failure_reason": getattr(j, "failure_reason", None),
-                            "reached_captcha": getattr(j, "reached_captcha", None),
-                        }
-        except Exception as exc:  # noqa: BLE001 - reading the judge verdict must not crash the run
-            logger.debug("could not read built-in judge verdict: %s", exc)
-        return None
 

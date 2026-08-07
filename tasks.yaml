@@ -8,7 +8,7 @@
 #   marker      (optional) network ground-truth URL fragment: a successful POST/PUT/PATCH to a
 #               URL containing it proves the record saved. OMIT it when a task has no known
 #               create-write (verification / read-only flows) — the gate is then disabled and
-#               success comes from the segment gates + the judge. A missing marker is never an
+#               success comes from the segment gates. A missing marker is never an
 #               error.
 #   tags        (optional) suite selection groups (--suite tag:nps).
 #   assertions  (optional) per-task overrides for pipeline/assertions.py.

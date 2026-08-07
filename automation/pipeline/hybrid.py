@@ -163,7 +163,7 @@ def _base_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate
         # A whole-prompt fallback blob mentions "download" mid-task, but its deliverable
         # is the WHOLE task — the download gate would also inject the FILE DOWNLOAD
         # prompt block at the top, which sent the blob runs hunting a Download control
-        # from step 1. The blob's arbiter is the end-of-run judge; degrade to steps.
+        # from step 1. The blob's arbiter is the run-level ground truth; degrade to steps.
         return Gate(kind="steps")
     if downloads_file(sub.template_prompt):
         return Gate(kind="download")
@@ -797,7 +797,7 @@ class HybridSession:
             is_done=True, is_successful=None, has_errors=False, final_result=None,
             urls=[], n_steps=0, duration_seconds=duration, extracted_content=[],
             model_actions=[], errors=[], collector_results=collector_results,
-            artifacts=artifacts, screenshots=[], steps=[], judgement=None, usage=None,
+            artifacts=artifacts, screenshots=[], steps=[], usage=None,
             ground_truth=ground_truth,
         )
 

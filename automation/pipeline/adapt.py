@@ -7,7 +7,7 @@ parameter (one LLM call: fill step 13 types "5" → param "qty"), producing a te
      "params": {"client": "290 CREW LIMITED", "customer": "Suresh Gopi", "qty": "5", ...},
      "steps": [... fill values and value-bearing selectors carry {{param}} tokens ...]}
 
-When a new prompt later has no script of its own, `match_template()` (one LLM call) picks the
+When a new prompt later has no script of its own, `match_template()` picks the
 template with the same procedure and reads the new prompt's value for EVERY parameter into a
 dictionary; `instantiate()` then swaps the tokens. Because each token was placed at a specific
 step at parameterize time, substitution is purely mechanical and per-field — two fields that
