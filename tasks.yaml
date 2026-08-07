@@ -748,6 +748,14 @@ payroll_food_limited_e2e_rti:
   # VERBATIM slices of the prompt above (their space-joined concatenation reproduces
   # it exactly - keep both sides in sync when rewording). Kinds declared only for the
   # four repeat-until fragments; everything else lets node_kind decide.
+  #
+  # verify: blocks (pipeline/checks.py) are deterministic per-slice gates evaluated on
+  # top of the slice's base gate; they never change task identity. Authoring rules:
+  # only assert write_accepted for writes PROVEN in a passing run's network.json (this
+  # app's modal Save and Pay-Forecast cell edits fire NO request - never assert those);
+  # url_contains takes a literal raw-URL fragment, never a normalized context from
+  # progress.json (those embed '*'); dynamic noted values (fakenamegenerator identity)
+  # cannot be declared statically.
   subtasks:
     - prompt: >-
         Go to the Payroll module, search for and select the business name FOOD LIMITED, then
@@ -765,6 +773,8 @@ payroll_food_limited_e2e_rti:
         and ending with C; set NI Category to A; set Gross Pay to 3500; select Student Loan
         with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 06/04/2026 and with loan end date
         01/07/2027; then click Save.
+      verify:
+        - write_accepted: "Employees"
     - prompt: >-
         Next go to Pay Forecast and load the new employee's data by repeating the following
         steps: type the noted employee name into the combobox and select the employee; if the
@@ -813,6 +823,8 @@ payroll_food_limited_e2e_rti:
         fully loaded before doing anything else. Keep repeating those steps until Alistair
         Allan is the employee shown.
       kind: loop
+      verify:
+        - text_visible: "Alistair Allan"
     - prompt: >-
         With Alistair Allan shown as the current employee, click Add Expenses or Benefits, set
         Type to 'Assets transferred', set the period from April 2026 and set period to May
@@ -828,11 +840,15 @@ payroll_food_limited_e2e_rti:
         in all other cases click Save & Next and wait for the next employee to load. Keep
         repeating until Bruce Wright is the employee shown.
       kind: loop
+      verify:
+        - text_visible: "Bruce Wright"
     - prompt: >-
         With Bruce Wright shown, select bulk upload FPS which is a button next to Save & Next,
         click the the checkbox in the grid header row, left of 'Employees', click the checkbox
         of Alistair Allan, click FPS, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit.
+      verify:
+        - write_accepted: "FPS"
     - prompt: >-
         Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
         Jun-26, and click Save & Next exactly 3 times, waiting for the screen to update after
