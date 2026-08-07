@@ -782,6 +782,12 @@ payroll_food_limited_e2e_rti:
         instruction; if no data is shown, refresh the page and repeat from typing the name
         again. Keep repeating until the pay rows are visible.
       kind: loop
+      # Guards the template-grid false-pass (run 20260807_155254 seg3): the EMPTY template
+      # also shows the Apr-26..Mar-27 period labels, but only a loaded employee shows the
+      # seeded £3,500.00 pay cells (Gross Pay 3500 is set in this task's own wording;
+      # format verified from run 153352 video frames).
+      verify:
+        - text_visible: "3,500.00"
     - prompt: >-
         Once the pay rows are loaded, set the pay of Dec-26 to 5000, then set the net pay of
         Feb-27 to 4000 using the Net to Gross option on the Feb-27 row. At any point during
