@@ -56,6 +56,7 @@ from automation.browser.recording import start_run_recording, stop_run_recording
 from automation.pipeline import adapt
 from automation.pipeline import router
 from automation.pipeline import subtask_store as sstore
+from automation.pipeline.checks import evaluate_checks
 from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloads_file,
                                            get_decomposition, is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
@@ -127,19 +128,30 @@ async def _abort_ad_requests(route) -> None:
 
 @dataclass
 class Gate:
-    """How one segment's success is judged (marker > postcondition > download > steps)."""
+    """How one segment's success is judged (marker > postcondition > download > steps).
+    `checks` are the subtask's declared deterministic checks (pipeline/checks.py): they
+    ride along on WHATEVER base kind resolves and evaluate on top of it, demote-only."""
 
     kind: str                       # "marker" | "postcondition" | "download" | "steps"
     marker: str | None = None       # kind == "marker": create-write URL fragment
     postcondition: dict[str, Any] | None = None   # {"url_contains": ...} | {"visible": ...}
     end_context: str | None = None  # recorded end context (normalized URL) to compare
+    checks: tuple = ()              # declared verify checks (tuple of checks.Check)
 
 
 def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
-    """Resolve the gate for a subtask: its marker (the save-owning segment) wins; else a
-    declared postcondition; else the DOWNLOAD gate when the wording says the segment
-    downloads/exports a file (its truth is "a file arrived", not the page state — and
-    not the agent's self-report, which a download click's inevitable timeout receipt
+    """Resolve the gate for a subtask (see _base_gate for the kind precedence), then
+    attach the subtask's declared verify checks — they apply to every kind."""
+    gate = _base_gate(sub, entry, context)
+    gate.checks = tuple(getattr(sub, "verify", None) or ())
+    return gate
+
+
+def _base_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
+    """Resolve the base gate for a subtask: its marker (the save-owning segment) wins;
+    else a declared postcondition; else the DOWNLOAD gate when the wording says the
+    segment downloads/exports a file (its truth is "a file arrived", not the page state —
+    and not the agent's self-report, which a download click's inevitable timeout receipt
     poisons); else the library entry's recorded end_context when it differs from the
     start context (a navigation segment must actually land somewhere); else the steps
     floor (clean execution / agent self-report)."""
@@ -161,23 +173,40 @@ def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Ga
     return Gate(kind="steps")
 
 
+def _describe_check(check: Any) -> str:
+    """One declared check as agent-actionable words. Wording order and content mirror
+    what evaluate_gate will enforce, same convention as the postcondition branch."""
+    return {
+        "text_visible": f'the text "{check.arg}" visible on the page',
+        "text_absent": f'the text "{check.arg}" no longer visible',
+        "control_exists": f'a control named "{check.arg}" present',
+        "url_contains": f'the page URL containing "{check.arg}"',
+        "write_accepted": f'an accepted write to "{check.arg}"',
+    }.get(check.kind, f'{check.kind} "{check.arg}"')
+
+
 def _describe_expected_end(gate: Gate) -> str | None:
     """The gate's pass condition in words the agent can act on, or None when the gate has
     no page-state condition (marker gates verify via verify_save_registered instead, and
-    steps gates have nothing to check). This is what turns the library's recorded outcome
-    into the authoring agent's explicit done-condition."""
-    if gate.kind != "postcondition":
-        return None
-    # Branch order mirrors evaluate_gate exactly, so the condition described to the agent
-    # is always the one the gate will enforce.
-    if gate.postcondition and gate.postcondition.get("url_contains"):
-        return f'the page URL contains "{gate.postcondition["url_contains"]}"'
-    if gate.postcondition and gate.postcondition.get("visible"):
-        return f'the element matching "{gate.postcondition["visible"]}" is visible'
-    if gate.end_context:
-        return (f'the page URL path matches "{gate.end_context}" '
-                f'(lowercased; each "*" stands for a record id)')
-    return None
+    bare steps gates have nothing to check). This is what turns the library's recorded
+    outcome — and any declared verify checks — into the authoring agent's explicit
+    done-condition."""
+    base = None
+    if gate.kind == "postcondition":
+        # Branch order mirrors evaluate_gate exactly, so the condition described to the
+        # agent is always the one the gate will enforce.
+        if gate.postcondition and gate.postcondition.get("url_contains"):
+            base = f'the page URL contains "{gate.postcondition["url_contains"]}"'
+        elif gate.postcondition and gate.postcondition.get("visible"):
+            base = f'the element matching "{gate.postcondition["visible"]}" is visible'
+        elif gate.end_context:
+            base = (f'the page URL path matches "{gate.end_context}" '
+                    f'(lowercased; each "*" stands for a record id)')
+    if not gate.checks:
+        return base
+    described = "; ".join(_describe_check(c) for c in gate.checks)
+    line = f"mechanical verification will additionally require: {described}"
+    return f"{base}; and {line}" if base else line
 
 
 # Extra agent steps for the SAVE-OWNING segment. Its job is a loop — save, verify against
@@ -239,7 +268,42 @@ async def evaluate_gate(
     requests_window: list[dict[str, Any]],
     downloads_window: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Evaluate a segment gate. Returns (ok, detail).
+    """Evaluate a segment gate: the base kind (see _evaluate_base_gate), then any
+    declared verify checks on top. Checks are demote-only — they can fail a segment the
+    base gate passed (including authoritative marker/download passes) but never
+    resurrect a failed one; on a failed base they still get their single honest
+    evaluation so the detail lands in the report (the same convention the settle window
+    applies to a failed-steps postcondition). `detail["checks"]` appears only when the
+    gate declares checks — a bare gate's detail is byte-identical to before."""
+    ok, detail = await _evaluate_base_gate(
+        gate, steps_ok=steps_ok, page=page, requests_window=requests_window,
+        downloads_window=downloads_window)
+    if gate.checks:
+        results = await evaluate_checks(page, requests_window, gate.checks, poll=ok)
+        detail["checks"] = results
+        ok = ok and all(r["ok"] for r in results)
+    return ok, detail
+
+
+def _check_failure_reason(detail: dict[str, Any]) -> str | None:
+    """The first failing declared check as a one-line human verdict, or None. This is
+    what a segment's error should lead with — the deterministic reason, not the agent's
+    happy final text."""
+    for r in detail.get("checks") or []:
+        if not r.get("ok"):
+            why = r.get("error") or "not satisfied"
+            if r.get("evidence"):
+                why = f"{why} [{r['evidence']}]"
+            return f'deterministic check failed: {r["kind"]} "{r["arg"]}" — {why}'
+    return None
+
+
+async def _evaluate_base_gate(
+    gate: Gate, *, steps_ok: bool, page: Page | None,
+    requests_window: list[dict[str, Any]],
+    downloads_window: list[str] | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Evaluate a gate's BASE kind. Returns (ok, detail).
 
     kind == "marker" is authoritative: the segment passed iff its network window carries a
     successful create-write to the marker — exactly the whole-task ground-truth rule, scoped
@@ -768,7 +832,8 @@ class HybridSession:
             downloads_window=seg.downloads,
         )
         if steps_ok and not seg.ok:
-            seg.error = seg.error or f"segment gate failed: {seg.gate}"
+            seg.error = (seg.error or _check_failure_reason(seg.gate)
+                         or f"segment gate failed: {seg.gate}")
         seg.duration_seconds = (datetime.now() - started).total_seconds()
         return seg
 
@@ -830,11 +895,14 @@ class HybridSession:
         if not seg.ok:
             if steps_ok:
                 # The agent believed it succeeded but the gate disagreed: surface the gate
-                # verdict, not the agent's happy final text.
-                seg.error = (f"gate failed: {seg.gate} "
+                # verdict — leading with the deterministic check reason when one failed —
+                # not the agent's happy final text.
+                core = _check_failure_reason(seg.gate) or f"gate failed: {seg.gate}"
+                seg.error = (f"{core} "
                              f"(agent claimed success: {history.final_result()!r})")
             else:
-                seg.error = history.final_result() or f"segment gate failed: {seg.gate}"
+                seg.error = (history.final_result() or _check_failure_reason(seg.gate)
+                             or f"segment gate failed: {seg.gate}")
         else:
             # The segment's distilled observation, carried into later segments' context.
             final = " ".join(str(history.final_result() or "").split())

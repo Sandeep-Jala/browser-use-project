@@ -347,6 +347,12 @@ def _render_subtasks(subtasks: list[dict[str, Any]] | None) -> str:
                  f"{_esc((s.get('prompt') or '')[:120])}<br>"
                  f"<span style='color:var(--text-muted)'>{_esc(detail)}</span></span>"
                  f"<span class='badge' style='{badge}'>{label}</span></div>")
+        for c in gate.get("checks") or []:
+            mark = "✓" if c.get("ok") else "✗"
+            why = (c.get("evidence") if c.get("ok")
+                   else c.get("error") or c.get("evidence") or "not satisfied")
+            line = f"{mark} {c.get('kind')} \"{c.get('arg')}\" — {why}"
+            p.append(f"<div class='obs-reason'><code>{_esc(line[:300])}</code></div>")
         if s.get("error"):
             p.append(f"<div class='obs-reason'><code>{_esc(str(s['error'])[:300])}</code></div>")
         p.append("</div>")

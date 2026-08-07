@@ -1227,3 +1227,128 @@ def test_segment_gate_resolution():
     # Same end context as start (a fill segment) -> steps floor.
     assert segment_gate(sub_plain, {"end_context": "/a"}, "/a").kind == "steps"
     assert segment_gate(sub_plain, None, "/a").kind == "steps"
+
+
+# ------------------------------- unit: declared checks on gates -------------------------------
+
+
+def test_segment_gate_attaches_declared_checks_to_any_kind():
+    from automation.pipeline.checks import Check
+
+    verify = (Check(kind="url_contains", arg="payroll"),)
+    plain = Subtask(index=0, template_prompt="open payroll", verify=verify)
+    gate = segment_gate(plain, None, "/a")
+    assert gate.kind == "steps" and gate.checks == verify
+
+    saver = Subtask(index=0, template_prompt="save it", marker="Invoices", verify=verify)
+    gate = segment_gate(saver, None, "/a")
+    assert gate.kind == "marker" and gate.checks == verify
+
+    bare = Subtask(index=0, template_prompt="open payroll")
+    assert segment_gate(bare, None, "/a").checks == ()
+
+
+async def test_checks_demote_passing_steps_gate(monkeypatch):
+    from automation.pipeline import checks as ck
+    from automation.pipeline.checks import Check
+
+    monkeypatch.setattr(ck, "_CHECK_POLL_S", 0.01)
+    gate = Gate(kind="steps",
+                checks=(Check(kind="url_contains", arg="payroll", timeout_s=0.05),))
+    page = SimpleNamespace(url="http://app/dashboard")
+    ok, detail = await evaluate_gate(gate, steps_ok=True, page=page, requests_window=[])
+    assert ok is False
+    assert detail["kind"] == "steps"
+    [c] = detail["checks"]
+    assert c["ok"] is False and c["kind"] == "url_contains"
+
+
+async def test_checks_never_resurrect_failed_base():
+    from automation.pipeline.checks import Check
+
+    gate = Gate(kind="steps", checks=(Check(kind="url_contains", arg="payroll"),))
+    page = SimpleNamespace(url="http://app/payroll")
+    ok, detail = await evaluate_gate(gate, steps_ok=False, page=page, requests_window=[])
+    assert ok is False
+    [c] = detail["checks"]
+    assert c["ok"] is True  # evaluated once so the report still shows the detail
+
+
+async def test_checks_demote_authoritative_marker_gate(monkeypatch):
+    from automation.pipeline import checks as ck
+    from automation.pipeline.checks import Check
+
+    monkeypatch.setattr(ck, "_CHECK_POLL_S", 0.01)
+    gate = Gate(kind="marker", marker="Invoices",
+                checks=(Check(kind="write_accepted", arg="Payments", timeout_s=0.05),))
+    hit = [{"method": "POST", "url": "http://api/Invoices/create", "status": 201,
+            "step": 3}]
+    ok, detail = await evaluate_gate(gate, steps_ok=True, page=None, requests_window=hit)
+    assert ok is False
+    assert detail["create_write_seen"] is True  # base verdict still recorded
+
+
+async def test_checks_single_shot_when_base_failed():
+    from automation.pipeline.checks import Check
+
+    calls: list[str] = []
+
+    class Probe:
+        url = "http://x"
+
+        async def evaluate(self, expr):
+            calls.append(expr)
+            return {"count": 0}
+
+    gate = Gate(kind="steps",
+                checks=(Check(kind="text_visible", arg="Ghost", timeout_s=5),))
+    ok, _ = await evaluate_gate(gate, steps_ok=False, page=Probe(), requests_window=[])
+    assert ok is False and len(calls) == 1
+
+
+def test_describe_expected_end_mentions_checks():
+    from automation.pipeline.checks import Check
+
+    gate = Gate(kind="steps", checks=(Check(kind="write_accepted", arg="Employees"),
+                                      Check(kind="text_visible", arg="Alistair Allan")))
+    text = hybrid._describe_expected_end(gate)
+    assert 'an accepted write to "Employees"' in text
+    assert '"Alistair Allan"' in text
+
+    postcond = Gate(kind="postcondition", postcondition={"url_contains": "payrun"},
+                    checks=(Check(kind="url_contains", arg="payroll"),))
+    both = hybrid._describe_expected_end(postcond)
+    assert 'the page URL contains "payrun"' in both and '"payroll"' in both
+
+    bare = Gate(kind="steps")
+    assert hybrid._describe_expected_end(bare) is None
+
+
+def test_check_failure_reason_names_first_failure():
+    detail = {"kind": "steps", "checks": [
+        {"kind": "url_contains", "arg": "payroll", "ok": True,
+         "evidence": "http://app/payroll", "error": None},
+        {"kind": "write_accepted", "arg": "FPS", "ok": False, "evidence": None,
+         "error": 'no accepted create-write matching "FPS" in this segment\'s traffic'},
+    ]}
+    reason = hybrid._check_failure_reason(detail)
+    assert reason.startswith('deterministic check failed: write_accepted "FPS"')
+    assert "no accepted" in reason
+    assert hybrid._check_failure_reason({"kind": "steps"}) is None
+
+
+def test_report_renders_check_verdicts():
+    from automation.pipeline import report
+
+    html = report._render_subtasks([{
+        "index": 0, "prompt": "add employee", "mode": "authored", "ok": False,
+        "steps_executed": 5, "duration_seconds": 3.2,
+        "gate": {"kind": "steps", "checks": [
+            {"kind": "write_accepted", "arg": "Employees", "ok": True,
+             "evidence": "POST /api/Employees → 200", "error": None},
+            {"kind": "text_visible", "arg": "Alistair", "ok": False,
+             "evidence": None, "error": "not found"},
+        ]},
+    }])
+    assert "write_accepted" in html and "text_visible" in html
+    assert "POST /api/Employees" in html and "not found" in html
