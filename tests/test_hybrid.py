@@ -130,7 +130,7 @@ class FakeSession:
         gt = None
         if parent_marker:
             gt = {"marker": parent_marker, "create_write_seen": self.create_write_seen,
-                  "write_step": None, "overrode_success": False}
+                  "write_step": None}
         return _skeleton_result(ground_truth=gt)
 
 

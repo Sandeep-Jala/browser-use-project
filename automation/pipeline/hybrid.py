@@ -790,7 +790,6 @@ class HybridSession:
                 "marker": parent_marker,
                 "create_write_seen": write is not None,
                 "write_step": write.get("step") if write else None,
-                "overrode_success": False,
             }
         return RunResult(
             task=task, run_id=self.run_id, artifacts_dir=self.run_dir,

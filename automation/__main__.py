@@ -192,9 +192,7 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
             gt = result.ground_truth or {}
             if gt:
                 print(f"   ground truth: create-write to '{gt.get('marker')}' seen in network: "
-                      f"{gt.get('create_write_seen')}"
-                      + ("  (self-reported success OVERRIDDEN → FAIL)"
-                         if gt.get("overrode_success") else ""))
+                      f"{gt.get('create_write_seen')}")
             if result.usage:
                 print(f"   tokens: {result.usage.get('total_tokens')}  "
                       f"cost=${result.usage.get('total_cost', 0):.4f}")

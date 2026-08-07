@@ -375,7 +375,7 @@ class Runner:
         `request_offset` windows the save probe to requests captured from that index on, so
         a mid-task segment doesn't credit a create-write an earlier segment fired.
 
-        Returns {"history", "screenshots", "steps", "usage"}.
+        Returns {"history", "usage"}.
         """
         if self.available_files:
             agent_task += _workspace_files_note(self.available_files)
@@ -659,34 +659,6 @@ class Runner:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("could not save recording: %s", exc)
 
-        # Per-step screenshots browser-use already captured for its own history (it grabs one
-        # every step regardless of use_vision), aligned to steps. Cheaper + better-aligned
-        # than taking our own.
-        screenshots: list[str | None] = []
-        try:
-            screenshots = history.screenshots(return_none_if_not_screenshot=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("could not read screenshots from history: %s", exc)
-
-        # Per-step progress timeline from the agent's own reasoning (no extra LLM call): each
-        # step's goal + its evaluation of the prior step, so the report shows what the agent
-        # was doing at every step and exactly where it ended up.
-        steps: list[dict[str, Any]] = []
-        try:
-            thoughts = history.model_thoughts()
-            urls = history.urls()
-            for i, brain in enumerate(thoughts):
-                steps.append(
-                    {
-                        "n": i + 1,
-                        "evaluation": getattr(brain, "evaluation_previous_goal", None),
-                        "next_goal": getattr(brain, "next_goal", None),
-                        "url": urls[i] if i < len(urls) else None,
-                    }
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("could not build step timeline from history: %s", exc)
-
         # LLM token usage + cost for the run (browser-use computes this into history.usage).
         usage: dict[str, Any] | None = None
         try:
@@ -698,8 +670,6 @@ class Runner:
 
         return {
             "history": history,
-            "screenshots": screenshots,
-            "steps": steps,
             "usage": usage,
         }
 

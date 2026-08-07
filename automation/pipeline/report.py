@@ -194,8 +194,6 @@ def _render_html(result: "RunResult") -> str:
     p.append(f"<div class='detail-label'>Run ID</div><div class='detail-val'>{_esc(result.run_id)}</div>")
     p.append(f"<div class='detail-label'>Status</div><div class='detail-val'>{status} "
              f"(done={result.is_done}, success={result.is_successful})</div>")
-    final_url = result.urls[-1] if result.urls else None
-    p.append(f"<div class='detail-label'>Final URL</div><div class='detail-val'>{_esc(final_url)}</div>")
     if usage:
         tokens_detail = (
             f"{usage.get('total_tokens', 0):,} total — "
@@ -232,14 +230,9 @@ def _render_html(result: "RunResult") -> str:
     # ---- UI & Accessibility scans (detect_layout_issues / run_accessibility_scan) ----
     p.append(_render_ui_scans(result.extracted_content))
 
-    # ---- Agent steps (per-step progress timeline) ----
-    p.append(_render_steps(result.steps, result.model_actions, result.n_steps))
-
     # ---- Run video (--record) ----
     p.append(_render_video(result))
 
-    # ---- Screenshots gallery ----
-    p.append(_render_screenshots(result.screenshots))
 
     # ---- Console logs ----
     p.append(_render_console(con))
@@ -278,15 +271,13 @@ def _render_html(result: "RunResult") -> str:
 def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
     """Render the network ground-truth check: was the record actually saved?
 
-    This is the objective counterweight to the agent's self-report and the LLM judge (both of
-    which can be fooled). When a create-write was expected but never hit the network, it flags
-    that the reported success was overridden to failure.
+    This is the objective counterweight to the agent's self-report (which can be fooled):
+    when a marker is configured, the run verdict itself requires this create-write.
     """
     if not ground_truth:
         return ""
     marker = ground_truth.get("marker")
     seen = ground_truth.get("create_write_seen")
-    overrode = ground_truth.get("overrode_success")
     if seen:
         icon, color, label, badge = "check", "var(--success)", "SAVED", "background:var(--success);color:#fff"
     else:
@@ -302,11 +293,7 @@ def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
         f"<span class='obs-title'>Create-write to <code>{_esc(marker)}</code> seen in network</span>"
         f"<span class='badge' style='{badge}'>{label}</span></div>"
     )
-    if overrode:
-        p.append("<div class='obs-reason'><em>Note:</em> the run reported success but no matching "
-                 "create-write was sent — nothing was actually saved. <em>Reported success was "
-                 "overridden to FAIL.</em></div>")
-    elif not seen:
+    if not seen:
         p.append("<div class='obs-reason'>No matching create-write was sent during this run.</div>")
     p.append("</div></div></div>")
     return "".join(p)
@@ -497,47 +484,6 @@ def _render_a11y_block(text: str) -> str:
     return "".join(p)
 
 
-def _render_steps(
-    steps: list[dict[str, Any]], model_actions: list[dict[str, Any]] | None, n_steps: int
-) -> str:
-    """Per-step progress timeline (the agent's own goal/eval per step). Falls back to the raw
-    action list if the timeline is unavailable."""
-    reached = len(steps) or n_steps
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons'>list</span> Agent Steps "
-             f"<span class='muted' style='font-weight:400; font-size:0.85rem'>"
-             f"(reached step {reached} of {n_steps})</span></div>")
-    if steps:
-        last = len(steps)
-        p.append("<div class='steps-table'>")
-        for s in steps:
-            n = s.get("n")
-            border = "border-left:3px solid var(--primary);" if n == last else ""
-            p.append(
-                f"<div class='step-row' style='align-items:start; {border}'>"
-                f"<div class='step-num'>#{_esc(n)}</div><div class='step-desc'>"
-                f"{_esc(s.get('next_goal') or '(no goal recorded)')}"
-            )
-            if s.get("evaluation"):
-                p.append(f"<div class='muted' style='font-size:0.78rem; margin-top:3px;'>"
-                         f"<em>eval:</em> {_esc(s.get('evaluation'))}</div>")
-            if s.get("url"):
-                p.append(f"<div class='req-url' style='margin-top:3px;'>{_esc(s.get('url'))}</div>")
-            p.append("</div></div>")
-        p.append("</div>")
-    elif model_actions:
-        p.append("<div class='steps-table'>")
-        for i, a in enumerate(model_actions, 1):
-            p.append(f"<div class='step-row'><div class='step-num'>#{i}</div>"
-                     f"<div class='step-desc'>{_esc(_action_label(a))}</div></div>")
-        p.append("</div>")
-    else:
-        p.append("<div class='result-box muted'>No steps recorded.</div>")
-    p.append("</div>")
-    return "".join(p)
-
-
 def _render_video(result: "RunResult") -> str:
     """Player for the run's .mp4 (--record), or "" when the run wasn't recorded.
 
@@ -556,27 +502,6 @@ def _render_video(result: "RunResult") -> str:
         "style='width:100%; max-width:1100px; border-radius:8px; background:#000'>"
         "</video></div>"
     )
-
-
-def _render_screenshots(screenshots: list[str | None]) -> str:
-    shots = [(i + 1, s) for i, s in enumerate(screenshots) if s]
-    if not shots:
-        return ""
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>photo_camera</span>"
-             f" Screenshots <span class='muted' style='font-weight:400; font-size:0.85rem'>"
-             f"({len(shots)} captured)</span></div><div class='gallery'>")
-    for step, b64 in shots:
-        src = b64 if str(b64).startswith("data:") else f"data:image/png;base64,{b64}"
-        cap = f"Step {step}"
-        p.append(
-            f"<div class='shot-card' onclick='openShot(this)' data-cap='{cap}'>"
-            f"<img src='{src}' alt='{cap}' loading='lazy'>"
-            f"<div class='cap'>{cap}</div></div>"
-        )
-    p.append("</div></div>")
-    return "".join(p)
 
 
 def _render_console(con: dict[str, Any]) -> str:
@@ -677,16 +602,3 @@ def _render_network(net: dict[str, Any]) -> str:
     return "".join(p)
 
 
-def _action_label(action: dict[str, Any]) -> str:
-    """Turn a model action dict into a short readable label."""
-    if not isinstance(action, dict):
-        return str(action)
-    # actions look like {"<action_name>": {..params..}, "interacted_element": ...}
-    for key, val in action.items():
-        if key == "interacted_element":
-            continue
-        params = ""
-        if isinstance(val, dict):
-            params = ", ".join(f"{k}={v}" for k, v in val.items() if k != "interacted_element")
-        return f"{key}: {params}" if params else str(key)
-    return str(action)
