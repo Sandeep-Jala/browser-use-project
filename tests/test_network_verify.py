@@ -319,3 +319,99 @@ def test_with_write_outcome_merges_not_replaces():
     assert agent_tools._with_write_outcome(None, None) is None
     assert agent_tools._with_write_outcome({"x": 1}, None) == {"x": 1}
     assert agent_tools._with_write_outcome(None, outcome) == {"write_outcome": outcome}
+
+
+# ---------------- fail_and_stop contradiction bounce + toggle doubt suppression ----------------
+# Run 20260807_164137 seg2: the Save receipt said "the write above SUCCEEDED: do NOT redo"
+# and the agent called fail_and_stop one step later claiming nothing was saved. The bounce
+# refuses that ONCE per segment; toggle clicks stop receiving save/submit doubt language
+# (step 13's switch click primed the false "form is broken" narrative).
+
+
+def _accepted_business_write():
+    return _write_snapshot(
+        body=_MAY_BODY,
+        url="https://api.app/Payroll/Clients/6a/Employees/?yearId=27")
+
+
+async def test_fail_and_stop_bounces_once_on_accepted_segment_write():
+    agent_tools.set_live_network(_FakeLiveNetwork([_accepted_business_write()]))
+    try:
+        first = await agent_tools._fail_and_stop_result("employee not created")
+        assert first.error and "REFUSED" in first.error
+        assert "/Employees/" in first.error and "200" in first.error
+        assert not first.is_done
+        second = await agent_tools._fail_and_stop_result("employee not created")
+        assert second.is_done is True and second.success is False
+    finally:
+        agent_tools.clear_live_network()
+
+
+async def test_fail_and_stop_ignores_infra_writes():
+    infra = _write_snapshot(url="https://api.app/auth/webpush")
+    agent_tools.set_live_network(_FakeLiveNetwork([infra]))
+    try:
+        res = await agent_tools._fail_and_stop_result("nothing worked")
+        assert res.is_done is True and res.success is False
+    finally:
+        agent_tools.clear_live_network()
+
+
+async def test_fail_and_stop_ignores_refused_and_unsettled_writes():
+    refused = _write_snapshot(body=_APRIL_BODY)
+    inflight = _write_snapshot(status=None, settled=False)
+    agent_tools.set_live_network(_FakeLiveNetwork([refused, inflight]))
+    try:
+        res = await agent_tools._fail_and_stop_result("blocked")
+        assert res.is_done is True and res.success is False
+    finally:
+        agent_tools.clear_live_network()
+
+
+async def test_fail_and_stop_without_collector_passes_through():
+    agent_tools.clear_live_network()
+    res = await agent_tools._fail_and_stop_result("cannot proceed")
+    assert res.is_done is True and res.success is False
+
+
+async def test_fail_and_stop_bounce_resets_per_segment():
+    agent_tools.set_live_network(_FakeLiveNetwork([_accepted_business_write()]))
+    try:
+        first = await agent_tools._fail_and_stop_result("claim A")
+        assert first.error and "REFUSED" in first.error
+        # New segment: the guard re-arms.
+        agent_tools.set_live_network(_FakeLiveNetwork([_accepted_business_write()]))
+        again = await agent_tools._fail_and_stop_result("claim B")
+        assert again.error and "REFUSED" in again.error
+    finally:
+        agent_tools.clear_live_network()
+
+
+async def test_toggle_click_in_dialog_gets_no_save_doubt(monkeypatch):
+    _speed(monkeypatch)
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": True, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _FakeLiveNetwork([]))
+    toggle = _FakeDomNode("Student Loan", attributes={"role": "switch"})
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: toggle}))
+    msg = res.extracted_content
+    assert "no write request followed" not in msg
+    assert "likely did NOT go through" not in msg
+    assert "STILL OPEN" not in msg
+
+
+async def test_toggle_click_that_fires_write_keeps_receipt(monkeypatch):
+    _speed(monkeypatch)
+    _dialog_states(monkeypatch, {"in_dialog": True, "open": 1},
+                   {"in_dialog": True, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK",
+                        _FakeLiveNetwork([_write_snapshot(body=_MAY_BODY)]))
+    toggle = _FakeDomNode("Auto enrol", attributes={"role": "switch"})
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: toggle}))
+    msg = res.extracted_content
+    assert "POST" in msg and "200" in msg
+    assert (res.metadata or {}).get("write_outcome", {}).get("accepted") is True

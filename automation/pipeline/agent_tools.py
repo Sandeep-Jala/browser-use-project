@@ -1060,6 +1060,8 @@ _DIALOG_SETTLE_S = 0.8
 # NO write says exactly that (the swallowed-save flag).
 
 _LIVE_NETWORK: Any = None
+_SEGMENT_T0: float = 0.0  # monotonic segment start (stamped with the collector)
+_FAIL_BOUNCED = False     # fail_and_stop's contradiction bounce fired this segment
 _WRITE_SNIFF_S = 1.0     # window (from click dispatch) for a triggered write to START
 _WRITE_SETTLE_S = 8.0    # cap on waiting for started writes to finish (matches the
                          # end-of-run in-flight-save poll)
@@ -1067,14 +1069,85 @@ _BODY_POLL_S = 1.0       # extra grace for the async body capture after settle
 
 
 def set_live_network(collector: Any) -> None:
-    """Register the run's live NetworkCollector for click receipts (runner-owned)."""
-    global _LIVE_NETWORK
+    """Register the run's live NetworkCollector for click receipts (runner-owned).
+    Marks the segment start, which windows the fail_and_stop contradiction bounce and
+    re-arms it (once per segment)."""
+    global _LIVE_NETWORK, _SEGMENT_T0, _FAIL_BOUNCED
     _LIVE_NETWORK = collector
+    _SEGMENT_T0 = time.monotonic()
+    _FAIL_BOUNCED = False
 
 
 def clear_live_network() -> None:
-    global _LIVE_NETWORK
+    global _LIVE_NETWORK, _FAIL_BOUNCED
     _LIVE_NETWORK = None
+    _FAIL_BOUNCED = False
+
+
+# Writes the app's infrastructure fires constantly (push auth, SignalR negotiate, token
+# refresh, keep-alives) — never evidence that USER work landed, so the fail_and_stop
+# bounce must ignore them (observed live: /auth/webpush POSTs in every segment).
+_INFRA_WRITE_RE = re.compile(r"/auth/|negotiate|token|keepalive|telemetry", re.I)
+
+
+def _segment_accepted_write() -> dict[str, Any] | None:
+    """The first accepted BUSINESS write of the current segment, or None: settled 2xx,
+    non-negative body verdict, not infra traffic. Read from the live collector at call
+    time so a write that settled after its click's receipt still counts."""
+    if _LIVE_NETWORK is None:
+        return None
+    try:
+        writes = _LIVE_NETWORK.writes_since(_SEGMENT_T0)
+    except Exception:  # noqa: BLE001 - the bounce is best-effort, never a crash source
+        return None
+    for w in writes:
+        record = w.get("record") or {}
+        if _INFRA_WRITE_RE.search(str(record.get("url") or "")):
+            continue
+        if record.get("failed") or not w.get("settled"):
+            continue
+        status = record.get("status")
+        if not (isinstance(status, int) and 200 <= status < 300):
+            continue
+        verdict = _write_verdict(record)
+        if verdict is not None and verdict[0]:
+            continue
+        return record
+    return None
+
+
+async def _fail_and_stop_result(reason: str) -> ActionResult:
+    """fail_and_stop's body, with the contradiction bounce: a failure claim made in a
+    segment whose OWN traffic carries an accepted business write is refused ONCE, citing
+    the receipt (run 20260807_164137: the Save receipt said "the write above SUCCEEDED —
+    do NOT redo" and the agent declared "new employee not created" one step later). The
+    second call always goes through — honest failures (saved-but-wrong, later objectives
+    unreachable) stay possible."""
+    global _FAIL_BOUNCED
+    if not _FAIL_BOUNCED:
+        accepted = _segment_accepted_write()
+        if accepted is not None:
+            _FAIL_BOUNCED = True
+            msg = (
+                "fail_and_stop REFUSED (once): your failure claim contradicts this "
+                f"segment's own receipt — {_format_write({'record': accepted})}. The "
+                "record/change likely EXISTS and the app may simply have navigated "
+                "after the save. Re-read the page and continue from what it actually "
+                "shows; call fail_and_stop again ONLY if you have evidence that "
+                "contradicts the receipt (the record is genuinely absent or wrong "
+                "on re-check)."
+            )
+            logger.info("■ fail_and_stop bounced (claim was: %s)", reason[:120])
+            return ActionResult(error=msg, metadata={"refused_stop": True})
+    logger.info("■ fail_and_stop: %s", reason)
+    return ActionResult(
+        is_done=True,
+        success=False,
+        error=reason,
+        extracted_content=f"Run failed and stopped: {reason}",
+        long_term_memory=f"Run failed and stopped: {reason}",
+        include_in_memory=True,
+    )
 
 
 def _write_verdict(record: dict[str, Any]) -> tuple[bool, str] | None:
@@ -1291,6 +1364,24 @@ async def _dialog_closed(browser_session, pre: dict[str, Any],
     return post["open"] < pre["open"]
 
 
+_TOGGLE_ROLES = ("switch", "checkbox", "radio", "menuitemcheckbox", "menuitemradio")
+
+
+def _is_toggle_control(node: Any) -> bool:
+    """Toggle-family controls never fire the write their click is 'for', so the in-dialog
+    save/submit doubt advisory on their receipts only primes a false 'form is broken'
+    narrative (run 20260807_164137 step 13: a loan switch got 'likely did NOT go
+    through'). Their receipts stay plain; a toggle that DOES fire a write still gets the
+    normal network receipt."""
+    if node is None:
+        return False
+    attrs = getattr(node, "attributes", None) or {}
+    if str(attrs.get("role") or "").lower() in _TOGGLE_ROLES:
+        return True
+    tag = str(getattr(node, "tag_name", "") or "").lower()
+    return tag == "input" and str(attrs.get("type") or "").lower() in ("checkbox", "radio")
+
+
 def _with_write_outcome(meta: dict[str, Any] | None,
                         outcome: dict[str, Any] | None) -> dict[str, Any] | None:
     """Merge a write_outcome stamp into existing ActionResult metadata WITHOUT replacing
@@ -1303,6 +1394,7 @@ def _with_write_outcome(meta: dict[str, Any] | None,
 
 async def _click_outcome_suffix(browser_session, t0: float,
                                 pre: dict[str, Any] | None,
+                                node: Any = None,
                                 ) -> tuple[str, dict[str, Any] | None]:
     """The NETWORK OUTCOME (write requests fired, with server verdicts) + DIALOG OUTCOME
     receipt suffix for a click dispatched at t0 whose pre-click dialog state was `pre`,
@@ -1312,12 +1404,15 @@ async def _click_outcome_suffix(browser_session, t0: float,
     find_by_text used to fire its POST with no receipt at all (run 20260807_095537 seg6:
     the unreceipted DataRequest create was re-clicked into a duplicate)."""
     in_dialog = bool(isinstance(pre, dict) and pre.get("in_dialog"))
+    # Toggle-family clicks get no save/submit doubt language (see _is_toggle_control) —
+    # neither the no-write flag nor the dialog-closure advisory.
+    advisory = in_dialog and not _is_toggle_control(node)
     suffix, fired, accepted = "", False, False
     if _LIVE_NETWORK is not None:
         text, fired, accepted = await _network_outcome(_LIVE_NETWORK, t0,
-                                                       expect_write=in_dialog)
+                                                       expect_write=advisory)
         suffix += text
-    if in_dialog:
+    if advisory:
         closed = await _dialog_closed(browser_session, pre, fired)
         if closed is True:
             if accepted:
@@ -1375,7 +1470,7 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
     if res is None or getattr(res, "error", None) \
             or not getattr(res, "extracted_content", None):
         return res
-    suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre)
+    suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre, node)
     if not suffix and outcome is None:
         return res
     update: dict[str, Any] = {"extracted_content": res.extracted_content + suffix}
@@ -1639,15 +1734,7 @@ def build_tools() -> Tools:
         "the next phase or the done condition depends on it. Pass a short reason."
     )
     async def fail_and_stop(reason: str) -> ActionResult:
-        logger.info("■ fail_and_stop: %s", reason)
-        return ActionResult(
-            is_done=True,
-            success=False,
-            error=reason,
-            extracted_content=f"Run failed and stopped: {reason}",
-            long_term_memory=f"Run failed and stopped: {reason}",
-            include_in_memory=True,
-        )
+        return await _fail_and_stop_result(reason)
 
     @tools.action(
         "Scroll for discovery, capped at 0.5 pages per call (values above 0.5 are clamped). "
@@ -1910,7 +1997,7 @@ def build_tools() -> Tools:
             # Same network+dialog receipts as the click override: a Save clicked through
             # find_by_text fired its POST invisibly (run 20260807_095537 seg6) and the
             # agent, seeing nothing, clicked Save again — a duplicate create.
-            suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre)
+            suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre, node)
             meta = _with_write_outcome(meta, outcome)
             msg = (f"find_by_text('{query}'): clicked the single match "
                    f"{_line(idx, node, label)}" + suffix)
