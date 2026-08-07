@@ -834,6 +834,13 @@ _COMPOSED_WALK_JS = """\
     };
 """
 
+def _query_tokens(s: str) -> list[str]:
+    """A query in the raw finders' token form: lowercased, split on non-alphanumerics.
+    ONE tokenizer for authoring probes, replay re-finds, and gate checks — it must stay
+    in lockstep with the JS-side norm()/toks() in the probes below."""
+    return [t for t in re.split(r"[^a-z0-9]+", str(s).lower()) if t]
+
+
 # The raw-DOM find+click algorithm, SHARED between find_by_text (authoring, agent_tools)
 # and the `find_click` replay step: token match over title/aria-label/name/text plus child
 # icon hints, ranked visible-first then by NAME SPECIFICITY (exact > word-aligned prefix >
@@ -1837,7 +1844,7 @@ async def _find_click(page: Page, text: str, verify_name: bool = False) -> str:
     hints legitimately click elements not named by the query)."""
     import json as _json
 
-    tokens = [t for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
+    tokens = _query_tokens(text)
     if not tokens:
         raise RuntimeError(f"find_click: no searchable text in {text!r}")
     expr = RAW_FIND_JS % (_json.dumps(tokens), "true")
@@ -1918,7 +1925,7 @@ async def _extract_value(page: Page, step: dict[str, Any], timeout_ms: int
     if not value and step.get("query"):
         import json as _json
 
-        tokens = [t for t in re.split(r"[^a-z0-9]+", str(step["query"]).lower()) if t]
+        tokens = _query_tokens(step["query"])
         if tokens:
             raw = await page.evaluate(RAW_FIND_JS % (_json.dumps(tokens), "false"))
             if not (raw and not raw.get("error") and raw.get("count")):
