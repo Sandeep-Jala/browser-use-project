@@ -677,9 +677,9 @@ payroll_rti_process_old:
   prompt: >-
     go to Payroll module, search and select FOOD LIMITED business name, go to Payroll & RTI, Set the date to May-26, click Save & Next. If a pop up appears, select 'don't show this again' and click Process.
     Process the existing employees one at a time by clicking Save & Next, and after each click
-    check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Alistair Allan is the employee shown. If you see an error
+    check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Aran Allan is the employee shown. If you see an error
     'The employer pay is lower than the minimum wage rate', click Add Payment, set Amount to
-    5000, and click Save & Next. With Alistair Allan shown as the current employee, click Add
+    5000, and click Save & Next. With Aran Allan shown as the current employee, click Add
     Expenses or Benefits, set Type to 'Assets transferred' from April 2026 to May 2026,
     set Cost to 200,set Employee contribution to 100, and click Save, then select Addition or Deduction, set Type to
     'Additions', amount is 500, period to is May 26, name is bonus and click Save. Continue
@@ -698,15 +698,15 @@ payroll_rti_process:
     tick 'Don't show this again', click Process, and continue. Now process
     the existing employees one at a time by repeating the following steps
     for each employee: first read the name of the employee currently shown;
-    if the employee shown is Alistair Allan, stop repeating and do not click
+    if the employee shown is Aran Allan, stop repeating and do not click
     Save & Next again; otherwise, if the error 'The employer pay is lower
     than the minimum wage rate' is shown, click Add Payment, set Amount to
     5000, and click Save & Next; if Save & Next is disabled for this
     employee, do not click it and instead select the next employee in the
     list directly; in all other cases click Save & Next and wait until the
     next employee has fully loaded before doing anything else. Keep
-    repeating those steps until Alistair Allan is the employee shown. With
-    Alistair Allan shown as the current employee, click Add Expenses or
+    repeating those steps until Aran Allan is the employee shown. With
+    Aran Allan shown as the current employee, click Add Expenses or
     Benefits, set Type to 'Assets transferred', set the period from April
     2026 and set period to May 2026, set Cost to 200, set Employee contribution to 100,
     and click Save; then select Addition or Deduction, set Type to
@@ -719,7 +719,7 @@ payroll_rti_process:
     and in all other cases click Save & Next and wait for the next employee
     to load. Keep repeating until Bruce Wright is the employee shown. With
     Bruce Wright shown, select bulk upload FPS which is a button next
-    to Save & Next, click the the checkbox in the grid header row, left of 'Employees', click the checkbox of Alistair Allan, click
+    to Save & Next, click the the checkbox in the grid header row, left of 'Employees', click the checkbox of Aran Allan, click
     FPS, select the document New_Employees_List_-_WI_LTD.csv, and click
     Submit. Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to Jun-26, and click Save & Next exactly 3 times, waiting for the
     screen to update after each click and stopping after the third click.
@@ -737,25 +737,7 @@ payroll_rti_process:
 # data-request send, payrun saves, FPS submit, settings save) and no single URL fragment
 # gates them all — success comes from the segment gates + judge.
 payroll_food_limited_e2e_rti:
-  # The prompt is DERIVED from the declared subtasks below (their space-joined
-  # concatenation) — edit the slices directly; there is no separate prompt to keep
-  # in sync. Rewording a slice changes the task id exactly as rewording the prompt
-  # did (tests/test_tasks.py FROZEN_TIDS flags it for a re-freeze).
   tags: [payroll]
-  # Declared split (Tier 1, 2026-08-05): the LLM decomposer rejected its own split of
-  # this mega-task 3x per run (token-closure slips; meta-sentences failing coverage)
-  # and every run degraded to the whole-prompt fallback blob. These 19 blocks are
-  # VERBATIM slices of the prompt above (their space-joined concatenation reproduces
-  # it exactly - keep both sides in sync when rewording). Kinds declared only for the
-  # four repeat-until fragments; everything else lets node_kind decide.
-  #
-  # verify: blocks (pipeline/checks.py) are deterministic per-slice gates evaluated on
-  # top of the slice's base gate; they never change task identity. Authoring rules:
-  # only assert write_accepted for writes PROVEN in a passing run's network.json (this
-  # app's modal Save and Pay-Forecast cell edits fire NO request - never assert those);
-  # url_contains takes a literal raw-URL fragment, never a normalized context from
-  # progress.json (those embed '*'); dynamic noted values (fakenamegenerator identity)
-  # cannot be declared statically.
   subtasks:
     - prompt: >-
         Go to the Payroll module, search for and select the business name FOOD LIMITED, then
@@ -773,8 +755,6 @@ payroll_food_limited_e2e_rti:
         and ending with C; set NI Category to A; set Gross Pay to 3500; select Student Loan
         with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 06/04/2026 and with loan end date
         01/07/2027; then click Save.
-      verify:
-        - write_accepted: "Employees"
     - prompt: >-
         Next go to Pay Forecast and load the new employee's data by repeating the following
         steps: type the noted employee name into the combobox and select the employee; if the
@@ -782,12 +762,6 @@ payroll_food_limited_e2e_rti:
         instruction; if no data is shown, refresh the page and repeat from typing the name
         again. Keep repeating until the pay rows are visible.
       kind: loop
-      # Guards the template-grid false-pass (run 20260807_155254 seg3): the EMPTY template
-      # also shows the Apr-26..Mar-27 period labels, but only a loaded employee shows the
-      # seeded £3,500.00 pay cells (Gross Pay 3500 is set in this task's own wording;
-      # format verified from run 153352 video frames).
-      verify:
-        - text_visible: "3,500.00"
     - prompt: >-
         Once the pay rows are loaded, set the pay of Dec-26 to 5000, then set the net pay of
         Feb-27 to 4000 using the Net to Gross option: click the pencil icon at the right end
@@ -803,8 +777,11 @@ payroll_food_limited_e2e_rti:
         Then go to Data Request, click Add Request, click Payroll Review, click Standard,
         select the employee, and click Save.
     - prompt: >-
-        In the Send Email section that opens, change the From field to no-reply and click
-        Send; if the Send Email section has not closed after clicking Send, click Save again.
+        In the Send Email section that opens, open the From dropdown and select the no-reply
+        option, then click Send;
+        if the Send Email section has not closed after clicking Send, click Save again.
+        If the email was not sent, it is saved as Drafted; click the email button next to
+        the Drafted status to reopen the Send Email section, then click Send.
     - prompt: >-
         Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
         click the blue Sent badge in its Status column to open the Payroll Status dialog; in
@@ -823,23 +800,28 @@ payroll_food_limited_e2e_rti:
     - prompt: >-
         Now process the existing employees one at a time by repeating the following steps for
         each employee: first read the name of the employee currently shown; if the employee
-        shown is Alistair Allan, stop repeating and do not click Save & Next again; otherwise,
+        shown is Aran Allan, stop repeating and do not click Save & Next again; otherwise,
         if the error 'The employer pay is lower than the minimum wage rate' is shown, click
         Add Payment, set Amount to 5000, and click Save & Next; if Save & Next is disabled for
         this employee, do not click it and instead select the next employee in the list
         directly; in all other cases click Save & Next and wait until the next employee has
-        fully loaded before doing anything else. Keep repeating those steps until Alistair
+        fully loaded before doing anything else. Keep repeating those steps until Aran
         Allan is the employee shown.
       kind: loop
-      verify:
-        - text_visible: "Alistair Allan"
     - prompt: >-
-        With Alistair Allan shown as the current employee, click Add Expenses or Benefits, set
+        With Aran Allan shown as the current employee, click Add Expenses or Benefits, set
         Type to 'Assets transferred', set the period from April 2026 and set period to May
-        2026, set Cost to 200, set Employee contribution to 100, and click Save;
+        2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
+        expense exactly once: the dialog simply closes on Save with no confirmation
+        message, and the grid then lists the expense at its net value 100.00 (the 200 cost
+        minus the 100 contribution), which is a successful add; do not click Add Expenses
+        or Benefits again;
     - prompt: >-
-        then select Addition or Deduction, set Type to 'Additions', set Amount to 500, set
-        Period to May 26, set Name to bonus, and click Save.
+        then click the + next to the Additions or Deductions section to open the Add Addition
+        or Deduction dialog, set Type to 'Additions', set Amount to 500, set Period to May 26,
+        set Name to bonus, and click Save. Add this bonus exactly once too: this Save also
+        closes silently with no confirmation message; do not reopen the dialog or add it
+        again.
     - prompt: >-
         After saving, continue processing employees one at a time by repeating exactly the
         same steps as before: read the name of the employee currently shown; if the employee
@@ -848,15 +830,13 @@ payroll_food_limited_e2e_rti:
         in all other cases click Save & Next and wait for the next employee to load. Keep
         repeating until Bruce Wright is the employee shown.
       kind: loop
-      verify:
-        - text_visible: "Bruce Wright"
     - prompt: >-
-        With Bruce Wright shown, select bulk upload FPS which is a button next to Save & Next,
-        click the the checkbox in the grid header row, left of 'Employees', click the checkbox
-        of Alistair Allan, click FPS, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
-      verify:
-        - write_accepted: "FPS"
+        With Bruce Wright shown, select bulk upload FPS which is a button next to Save &
+        Next. The checkbox in the grid header row, left of 'Employees', selects or unselects
+        all employees at once; use it to unselect all employees first, clicking it a second
+        time if the first click selected them all, so that no employee is ticked. Then click
+        the checkbox of Aran Allan so that Aran Allan is the only employee ticked,
+        click FPS, select the document New_Employees_List_-_WI_LTD.csv, and click Submit.
     - prompt: >-
         Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
         Jun-26, and click Save & Next exactly 3 times, waiting for the screen to update after

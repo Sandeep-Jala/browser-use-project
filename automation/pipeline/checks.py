@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -212,3 +213,78 @@ def receipt_rollup(history: Any, requests_window: list[dict[str, Any]],
                     "receipts contradict success: the segment's final write was not "
                     f"accepted and nothing accepted followed it{why}")
     return (not reasons), reasons
+
+
+# Infrastructure traffic the window write rule must never judge: push registration,
+# token refresh, and SignalR handshakes fire on their own schedule and say nothing
+# about whether the SEGMENT's work was saved.
+_NOISE_WRITE_FRAGMENTS = ("/auth/", "/oauth/", "webpush", "negotiate", "/hubs/")
+
+# Deterministic save-cue for the report-only warning (never for gating): fixed word
+# stems, word-boundary matched, no LLM.
+_SAVE_CUE_RE = re.compile(
+    r"\b(?:sav(?:e|es|ed|ing)|submit(?:s|ted|ting)?|send(?:s|ing)?|sent|"
+    r"creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|upload(?:s|ed|ing)?|"
+    r"delet(?:e|es|ed|ing)|updat(?:e|es|ed|ing))\b", re.IGNORECASE)
+
+
+def business_writes(requests_window: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The window's write requests that belong to the app itself — POST/PUT/PATCH
+    minus infrastructure noise (see _NOISE_WRITE_FRAGMENTS)."""
+    out: list[dict[str, Any]] = []
+    for r in requests_window:
+        if r.get("method") not in ("POST", "PUT", "PATCH"):
+            continue
+        url = str(r.get("url", "")).lower()
+        if any(frag in url for frag in _NOISE_WRITE_FRAGMENTS):
+            continue
+        out.append(r)
+    return out
+
+
+def save_cue(text: str | None) -> bool:
+    """Does this subtask wording imply a server write? Fixed stem list, no LLM.
+    Consumed only by the gate's report-only warning — a cue never fails a segment,
+    because some dialogs legitimately save with no network traffic at all."""
+    return bool(text and _SAVE_CUE_RE.search(text))
+
+
+def window_write_rollup(requests_window: list[dict[str, Any]],
+                        ) -> tuple[bool, list[str]]:
+    """The generic write-acceptance rule: a segment whose business writes ALL failed
+    or were refused fails, with the server's own refusal as the reason. (ok, reasons).
+
+    Judges only observed traffic — nothing is inferred from wording, so it holds for
+    any task, declared or ad-hoc, agent-run or replayed, with zero authoring:
+    - a zero-write window always passes (dialog saves can legitimately fire nothing);
+    - ONE accepted business write waives every refusal in the window (an accepted
+      save followed by a refused duplicate re-submit is a success — the same waiver
+      receipt_rollup applies);
+    - refused = HTTP >= 400, a network-level failure, or a 2xx whose captured body
+      refuses (_write_verdict — the "already submitted" class);
+    - in-flight records (no status, not failed) are skipped: only settled traffic
+      is judged.
+    """
+    from automation.pipeline.agent_tools import _write_verdict  # lazy import
+    refusals: list[str] = []
+    for r in business_writes(requests_window):
+        if r.get("failed"):
+            refusals.append(str(r.get("errorText") or "request failed on the network"))
+            continue
+        status = r.get("status")
+        if status is None:
+            continue
+        if 200 <= status < 400:
+            verdict = _write_verdict(r)
+            if verdict is not None and verdict[0]:
+                refusals.append(verdict[1])
+                continue
+            return True, []
+        refusals.append(
+            f"HTTP {status} on {r.get('method')} {str(r.get('url', ''))[:120]}")
+    if refusals:
+        what = "only write" if len(refusals) == 1 else f"{len(refusals)} writes"
+        return False, [
+            f"this segment fired {what} and none was accepted — "
+            f'last refusal: "{str(refusals[-1])[:200]}"']
+    return True, []

@@ -1,9 +1,9 @@
 """LLM provider construction.
 
 One place to turn a `Config` into a browser-use chat model. The active provider is Azure
-OpenAI (gpt-4.1-mini) via its OpenAI-compatible /openai/v1 endpoint — ChatOpenAI plus a
-custom base_url. Groq remains available: flip `LLM_PROVIDER=groq` in `.env` to switch
-with no other code changes.
+OpenAI via its OpenAI-compatible /openai/v1 endpoint — ChatOpenAI plus a custom base_url,
+with the deployment name from AZURE_OPENAI_MODEL (o4-mini as of 2026-08-11 PM). Groq
+remains available: flip `LLM_PROVIDER=groq` in `.env` to switch with no other code changes.
 """
 from __future__ import annotations
 
@@ -33,15 +33,16 @@ def build_llm(config: Config) -> BaseChatModel:
             # frequency_penalty is deliberately left at its 0.3 default: it exists to stop
             # gpt-4.1-mini's runaway "\t" generation — do not zero it.
             max_retries=5,
-            # Applied only to reasoning models (o4-mini). "low" (browser-use's default)
-            # produced shallow moves — saving before mandatory fields, a fixed NI where
-            # the task said random — and reacted to app errors without connecting them to
-            # earlier steps; raised to "medium" 2026-07-30 (user-approved) for exactly that
-            # causal-reasoning depth. The cap must rise with the effort: completion tokens
-            # INCLUDE the hidden reasoning tokens, and medium effort at 4096 risks
-            # finish_reason='length' with empty content (8192 is sized for medium).
-            reasoning_effort="low",
-            max_completion_tokens=4096,
+            # Applied only to reasoning models — active again on o4-mini, the deployment
+            # since 2026-08-11 PM (user: "back to o4 mini medium"; the 07-30 approved
+            # setting — "low" produced shallow moves, "high" was a one-day trial). The
+            # cap must rise with the effort: completion tokens INCLUDE the hidden
+            # reasoning tokens (8192 for medium, 16384 for high), or
+            # finish_reason='length' comes back with empty content — and o4-mini needs
+            # llm_timeout passed explicitly in runner.run_agent_segment (browser-use's
+            # model-name heuristic hands it only 75s).
+            reasoning_effort="medium",
+            max_completion_tokens=8192,
             # Best-effort determinism: at temperature 0, Azure still varies across backend
             # replicas; a fixed seed narrows step-to-step decision flakiness.
             seed=42,

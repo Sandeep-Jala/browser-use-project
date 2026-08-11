@@ -200,14 +200,17 @@ FROZEN_TIDS = {
     # next run decomposes fresh.
     # Re-frozen 2026-08-05 evening: further user edits between runs (the FPS header-
     # checkbox line and RTI polish continued to evolve alongside the e2e_rti rewording).
-    "payroll_rti_process": "3f1186abde58a1ea",
+    # Re-frozen 2026-08-10: user retargeted the stop/expense/FPS employee
+    # Alistair Allan -> Aran Allan (edited directly in tasks.yaml).
+    "payroll_rti_process": "6fcbcf3a74277901",
     # Added 2026-08-05: the pre-rewrite RTI wording, kept deliberately for comparison
     # while the imperative rewrite above beds in (its stop employees were retargeted to
     # Alan Marshall / Bruce Wright and the FPS checkbox rewording applied here too).
     # Re-frozen 2026-08-05 later PM: same employee retargets as the main copy
     # (Alan Marshall -> Aleksander Millar -> Alistair Allan), applied here deliberately
     # to keep the shared wording identity.
-    "payroll_rti_process_old": "20d8ead8c7cc6a87",
+    # Re-frozen 2026-08-10: same Alistair Allan -> Aran Allan retarget as the main copy.
+    "payroll_rti_process_old": "bb7f800478491cde",
     # Re-frozen 2026-07-27: the data-request tail was rewritten in ALL THREE copies that
     # carry it (here, crm_data_request, payroll_food_limited_e2e) against screenshots of the
     # real UI — the old "click on status sent ... select status Sent/Submitted, Note well
@@ -258,7 +261,47 @@ FROZEN_TIDS = {
     # controls (pencil icon -> 'Salary to take home' popup -> Net amount -> Calculate)
     # and to redo BOTH pay changes after a refresh (a reload wipes client-staged edits) —
     # root-caused from run 20260807_161823's video ("Could not locate Save button").
-    "payroll_food_limited_e2e_rti": "bf59faa084b3a2af",
+    # Re-frozen 2026-08-10: expense/bonus slices reworded from run 20260810_092500 —
+    # the expense grid shows the NET value (100.00, not the typed Cost 200) and both
+    # dialog Saves fire no request, so the old wording made the agent re-add ~6
+    # duplicate expenses; the bonus slice now names its real "+" control (the agent
+    # opened "Additional Inputs"/btnExtras instead and false-passed on residue rows).
+    # Re-frozen 2026-08-10 later (user choice): the verification narration was cut
+    # back OUT of the wording — prompts stay natural task language; the neutral
+    # no-writes receipt, the window write rule, and the declared verify: checks carry
+    # the guarding instead. The bonus slice keeps only the in-bounds "+ next to
+    # Additions or Deductions" referent fix.
+    # Re-frozen 2026-08-10 (2): the email slice gains the Drafted-recovery sentence —
+    # a missed send lands the email as Drafted, and the email button next to the
+    # Drafted status reopens the Send Email section (user-described app behavior;
+    # in-prompt self-recovery, same shape as the slice's existing Save-again clause).
+    # Re-frozen 2026-08-10 (3): the FPS bulk-upload slice now states the header
+    # checkbox's semantics (left of 'Employees' = select/unselect ALL employees) and
+    # the goal state — unselect everyone first, then tick ONLY Alistair Allan — after
+    # the agent misread the terse click list (a header click that SELECTS all followed
+    # by the Alistair click submits everyone EXCEPT him; cf. the Aaron Wilson FPS
+    # refusals in run 20260810_092500). Also drops the "the the" typo.
+    # Re-frozen 2026-08-10 (4): user retargeted Alistair Allan -> Aran Allan in the
+    # RTI half (direct tasks.yaml edit; same rename as both payroll_rti_process
+    # copies). The find-replace missed ONE occurrence split across a folded line
+    # ("until Alistair\n Allan" in the first employee loop) — completed to Aran Allan
+    # so the loop's stop condition no longer contradicts its repeat clause.
+    # Re-frozen 2026-08-10 (5): both payrun dialog slices gain once-only anti-duplicate
+    # wording (user choice — the sanctioned fix from the run-092500 residual-risk note):
+    # the expense slice states the silent close + net-value display (grid shows 100.00,
+    # not the typed 200) as what a successful add looks like, the bonus slice the silent
+    # close; both forbid re-adding.
+    # Re-frozen 2026-08-11: the email slice now names the From control ("open the From
+    # dropdown and select the no-reply option ... do not type an email address") — run
+    # 20260811_102219 forensics: "change the From field to no-reply" under-specified the
+    # control, and the agent completed the fragment into a fabricated address
+    # (no-reply@actingoffice.co.uk, domain borrowed from the on-page To recipient); the
+    # server refused the send ("Email not sent" in a 2xx body) and drafts piled up.
+    # Re-frozen 2026-08-11 (2): the user trimmed the belt-and-braces parenthetical
+    # ("From is a dropdown; do not type an email address into it") back out — prompts
+    # stay natural; "open the From dropdown and select the no-reply option" already
+    # names the control and the selection mode.
+    "payroll_food_limited_e2e_rti": "c194d6a9adbcfd1e",
 }
 
 
@@ -430,6 +473,10 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert len(subs) == 19                # Tier 1 won; no fallback blob
     assert not any(getattr(s, "fallback", False) for s in subs)
     assert [s.kind for s in subs].count("loop") == 4
+    assert subs[7].kind == "action"       # email slice: Drafted recovery stays classifier-neutral
+    assert subs[13].kind == "action"      # expense slice: once-only wording stays classifier-neutral
+    assert subs[14].kind == "action"      # bonus slice: once-only wording stays classifier-neutral
+    assert subs[16].kind == "action"      # FPS slice: unselect-all wording stays classifier-neutral
     assert decompose.is_conditional_guard(subs[11].template_prompt)   # the popup guard
     assert "download" in subs[5].template_prompt.lower()              # download subtask
 

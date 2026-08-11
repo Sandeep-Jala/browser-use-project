@@ -387,6 +387,13 @@ class Runner:
             use_vision=self.config.use_vision,
             vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
+            # o4-mini needs an explicit per-call budget: browser-use's model-name
+            # heuristic hands it the default 75s (only o3/claude/deepseek get 90),
+            # which medium-effort thinks can exceed. step_timeout is ONE asyncio
+            # timeout around the LLM call PLUS tool execution, so it must clear
+            # llm_timeout with action headroom.
+            llm_timeout=180,
+            step_timeout=300,
             # Raised 1→4 (2026-07-30, experiment). CAUTION: 1 was a deliberate fix — this app
             # re-renders after every input AND click, so an action queued behind another acts
             # on a stale page. 2 was tried with a text rule forbidding a click as the second

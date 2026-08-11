@@ -1266,8 +1266,14 @@ async def _network_outcome(collector: Any, t0: float,
             await asyncio.sleep(0.15)
             writes = collector.writes_since(t0)
         if not writes:
-            return ((" — no write request followed this click; if this was a save/submit, "
-                     "nothing reached the server." if expect_write else ""), False, False)
+            # Observation, not verdict: dialog saves can legitimately fire no request
+            # (client-staged, websocket, beacon — run 20260810_092500's expense dialog),
+            # so asserting "nothing reached the server" here primed a duplicate-add loop.
+            return ((" — no write request was observed after this click. Some apps "
+                     "save without network traffic, so this alone does not prove "
+                     "failure: if this was a save/submit, check the page for the "
+                     "change and only redo it if it is genuinely absent."
+                     if expect_write else ""), False, False)
         while any(not w["settled"] for w in writes) \
                 and time.monotonic() - t0 < _WRITE_SETTLE_S:
             await asyncio.sleep(0.2)

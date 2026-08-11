@@ -383,3 +383,81 @@ def test_rollup_accepted_final_write_passes():
         _Item(_R(is_done=True)),
     )
     assert ck.receipt_rollup(hist, [])[0] is True
+
+
+# ------------------------------- window_write_rollup -------------------------------
+
+
+def test_window_rule_zero_writes_passes():
+    assert ck.window_write_rollup([]) == (True, [])
+    reads = [_write(method="GET"), _write(method="GET", status=404)]
+    assert ck.window_write_rollup(reads) == (True, [])
+
+
+def test_window_rule_accepted_write_passes():
+    assert ck.window_write_rollup([_write()])[0] is True
+
+
+def test_window_rule_refused_body_only_fails_with_server_text():
+    body = json.dumps({"status": False, "message": "already submitted"})
+    ok, reasons = ck.window_write_rollup([_write(body=body)])
+    assert ok is False
+    assert "already submitted" in reasons[0]
+
+
+def test_window_rule_http_error_only_fails():
+    ok, reasons = ck.window_write_rollup([_write(status=500)])
+    assert ok is False
+    assert "HTTP 500" in reasons[0]
+
+
+def test_window_rule_network_failure_only_fails():
+    rec = _write(status=None, failed=True, errorText="net::ERR_CONNECTION_RESET")
+    ok, reasons = ck.window_write_rollup([rec])
+    assert ok is False
+    assert "ERR_CONNECTION_RESET" in reasons[0]
+
+
+def test_window_rule_refusal_recovered_by_later_accept_passes():
+    body = json.dumps({"status": False, "message": "select a reason"})
+    assert ck.window_write_rollup([_write(body=body), _write()])[0] is True
+
+
+def test_window_rule_accept_waives_later_refused_duplicate():
+    body = json.dumps({"status": False, "message": "already submitted"})
+    assert ck.window_write_rollup([_write(), _write(body=body)])[0] is True
+
+
+def test_window_rule_noise_accept_cannot_waive_business_refusal():
+    """The waiver hole this rule closes: an accepted infrastructure write must not
+    count as proof the segment's business write landed."""
+    noise = _write(url="https://x/auth/webpush")
+    body = json.dumps({"status": False, "message": "already submitted"})
+    ok, reasons = ck.window_write_rollup([noise, _write(body=body)])
+    assert ok is False
+    assert "already submitted" in reasons[0]
+
+
+def test_window_rule_noise_only_traffic_passes():
+    window = [_write(url="https://x/auth/webpush"),
+              _write(url="https://x/oauth/token", status=400),
+              _write(url="https://x/client/negotiate?hub=usershub")]
+    assert ck.window_write_rollup(window) == (True, [])
+
+
+def test_window_rule_inflight_write_is_skipped():
+    assert ck.window_write_rollup([_write(status=None)]) == (True, [])
+
+
+def test_business_writes_filters_methods_and_noise():
+    window = [_write(), _write(method="GET"),
+              _write(url="https://x/hubs/users/negotiate")]
+    assert len(ck.business_writes(window)) == 1
+
+
+def test_save_cue_matches_stems_and_ignores_plain_reads():
+    assert ck.save_cue("fill in the form and click Save") is True
+    assert ck.save_cue("After saving, continue processing") is True
+    assert ck.save_cue("click Submit and wait") is True
+    assert ck.save_cue("go to the section and read the employee name") is False
+    assert ck.save_cue(None) is False

@@ -56,7 +56,9 @@ from automation.browser.recording import start_run_recording, stop_run_recording
 from automation.pipeline import adapt
 from automation.pipeline import router
 from automation.pipeline import subtask_store as sstore
-from automation.pipeline.checks import evaluate_checks, receipt_rollup
+from automation.pipeline.checks import (business_writes, evaluate_checks,
+                                        receipt_rollup, save_cue,
+                                        window_write_rollup)
 from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloads_file,
                                            get_decomposition, is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
@@ -276,21 +278,36 @@ async def evaluate_gate(
     requests_window: list[dict[str, Any]],
     downloads_window: list[str] | None = None,
     rollup: tuple[bool, list[str]] | None = None,
+    prompt_text: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Evaluate a segment gate: the base kind (see _evaluate_base_gate), then the
-    receipt roll-up verdict (computed by the agent call site, None on replay), then any
-    declared verify checks. Roll-up and checks are demote-only — they can fail a segment
-    the base gate passed but never resurrect a failed one; checks on a failed base still
-    get their single honest evaluation so the detail lands in the report (the same
-    convention the settle window applies to a failed-steps postcondition).
-    `detail["checks"]`/`detail["rollup"]` appear only when declared/failing — a bare
-    gate's detail is byte-identical to before."""
+    receipt roll-up verdict (computed by the agent call site, None on replay), then the
+    window write rule (window_write_rollup — every segment, agent or replay, declared
+    or ad-hoc: fired-but-never-accepted business writes fail the segment), then any
+    declared verify checks. Roll-up, write rule, and checks are demote-only — they can
+    fail a segment the base gate passed but never resurrect a failed one; checks on a
+    failed base still get their single honest evaluation so the detail lands in the
+    report (the same convention the settle window applies to a failed-steps
+    postcondition). `detail["checks"]`/`detail["rollup"]`/`detail["write_rollup"]`
+    appear only when declared/failing — a bare gate's detail is byte-identical to
+    before. `prompt_text` (the subtask wording) feeds only the report-only
+    `detail["write_warning"]`: a save-cue with zero observed business writes flags a
+    possible silent-save blind spot without ever affecting `ok`."""
     ok, detail = await _evaluate_base_gate(
         gate, steps_ok=steps_ok, page=page, requests_window=requests_window,
         downloads_window=downloads_window)
     if rollup is not None and not rollup[0]:
         detail["rollup"] = rollup[1]
         ok = False
+    wr_ok, wr_reasons = window_write_rollup(requests_window)
+    if not wr_ok:
+        detail["write_rollup"] = wr_reasons
+        ok = False
+    if prompt_text and save_cue(prompt_text) and not business_writes(requests_window):
+        detail["write_warning"] = (
+            "wording implies a save but no write request was observed — this app may "
+            "save without network traffic; only a declared verify: check can see such "
+            "a save")
     if gate.checks:
         results = await evaluate_checks(page, requests_window, gate.checks, poll=ok)
         detail["checks"] = results
@@ -308,6 +325,9 @@ def _check_failure_reason(detail: dict[str, Any]) -> str | None:
             if r.get("evidence"):
                 why = f"{why} [{r['evidence']}]"
             return f'deterministic check failed: {r["kind"]} "{r["arg"]}" — {why}'
+    wrollup = detail.get("write_rollup") or []
+    if wrollup:
+        return str(wrollup[0])
     rollup = detail.get("rollup") or []
     if rollup:
         return str(rollup[0])
@@ -845,6 +865,7 @@ class HybridSession:
             gate, steps_ok=steps_ok, page=self.current_page(),
             requests_window=self.requests_since(watermark),
             downloads_window=seg.downloads,
+            prompt_text=sub.instantiated_prompt,
         )
         if steps_ok and not seg.ok:
             seg.error = (seg.error or _check_failure_reason(seg.gate)
@@ -908,6 +929,7 @@ class HybridSession:
             requests_window=self.requests_since(watermark),
             downloads_window=seg.downloads,
             rollup=rollup,
+            prompt_text=sub.instantiated_prompt,
         )
         seg.write_step = seg.gate.get("write_step")
         if not seg.ok:

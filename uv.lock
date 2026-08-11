@@ -223,7 +223,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "browser-use", specifier = "==0.13.6" },
+    { name = "browser-use", specifier = "==0.13.7" },
     { name = "fastembed", specifier = ">=0.8.0" },
     { name = "groq", specifier = ">=1.0.0" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.2" },
@@ -263,7 +263,7 @@ wheels = [
 
 [[package]]
 name = "browser-harness"
-version = "0.1.6"
+version = "0.1.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cdp-use" },
@@ -271,14 +271,14 @@ dependencies = [
     { name = "pillow" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/bc/a3aefcad0df4450f560969f64a1fab86d1b3cf0e1ec66ce3bd55aa63ece3/browser_harness-0.1.6.tar.gz", hash = "sha256:90c0c019e0bc0a1f189da28592abf4e7b4e3ebfb0d530ea173c0432829dba882", size = 94229, upload-time = "2026-07-17T05:03:31.632Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/fc/a8602efaecbeeffbae5678c377d9193e646b584488f8e4f67a08c05495cb/browser_harness-0.1.8.tar.gz", hash = "sha256:4a88d08e9c933622d728f006c3f70d6b6de052b388519c3aec5a030127ef4ea0", size = 98228, upload-time = "2026-07-26T03:16:38.874Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/d5/78013b7229843880d7f18945022662793eb00daeec2e5d2ea62687bc00c9/browser_harness-0.1.6-py3-none-any.whl", hash = "sha256:65d92ac05b71b5702ab734a389d4142dd749eb1f005d71792106c5da8e8eddca", size = 99498, upload-time = "2026-07-17T05:03:30.142Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/b9/aa8ab029af34e99784758fd5e8f76c853219cff1733ea422ff161313d108/browser_harness-0.1.8-py3-none-any.whl", hash = "sha256:4bbc414007750683408a6cf4e5c87dd62c85b8628e478d5020413814fde8ae50", size = 103971, upload-time = "2026-07-26T03:16:37.53Z" },
 ]
 
 [[package]]
 name = "browser-use"
-version = "0.13.6"
+version = "0.13.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -318,9 +318,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uuid7" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4e/d0/2ca49275bad774bd32bfb18c126e3158fc8e6d6a92239e9b0013d53ac220/browser_use-0.13.6.tar.gz", hash = "sha256:a631740b6feb42fe84544c95166e15342569329dbad31691fac8d5cd56a70a83", size = 610208, upload-time = "2026-07-17T05:32:00.429Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/b7/cfa84c836dafdd216078f39561368b5ad75692fb17e6275ac30a9728c21c/browser_use-0.13.7.tar.gz", hash = "sha256:02c27e154c4820b5e3e6606b30a666f11e203525fd051db4b9b515c35e2c2f0d", size = 614200, upload-time = "2026-07-27T17:25:43.888Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/ab/c9cad020e4394c124bef008b38484f1fec626f8317b541991b47f19df638/browser_use-0.13.6-py3-none-any.whl", hash = "sha256:dc284a6130d56368a0a2fa6d6d6d467296e61b3ec165b6b290aecc5ca19b4a9c", size = 714684, upload-time = "2026-07-17T05:31:58.713Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/b7/6df062c7cfd2a863f18dda0d5c7f8711e7316d772feb92370311391d8a2a/browser_use-0.13.7-py3-none-any.whl", hash = "sha256:2264439e45cc7dd7fe480ca37e9eabd040c31a4e4d5e20c069ad2f60c07e3ba8", size = 718627, upload-time = "2026-07-27T17:25:42.009Z" },
 ]
 
 [[package]]

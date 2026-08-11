@@ -180,7 +180,9 @@ async def test_dialog_click_with_no_write_flags_it(monkeypatch):
         _FakeBrowserSession({4: _FakeDomNode("Save")}))
 
     msg = res.extracted_content
-    assert "no write request followed this click" in msg
+    assert "no write request was observed after this click" in msg
+    assert "nothing reached the server" not in msg   # observation, never a failure verdict
+    assert "genuinely absent" in msg                 # the verify-by-state directive
     assert "STILL OPEN" in msg
 
 
@@ -397,7 +399,7 @@ async def test_toggle_click_in_dialog_gets_no_save_doubt(monkeypatch):
         _fake_builtin_click, SimpleNamespace(index=4),
         _FakeBrowserSession({4: toggle}))
     msg = res.extracted_content
-    assert "no write request followed" not in msg
+    assert "no write request was observed" not in msg
     assert "likely did NOT go through" not in msg
     assert "STILL OPEN" not in msg
 

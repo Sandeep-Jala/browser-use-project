@@ -1167,6 +1167,48 @@ async def test_steps_gate_is_passthrough():
     assert ok is False
 
 
+async def test_steps_gate_demoted_by_refused_only_window():
+    """The generic write rule: fired-but-never-accepted business writes fail any
+    segment — no declared verify needed (the ad-hoc-prompt case)."""
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": '{"status": false, "message": "already submitted"}'}]
+    ok, detail = await evaluate_gate(Gate(kind="steps"), steps_ok=True, page=None,
+                                     requests_window=window)
+    assert ok is False
+    assert "already submitted" in detail["write_rollup"][0]
+    from automation.pipeline.hybrid import _check_failure_reason
+    assert "already submitted" in _check_failure_reason(detail)
+
+
+async def test_steps_gate_refusal_waived_by_accepted_write():
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200},
+              {"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": '{"status": false, "message": "already submitted"}'}]
+    ok, detail = await evaluate_gate(Gate(kind="steps"), steps_ok=True, page=None,
+                                     requests_window=window)
+    assert ok is True and "write_rollup" not in detail
+
+
+async def test_write_warning_on_save_cue_with_no_writes():
+    ok, detail = await evaluate_gate(Gate(kind="steps"), steps_ok=True, page=None,
+                                     requests_window=[],
+                                     prompt_text="set Cost to 200 and click Save")
+    assert ok is True
+    assert "write_warning" in detail
+    ok, detail = await evaluate_gate(Gate(kind="steps"), steps_ok=True, page=None,
+                                     requests_window=[],
+                                     prompt_text="go to Pay Forecast and read the rows")
+    assert ok is True and "write_warning" not in detail
+
+
+async def test_marker_gate_pass_untouched_by_write_rule():
+    gate = Gate(kind="marker", marker="Invoices")
+    hit = [{"method": "POST", "url": "http://api/Invoices/create", "status": 201}]
+    ok, detail = await evaluate_gate(gate, steps_ok=False, page=None,
+                                     requests_window=hit)
+    assert ok is True and "write_rollup" not in detail
+
+
 async def test_url_contains_postcondition(monkeypatch):
     monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)  # failing case polls the settle window
     gate = Gate(kind="postcondition", postcondition={"url_contains": "invoices"})
