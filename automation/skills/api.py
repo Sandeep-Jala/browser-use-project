@@ -26,11 +26,18 @@ from playwright.async_api import Page
 
 from automation.pipeline.script_compile import (_REOPEN_MS, _SETTLE_MS, _click_with_retry,
                                                 _esc, _extract_value, _fill_with_retry,
-                                                _find_click, _select_with_retry,
-                                                _upload_with_retry, _wheel_scroll,
-                                                merge_extract)
+                                                _find_click, _resolve_with_scroll,
+                                                _select_with_retry, _upload_with_retry,
+                                                _wheel_scroll, merge_extract)
 
 logger = logging.getLogger("framework.skills.api")
+
+# repeat_click's readiness poll: after each click (and the recorded wait floor), the
+# target must resolve visible+enabled again before the next click — a slow employee
+# load must delay the cadence, never eat a click. Cap keeps a dead page an honest
+# failure instead of a hang.
+_REPEAT_READY_CAP_S = 10.0
+_REPEAT_POLL_MS = 250
 
 # App-wide recovery reflexes, run once when a verb fails: async (page) -> bool (True =
 # something was dismissed/fixed, retry the verb). Registered explicitly by the framework,
@@ -148,6 +155,74 @@ class SkillApi:
         self._last_click = step
         self._record("click", handle, sel, healed)
         await self.page.wait_for_timeout(_SETTLE_MS)
+
+    async def _await_repeat_ready(self, step: dict[str, Any], handle: str) -> None:
+        """Poll until one of the step's selectors resolves visible+enabled again."""
+        import time as _time
+
+        deadline = _time.monotonic() + _REPEAT_READY_CAP_S
+        sels = (step.get("selectors") or [])[:3]
+        while _time.monotonic() < deadline:
+            for sel in sels:
+                try:
+                    loc = self.page.locator(sel)
+                    if (await loc.count()) and await loc.first.is_visible() \
+                            and await loc.first.is_enabled():
+                        return
+                except Exception:  # noqa: BLE001 - candidate unprobeable; try the next
+                    continue
+            await self.page.wait_for_timeout(_REPEAT_POLL_MS)
+        raise RuntimeError(
+            f"repeat_click: {handle!r} did not become ready again within "
+            f"{_REPEAT_READY_CAP_S:g}s — the page likely stopped advancing")
+
+    async def repeat_click(self, handle: str, count: int, wait_s: float = 0.0) -> None:
+        """Click the anchored element `count` times — the compiled form of a recorded
+        "exactly N clicks" cadence (Save & Next through N employees). Between clicks:
+        the recorded wait as a floor, then a readiness poll on the same target, so a
+        slow load delays the cadence instead of eating a click. The first winning
+        selector is cached so every iteration follows the same routine; a stale cache
+        falls back to the full ladder once."""
+        step = self._step_for(handle, expect=True)
+        cached: dict[str, Any] | None = None
+        for i in range(int(count)):
+            try:
+                sel, healed = await _click_with_retry(
+                    self.page, cached or step, self.timeout_ms)
+            except Exception:  # noqa: BLE001 - cached selector went stale; full ladder
+                if cached is None:
+                    raise
+                cached = None
+                sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
+            if cached is None and not sel.endswith("(hidden dispatch)"):
+                cached = {**step, "selectors": [sel]}
+            self._last_click = step
+            self._record("click", handle, sel, healed)
+            await self.page.wait_for_timeout(_SETTLE_MS)
+            if i < int(count) - 1:
+                if wait_s:
+                    await self.page.wait_for_timeout(int(min(float(wait_s), 3.0) * 1000))
+                await self._await_repeat_ready(cached or step, handle)
+
+    async def click_indexed(self, handle: str, start: int, count: int) -> None:
+        """Click id-indexed grid rows start..start+count-1 via the anchor's selector
+        template (`{n}` placeholder) — the durable form of a virtualized-grid run
+        whose row-id prefixes regenerate per data load. Each index wheel-scrolls into
+        view when the pane hasn't rendered it yet. Positional by intent: the Nth row
+        is clicked whoever occupies it, so no name guard applies."""
+        anchor = self.anchors.get(handle) or {}
+        template = str(anchor.get("selector_template") or "")
+        if "{n}" not in template:
+            raise KeyError(f"anchor {handle!r} carries no indexed selector template")
+        for n in range(int(start), int(start) + int(count)):
+            step = {"selectors": [template.replace("{n}", str(n))]}
+            loc, sel = await _resolve_with_scroll(self.page, step, 2500)
+            try:
+                await loc.click(timeout=5000)
+            except Exception:  # noqa: BLE001 - pointer interception; force like click does
+                await loc.click(timeout=5000, force=True)
+            self._record("click", handle, sel, None)
+            await self.page.wait_for_timeout(_SETTLE_MS)
 
     async def fill(self, handle: str, value: Any, clear: bool = True) -> None:
         """Fill the anchored editable field (resolution refuses non-editable matches)."""

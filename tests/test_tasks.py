@@ -301,7 +301,65 @@ FROZEN_TIDS = {
     # ("From is a dropdown; do not type an email address into it") back out — prompts
     # stay natural; "open the From dropdown and select the no-reply option" already
     # names the control and the selection mode.
-    "payroll_food_limited_e2e_rti": "c194d6a9adbcfd1e",
+    # Re-frozen 2026-08-11 PM (counter rewrite, c194d6a9adbcfd1e → a718bbf3184164be):
+    # both RTI employee passes went name-based-loop → fixed-count action ("exactly 5
+    # clicks" / "exactly 14 more clicks"; subs-10's own Save & Next click saves
+    # employee #1, so 1+5+14 = the first 20), the expense lands on "the 7th employee
+    # of the pay run" instead of Aran Allan, and the FPS slice ticks the first 20
+    # employees after the unselect-all guard. Same edit: subs[9] pinned kind: action
+    # (records despite the button named Verify) and subs[11] got the popup probe —
+    # neither touches identity; the id drift is the wording alone.
+    # Re-frozen again 2026-08-11 evening (a718bbf3184164be → e291dcdf0741eaa2): the
+    # user fixed the Add-Employee NI number to the literal AB124557C (was "AB followed
+    # by a random 6-digit number and ending with C") — determinism for the recorded
+    # run; the slice's values are now fully replayable.
+    # Re-frozen 2026-08-12 (e291dcdf0741eaa2 → 541b2091dc0fd192): the user cut the
+    # task down to its first half — everything from the Sent-badge slice onward is
+    # commented out in tasks.yaml pending re-enable (payroll_detailed_review_fps is
+    # the active RTI vehicle) — and extended the email slice's Drafted recovery
+    # ("click Send again" + reopen-and-reselect-no-reply).
+    # Re-frozen 2026-08-12 PM (541b2091dc0fd192 → 30213b6416455597): the Net-to-Gross
+    # slice reworded after the 45-step seg-4 spiral — the user dropped the
+    # refresh-first recovery + kind: loop (now a recordable action), and the slice
+    # gained the popup facts (Net amount box beside the £ inside the popup, starts at
+    # 0, grid cells behind it are NOT the target, remaining-periods checkbox stays
+    # unticked, popup closes on Calculate → Feb-27 £4,000.00) plus a reopen-with-the-
+    # pencil recovery; refresh is no longer prescribed at all for this slice.
+    # Re-frozen again 2026-08-12 (→ 00cddadd6374f2ec): FIXED identity — REVERSED the
+    # same day at the user's direction ("get it back to the earlier version where it
+    # went to a website"). → 94ae70dcaa115764: the fakenamegenerator aux slice and the
+    # noted-details wording are RESTORED verbatim (NI stays the literal AB124557C);
+    # the pay-forecast load slice is flattened to a plain action ("wait until the pay
+    # rows have loaded" — no repeat cue) per the user's "I need it recorded". With the
+    # consumes_noted_data producer-override, the aux slice records/replays again;
+    # subs 2-3 are consumers by design (replayable only via runtime bindings).
+    # Re-frozen 2026-08-17 (94ae70dcaa115764 → 76b8aeff80b9c11c): the Data Request
+    # slice reworded from run 20260817_093555 — "select the employee" named no control,
+    # so the agent completed it with the previous slice's combobox recipe and typed the
+    # name into the Tax-year react-select, then scroll-hunted the page while the
+    # virtualized list (window of ~20 rows of 78) never had the row in DOM. The slice
+    # now names the real gesture: scroll inside the employee list itself until the
+    # noted employee's name is in view, tick the checkbox on that row (user kept the
+    # wording lean — no combobox-forbidding sentence). The virtualization parenthetical
+    # says "at once", NOT "at a time" — "at a time" is a _LOOP_REPEAT_RE cue and with
+    # "until" it reclassified the slice kind action → loop (never cached). Replaces
+    # sid 97bfb8637b9538e3 (segment never committed — no library entry orphaned).
+    # Re-frozen 2026-08-17 PM (76b8aeff80b9c11c → bd91fc77296c45e4): user reworded the
+    # Pay Forecast slice after run 133135's slow-connection stalls — it now opens with
+    # "Refresh the page and then type the noted employee name" (in-prompt recovery for
+    # the skeleton-loading Pay Forecast page; still kind=action, no repeat cue). The
+    # reword orphans the old seg-3 sid a4f26f734d041598 (library entry unreferenced;
+    # the next run authors seg 3 fresh under its new sid).
+    "payroll_food_limited_e2e_rti": "bd91fc77296c45e4",
+    # Added 2026-08-11 (user-dictated): Detailed payroll-review data request for the
+    # first 12 employees (May-26) + no-reply send, a Pay Elements bonus-row edit
+    # open-and-close, Verify All on the new request, then a Jun-26 payrun pass of
+    # 10 + 7 Save & Next clicks and an FPS submission. Declared as 10 verbatim
+    # slices; user clarified via options: FOOD LIMITED opener, bonus edit closes
+    # unchanged, 10-then-7 is one continuous 17-employee pass, FPS file is the
+    # shared New_Employees_List_-_WI_LTD.csv. The Send-Email and popup-guard slices
+    # reuse the e2e's proven wording verbatim.
+    "payroll_detailed_review_fps": "09d712c0d271b609",
 }
 
 
@@ -470,14 +528,20 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert joined == spec.prompt          # verbatim partition, no reword drift
 
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
-    assert len(subs) == 19                # Tier 1 won; no fallback blob
+    # 2026-08-12: the task is its first half (RTI slices commented out pending
+    # re-enable); the fakenamegenerator aux flow is the user's chosen shape, and every
+    # slice is a recordable action — the forecast-load slice was flattened ("wait
+    # until the pay rows have loaded", no repeat cue) and the Net-to-Gross slice lost
+    # its refresh-first recovery after the 45-step seg-4 spiral.
+    assert len(subs) == 8                 # Tier 1 won; no fallback blob
     assert not any(getattr(s, "fallback", False) for s in subs)
-    assert [s.kind for s in subs].count("loop") == 4
-    assert subs[7].kind == "action"       # email slice: Drafted recovery stays classifier-neutral
-    assert subs[13].kind == "action"      # expense slice: once-only wording stays classifier-neutral
-    assert subs[14].kind == "action"      # bonus slice: once-only wording stays classifier-neutral
-    assert subs[16].kind == "action"      # FPS slice: unselect-all wording stays classifier-neutral
-    assert decompose.is_conditional_guard(subs[11].template_prompt)   # the popup guard
+    assert [s.kind for s in subs] == ["action"] * 8
+    assert subs[1].tab_url and "fakenamegenerator" in subs[1].tab_url   # aux producer
+    # The producer-override keeps the noting slice OUT of the consumer net; the two
+    # slices that USE the noted identity stay consumers (bindings-only replay).
+    assert not decompose.consumes_noted_data(subs[1].template_prompt)
+    assert decompose.consumes_noted_data(subs[2].template_prompt)
+    assert decompose.consumes_noted_data(subs[3].template_prompt)
     assert "download" in subs[5].template_prompt.lower()              # download subtask
 
 
@@ -566,4 +630,52 @@ def test_subtask_verify_does_not_change_identity():
     a = tasks_mod._spec_from_entry("t", base)
     b = tasks_mod._spec_from_entry("t", with_verify)
     assert a.prompt == b.prompt
+    assert ss.task_id(a.prompt) == ss.task_id(b.prompt)
+
+
+# ------------------------------- declared conditional probe -------------------------------
+
+
+def test_subtask_probe_parsed_and_substituted():
+    """A probe: mapping parses into ONE Check at load time (short default poll — an
+    absent popup is a routine outcome, not a failure to wait out), with {{tokens}}
+    substituted from the slice's values like verify args."""
+    from automation.pipeline.checks import _PROBE_TIMEOUT_S, Check
+
+    entry = {"subtasks": [
+        {"prompt": "If a {{thing}} popup appears, dismiss it.",
+         "values": {"thing": "Process"},
+         "probe": {"text_visible": "Don't show this {{thing}} again"}},
+    ]}
+    spec = tasks_mod._spec_from_entry("t", entry)
+    assert spec.subtasks[0].probe == Check(
+        kind="text_visible", arg="Don't show this Process again",
+        timeout_s=_PROBE_TIMEOUT_S)
+
+
+def test_subtask_without_probe_is_none():
+    entry = {"subtasks": [{"prompt": "Open payroll."}]}
+    assert tasks_mod._spec_from_entry("t", entry).subtasks[0].probe is None
+
+
+def test_subtask_probe_list_form_fails_loud():
+    entry = {"subtasks": [{"prompt": "If a popup appears, dismiss it.",
+                           "probe": [{"text_visible": "x"}]}]}
+    with pytest.raises(ValueError, match="single check mapping"):
+        tasks_mod._spec_from_entry("t", entry)
+
+
+def test_subtask_probe_unresolved_token_fails_loud():
+    entry = {"subtasks": [{"prompt": "If a popup appears, dismiss it.",
+                           "probe": {"text_visible": "{{missing}}"}}]}
+    with pytest.raises(ValueError, match="missing"):
+        tasks_mod._spec_from_entry("t", entry)
+
+
+def test_subtask_probe_does_not_change_identity():
+    base = {"subtasks": [{"prompt": "If a popup appears, dismiss it."}]}
+    with_probe = {"subtasks": [{"prompt": "If a popup appears, dismiss it.",
+                                "probe": {"text_visible": "popup"}}]}
+    a = tasks_mod._spec_from_entry("t", base)
+    b = tasks_mod._spec_from_entry("t", with_probe)
     assert ss.task_id(a.prompt) == ss.task_id(b.prompt)

@@ -113,6 +113,35 @@ def test_parse_rejects_non_list_and_non_mapping_items():
         ck.parse_verify(["text_visible"])
 
 
+# ------------------------------- parse_probe -------------------------------
+
+
+def test_parse_probe_single_mapping_short_default_timeout():
+    check = ck.parse_probe({"text_visible": "Don't show this again"})
+    assert check.kind == "text_visible"
+    assert check.arg == "Don't show this again"
+    assert check.timeout_s == ck._PROBE_TIMEOUT_S
+
+
+def test_parse_probe_declared_timeout_wins():
+    check = ck.parse_probe({"text_visible": "x", "timeout_s": 8})
+    assert check.timeout_s == 8.0
+
+
+def test_parse_probe_none_is_none():
+    assert ck.parse_probe(None) is None
+
+
+def test_parse_probe_rejects_list_form():
+    with pytest.raises(ValueError, match="single check mapping"):
+        ck.parse_probe([{"text_visible": "x"}])
+
+
+def test_parse_probe_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="texts_visible"):
+        ck.parse_probe({"texts_visible": "x"})
+
+
 # ------------------------------- shared tokenizer -------------------------------
 
 

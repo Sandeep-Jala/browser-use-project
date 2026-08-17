@@ -31,7 +31,8 @@ from playwright.async_api import Page
 from automation.pipeline import adapt
 from automation.pipeline import subtask_store as sstore
 from automation.pipeline.script_compile import (_FP_ATTRS, _atomic_write, _esc, _role_of,
-                                                _selectors_from_parts, run_steps)
+                                                _selectors_from_parts,
+                                                merge_promoted_selectors, run_steps)
 from automation.skills import codegen
 from automation.skills.api import SkillApi
 
@@ -287,9 +288,8 @@ def promote_healed_anchors(anchors_path: str | Path,
 
         new_sels = _selectors_from_parts(tag, attrs, text)
         old_sels = list(anchor.get("selectors") or [])
-        seen: set[str] = set()
-        anchor["selectors"] = [s for s in new_sels + old_sels
-                               if not (s in seen or seen.add(s))][:_MAX_SELECTORS]
+        anchor["selectors"] = merge_promoted_selectors(new_sels, old_sels,
+                                                       _MAX_SELECTORS)
 
         fp = anchor.get("fingerprint") or {}
         fp["tag"] = tag or fp.get("tag")

@@ -441,6 +441,16 @@ def test_node_kind_loop_detection():
     assert decompose.node_kind(
         "click Save & Next and wait until the next employee has fully loaded",
         None) == "action"
+    # The 2026-08-11 counter rewrite of the e2e's employee passes rides on this:
+    # "exactly N clicks ... after each click" has neither a repeat cue ("for each"
+    # requires adjacency) nor a stop cue, so both slices stay recordable actions.
+    assert decompose.node_kind(
+        "Click Save & Next for the next 5 employees: exactly 5 clicks, waiting for "
+        "the next employee to fully load after each click.", None) == "action"
+    assert decompose.node_kind(
+        "Then click Save & Next for the next 14 employees in the same way: exactly "
+        "14 more clicks, waiting for the next employee to fully load after each "
+        "click.", None) == "action"
     # Marker precedence is unchanged: machine ground truth caches safely.
     assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
     assert decompose.node_kind(LOOP_ALAN, "Payroll") == "action"
@@ -508,6 +518,17 @@ def test_consumes_noted_data_matches_consumers_not_producers():
     assert not decompose.consumes_noted_data(
         "add invoice for customer {{customer}} and click save")
     assert not decompose.consumes_noted_data("open the recorded payment and click void")
+    # A PRODUCER slice — the wording IS the noting instruction — must not trip the
+    # usage-word branch on its own opening phrase ("From the generated identity ...").
+    # Observed live 2026-08-12: the fakenamegenerator slice classified consumer and
+    # stopped replaying whenever seg 0 authored (findings present).
+    assert not decompose.consumes_noted_data(
+        "Open a new tab and go to the generator site. From the generated identity, "
+        "note and remember exactly these details for use in all later steps: the "
+        "Name, the Gender (Male), the Address, and the Date of Birth.")
+    # ... but a slice that produces AND unambiguously consumes stays a consumer.
+    assert decompose.consumes_noted_data(
+        "note down the reference, then enter the noted name into the search box")
 
 
 JUDGE_PROMPT = "go to the reviews section. verify the mail is not sent"
@@ -672,3 +693,27 @@ async def test_spec_declared_verify_reaches_subtasks_and_cache_drops_it(library)
     assert cached and all("verify" not in d for d in cached["subtasks"])
     rebuilt = decompose._build_subtasks(cached["subtasks"], None, trust_kind=False)
     assert all(s.verify is None for s in rebuilt)
+
+
+@pytest.mark.asyncio
+async def test_spec_declared_probe_reaches_subtasks_and_cache_drops_it(library):
+    """Tier 1 threads a conditional slice's probe onto its Subtask; the saved cache
+    deliberately does NOT carry it (same re-attach-from-spec contract as verify)."""
+    from automation.pipeline.checks import Check
+
+    prompt = ("go to the payroll module. "
+              "If a popup appears, tick 'Don't show this again' and click Process.")
+    probe = Check(kind="text_visible", arg="Don't show this again", timeout_s=3.0)
+    spec = TaskSpec(key="k", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the payroll module."),
+        SubtaskDecl(prompt="If a popup appears, tick 'Don't show this again' and "
+                           "click Process.", probe=probe),
+    ))
+    subs = await decompose.get_decomposition(prompt, llm=None, spec=spec)
+    assert subs[0].probe is None
+    assert subs[1].probe == probe
+
+    cached = ss.load_decomposition(ss.task_id(prompt))
+    assert cached and all("probe" not in d for d in cached["subtasks"])
+    rebuilt = decompose._build_subtasks(cached["subtasks"], None, trust_kind=False)
+    assert all(s.probe is None for s in rebuilt)

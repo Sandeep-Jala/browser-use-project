@@ -158,3 +158,37 @@ def test_compile_failure_removes_stale_artifacts(stores):
     ss.steps_path(sid).write_text(json.dumps([{"action": "warp", "to": "mars"}]))
     assert compile_code_skill(sid) is None
     assert not ss.code_path(sid).exists() and not ss.anchors_path(sid).exists()
+
+
+# ------------------- repeat_click / click_indexed emission (2026-08-12) -------------------
+
+
+def test_repeat_click_and_click_indexed_transpile_and_lint():
+    steps = [
+        {"action": "click", "count": 5, "repeat_wait_s": 1.0,
+         "selectors": ['role=button[name="Save & Next"]'],
+         "fingerprint": {"tag": "button", "text": "Save & Next",
+                         "attrs": {"id": "btnSave"}}},
+        {"action": "click_indexed",
+         "selector_template": 'css=[id$="-{n}-checkbox"]', "start": 0, "count": 20,
+         "fingerprint": {"tag": "div", "attrs": {"id": "row1-0-checkbox"}}},
+    ]
+    code, anchors = transpile("sid9", steps)
+    assert "await api.repeat_click('save-next', 5, 1.0)" in code
+    assert "await api.click_indexed('row1-0-checkbox', 0, 20)" in code
+    assert lint_code(code) == []
+    assert anchors["save-next"]["selectors"] == ['role=button[name="Save & Next"]']
+    assert anchors["row1-0-checkbox"]["selector_template"] == 'css=[id$="-{n}-checkbox"]'
+    # A single-brace {n} template must survive anchor substitution untouched.
+    from automation.skills.base import _substituted_anchors
+    subbed = _substituted_anchors(anchors, {})
+    assert subbed is not None
+    assert subbed["row1-0-checkbox"]["selector_template"] == 'css=[id$="-{n}-checkbox"]'
+
+
+def test_plain_click_emission_unchanged_without_count():
+    steps = [{"action": "click", "selectors": ['css=[id="ok"]'],
+              "fingerprint": {"attrs": {"id": "ok"}}}]
+    code, _ = transpile("sid10", steps)
+    assert "await api.click('ok')" in code
+    assert "repeat_click" not in code

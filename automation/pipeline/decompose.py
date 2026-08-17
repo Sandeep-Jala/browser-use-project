@@ -188,6 +188,33 @@ def downloads_file(template_prompt: str) -> bool:
     return bool(_DOWNLOAD_RE.search(template_prompt))
 
 
+# The noting INSTRUCTION itself ("note and remember exactly these details") — the
+# producer side of the noted-data flow.
+_PRODUCES_NOTED_RE = re.compile(
+    r"\b(?:note|remember|capture|write)\s+(?:and\s+\w+\s+)?(?:down\s+)?(?:exactly\s+)?"
+    r"(?:the|these|those|all|it)\b",
+    re.IGNORECASE,
+)
+
+# The UNAMBIGUOUS consumer signals of _NOTED_DATA_RE — everything except the
+# usage-word branch's ambiguous participles (generated/recorded/saved/copied), which
+# legitimately appear inside producer wording ("From the generated identity, note ...").
+_NOTED_UNAMBIGUOUS_RE = re.compile(
+    r"\b(?:the|that|those|these|its|their)\s+"
+    r"(?:noted|remembered|captured|extracted|observed)\b"
+    r"|\b(?:using|use|with|from|for|enter|fill|add|type|paste|search)\s+"
+    r"(?:the|that|those|these)\s+(?:noted|remembered|captured|extracted|observed)\b"
+    r"|\b(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)"
+    r"\s+(?:earlier|previously|above|before)\b"
+    r"|\bfrom\s+the\s+(?:previous|prior|earlier|last)\s+"
+    r"(?:step|subtask|tab|page|site|search|result)s?\b"
+    r"|\b(?:which|that|whom?)\s+(?:we|you|i|was|were)\s+(?:just\s+)?"
+    r"(?:added|created|generated|made|noted|saved)\b"
+    r"|\b(?:newly|just)[\s-](?:added|created|generated)\b",
+    re.IGNORECASE,
+)
+
+
 def consumes_noted_data(template_prompt: str) -> bool:
     """True when the subtask's wording says it USES data noted by an earlier subtask.
 
@@ -196,8 +223,18 @@ def consumes_noted_data(template_prompt: str) -> bool:
     runs with the agent (which receives the fresh observations) and is never committed.
     Matched on the TEMPLATE prompt — the reference wording is procedure, not a value, so
     the decomposer keeps it literal there.
+
+    A PRODUCER slice — one whose own wording is the noting instruction — does not count
+    unless it also carries an unambiguous consumer phrase: "From the generated identity,
+    note and remember these details" used to trip the usage-word branch on its own
+    opening and stopped the fakenamegenerator slice from ever replaying (2026-08-12).
     """
-    return bool(_NOTED_DATA_RE.search(template_prompt))
+    if not _NOTED_DATA_RE.search(template_prompt):
+        return False
+    if _PRODUCES_NOTED_RE.search(template_prompt) \
+            and not _NOTED_UNAMBIGUOUS_RE.search(template_prompt):
+        return False
+    return True
 
 
 # Wording that opens with a conditional guard ("If you see an error ..., click Add
@@ -239,6 +276,11 @@ class Subtask:
     # Declared deterministic checks (tuple of checks.Check) — tier-1 spec subtasks only;
     # evaluated on top of the segment's base gate. Never cached (_as_cache drops them).
     verify: tuple[Any, ...] | None = None
+    # Declared presence probe (ONE checks.Check) for a leading-"If" conditional slice —
+    # tier-1 only, never cached (_as_cache drops it, same contract as verify). It stands
+    # in for the agent's live judgment of whether the branch condition is raised, which
+    # is what lets the branch replay/commit like an action (see run_hybrid_task).
+    probe: Any | None = None
 
     @property
     def instantiated_prompt(self) -> str:
@@ -293,6 +335,7 @@ def _build_subtasks(raw: list[dict[str, Any]], marker: str | None,
             postcondition=d.get("postcondition"),
             tab_url=d.get("tab_url"),
             verify=d.get("verify") or None,
+            probe=d.get("probe"),
         )
         for i, d in enumerate(raw)
     ]
@@ -315,8 +358,9 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
         "source": source,
         "created": datetime.now().isoformat(timespec="seconds"),
         "subtasks": [
-            # Deliberately no "verify": declared checks re-attach from the spec on every
-            # load, so a stale cache can never resurrect superseded checks.
+            # Deliberately no "verify" and no "probe": declared checks/probes re-attach
+            # from the spec on every load, so a stale cache can never resurrect
+            # superseded ones.
             {"template_prompt": s.template_prompt, "values": s.values,
              "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind,
              "tab_url": s.tab_url}
@@ -548,7 +592,7 @@ async def get_decomposition(
             {"template_prompt": d.prompt, "values": dict(d.values or {}),
              "marker": d.marker, "postcondition": d.postcondition,
              "kind": getattr(d, "kind", None), "tab_url": getattr(d, "tab_url", None),
-             "verify": getattr(d, "verify", None)}
+             "verify": getattr(d, "verify", None), "probe": getattr(d, "probe", None)}
             for d in declared
         ]
         problem = _validate(raw, prompt)

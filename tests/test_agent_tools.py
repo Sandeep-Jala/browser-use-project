@@ -510,6 +510,56 @@ async def test_click_inside_dialog_reports_still_open(monkeypatch):
     assert "validation" in res.extracted_content
 
 
+async def test_anonymous_checkbox_click_receipt_names_its_row(monkeypatch):
+    # Run 20260817_124339 seg 6: the ticked row checkbox's receipt read
+    # 'Clicked div role=checkbox ""' — nameless, so nothing contradicted the agent's
+    # belief it had ticked Harris Duncan; the request saved for Aaran Duncan and the
+    # segment false-passed. An anonymous checkbox click now names the ROW it sits in.
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    probed = []
+
+    async def fake_row_label(_session, node):
+        probed.append(node)
+        return "Aaran Duncan"
+
+    monkeypatch.setattr(agent_tools, "_row_context_label", fake_row_label)
+    node = _FakeDomNode("", attributes={"role": "checkbox",
+                                        "id": "row1569-40-checkbox"})
+
+    async def builtin(params=None, browser_session=None):
+        from browser_use.agent.views import ActionResult
+        return ActionResult(extracted_content='Clicked div role=checkbox ""')
+
+    res = await agent_tools._click_with_dialog_outcome(
+        builtin, SimpleNamespace(index=4), _FakeBrowserSession({4: node}))
+
+    assert probed, "row probe never ran for an anonymous checkbox"
+    assert 'in row "Aaran Duncan"' in res.extracted_content
+
+
+async def test_named_button_click_gets_no_row_probe(monkeypatch):
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    probed = []
+
+    async def fake_row_label(_session, node):
+        probed.append(node)
+        return "SHOULD NOT APPEAR"
+
+    monkeypatch.setattr(agent_tools, "_row_context_label", fake_row_label)
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert not probed                      # named non-checkbox: no probe, no suffix
+    assert "SHOULD NOT APPEAR" not in res.extracted_content
+
+
 async def test_click_outside_dialog_keeps_receipt_unchanged(monkeypatch):
     from types import SimpleNamespace
 
@@ -694,6 +744,34 @@ async def test_find_by_text_miss_reports_static_text_instead_of_not_in_dom(monke
     assert (res.metadata or {}).get("no_click") is True   # a probe — compiles to NOTHING
 
 
+async def test_find_by_text_miss_sweeps_from_top_and_resets_after(monkeypatch):
+    # Run 20260817_133135: the fallback swept DOWN-only from wherever the page stood
+    # (never finding targets ABOVE it) and a failed hunt left every container parked
+    # at the bottom — the user had to scroll back up by hand. The hunt must reset to
+    # the top BEFORE sweeping (full coverage) and again AFTER a failed sweep.
+    calls = []
+
+    async def eval_js(_session, expr, **kw):
+        if "FRAC" in expr:                        # SCROLL_CONTAINERS_JS
+            calls.append("sweep")
+            return 1                              # containers keep moving
+        if "scrollTop = 0" in expr:               # SCROLL_TOPS_JS
+            calls.append("top")
+            return 2
+        calls.append("find")
+        return {"count": 0}                       # a true miss, every probe
+
+    monkeypatch.setattr(agent_tools, "_eval_js", eval_js)
+    fn, pm = _registered_action("find_by_text")
+    await fn(params=pm(text="ghost button"), browser_session=_FakeBrowserSession({}))
+
+    assert calls.count("top") >= 2
+    assert calls.index("top") < calls.index("sweep")          # reset BEFORE the sweep
+    last_top = max(i for i, c in enumerate(calls) if c == "top")
+    last_sweep = max(i for i, c in enumerate(calls) if c == "sweep")
+    assert last_top > last_sweep                              # and again after failing
+
+
 async def test_find_by_text_true_miss_still_says_not_in_dom(monkeypatch):
     async def raw(_session, _expr):
         return {"count": 0}
@@ -865,6 +943,25 @@ def test_choose_option_ambiguous_or_absent_returns_none():
     assert agent_tools._choose_option(opts, "Existing employee") is None
     assert agent_tools._choose_option(opts, "New starter") is None
     assert agent_tools._choose_option([], "anything") is None
+
+
+def test_choose_option_matches_across_separator_differences():
+    # Run 20260817_124339 seg 7: the task says "select the no-reply option"; the real
+    # option is a full address WITHOUT the hyphen, so both the fabricated full-address
+    # call and a faithful 'no-reply' call missed. A separator-squashed comparison lets
+    # the faithful fragment pick the UNIQUE containing option; ambiguity still refuses,
+    # and short squashes never match (guard against 2-char accidents).
+    opts = [{"id": "a", "text": "anirban.manna@actingoffice.com"},
+            {"id": "b", "text": "noreply@actingoffice.com"}]
+    assert agent_tools._choose_option(opts, "no-reply")["id"] == "b"
+    # A word-aligned spelling ('no.reply@…') still wins via the existing partial tier.
+    assert agent_tools._choose_option(
+        opts + [{"id": "c", "text": "no.reply@other.com"}], "no-reply")["id"] == "c"
+    # Two squash-only candidates: ambiguous, refuse (the receipt lists the options).
+    assert agent_tools._choose_option(
+        [{"id": "b", "text": "noreply@actingoffice.com"},
+         {"id": "c", "text": "noreply@other.com"}], "no-reply") is None
+    assert agent_tools._choose_option(opts, "an") is None
 
 
 async def test_cb_resolve_from_input_placeholder_and_container():

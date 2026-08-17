@@ -75,6 +75,24 @@ async def test_dropdown_filter_typing_is_refused():
     assert "Assets transferred" in res.error
 
 
+async def test_dropdown_filter_refusal_names_the_field():
+    # Run 20260817_093555 subtask 6: three refusals re-advertised
+    # select_dropdown(index=23483, text='Layton Kelly') against the TAX YEAR combobox —
+    # nothing ever said WHAT field 23483 was, so the agent kept re-targeting it (its
+    # memory even flipped to "Employee filter combobox is at index 23483"). When the
+    # field's identity is readable, the refusal names it and adds the wrong-element
+    # redirect; when it is not, the message stays exactly the bare form.
+    session = _FakeSession(_FakeField(""), node_attrs={
+        "id": "react-select-9-input", "aria-label": "Tax year"})
+    res = await _type(session, text="Layton Kelly")
+
+    assert session.types == []                        # refusal still types nothing
+    assert (res.metadata or {}).get("no_fill") is True
+    assert "'Tax year'" in res.error                  # the field is NAMED
+    assert "WRONG element" in res.error               # wrong-target redirect rides along
+    assert "select_dropdown" in res.error             # right-target remedy stays
+
+
 async def test_date_picker_typing_is_not_refused_and_enter_stays_suppressed():
     # The refusal's counter-case (run 20260807_093003): the DOB DatePicker is role=combobox
     # but its typed text IS the value — the fill must go through and read back. Enter stays
@@ -172,3 +190,29 @@ def test_refused_dropdown_fill_compiles_to_nothing(tmp_path):
                  "x_path": "html/body/div/input"},
     )
     assert _compile(tmp_path, item) == []
+
+
+# --------------------------- popup (layer/callout) Enter suppression ---------------------------
+# Run 20260813_123549: auto-Enter after typing 4000 into the Salary-to-take-home
+# callout re-rendered the popup; the batched Calculate click then dispatched onto a
+# detached node (zero Calculate POSTs all run). Inside a transient layer the popup's
+# own confirm button is the commit — Enter must stay out.
+
+
+async def test_popup_input_suppresses_auto_enter():
+    session = _FakeSession(_FakeField(""), node_attrs={"id": "TextField4675"})
+    session.field.in_popup = True
+    res = await _type(session, text="4000")
+
+    assert [t for t, _ in session.types] == ["4000"]   # the typing itself lands
+    assert session.enters == 0                          # Enter suppressed
+    assert (res.metadata or {}).get("auto_enter") is False
+    assert "popup input" in (res.extracted_content or "")
+
+
+async def test_plain_input_still_gets_auto_enter():
+    session = _FakeSession(_FakeField(""), node_attrs={"id": "SearchBox9"})
+    res = await _type(session, text="4000")
+    assert session.enters == 1
+    assert (res.metadata or {}).get("auto_enter") is True
+

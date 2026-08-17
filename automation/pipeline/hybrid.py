@@ -64,6 +64,7 @@ from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloa
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
 from automation.pipeline.script_compile import (REVEAL_CSS_JS, _atomic_write, _esc,
+                                                repeat_hint_from_wording,
                                                 _names_value, merge_extract,
                                                 promote_healed, save_steps)
 
@@ -412,6 +413,7 @@ class Segment:
     prompt: str                     # the instantiated (concrete) subtask prompt
     context: str
     mode: str                       # "replay" | "authored" | "replay_failed->authored"
+                                    # | "probe" (conditional resolved by a FALSE probe)
     kind: str = "action"            # composition node kind: "action" | "judge" | "loop"
     ok: bool = False
     gate: dict[str, Any] = field(default_factory=dict)
@@ -432,10 +434,14 @@ class Segment:
     # Files downloaded during this segment's window (basenames; the files live in the
     # run's artifacts downloads/ folder).
     downloads: list[str] = field(default_factory=list)
+    # The replay failure that preceded an in-place takeover (mode
+    # "replay_failed->authored"). Without this the reason a library entry stopped
+    # working left no artifact at all — only a stdout line nobody kept.
+    replay_error: str | None = None
     # Why this segment did NOT replay (None on replays): "fresh" | "reauthor" | "judge" |
-    # "loop" | "conditional" | "dynamic" | "no_entry" | "identity_fork" |
-    # "values_unresolved". The answer to "why didn't it use the recording?" without
-    # archaeology — surfaced in the report row and the run summary.
+    # "loop" | "conditional" | "probe_absent" | "dynamic" | "fallback" | "no_entry" |
+    # "identity_fork" | "values_unresolved". The answer to "why didn't it use the
+    # recording?" without archaeology — surfaced in the report row and the run summary.
     skip_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -445,9 +451,40 @@ class Segment:
             "gate": self.gate, "steps_executed": self.steps_executed,
             "duration_seconds": round(self.duration_seconds, 1),
             "healed_steps": self.healed_steps, "tokens": self.tokens, "error": self.error,
+            "replay_error": self.replay_error,
             "finding": self.finding, "extracted": self.extracted,
             "downloads": self.downloads, "skip_reason": self.skip_reason,
         }
+
+
+VALUES_FILE = "values.json"
+
+
+def _write_run_values(hs: "HybridSession", run_values: dict[str, str]) -> None:
+    """Persist the run's extracted values to <run_dir>/values.json — the handoff file
+    between the segment that READS data off a page and the later segments that TYPE
+    it. In-memory `run_values` is still the primary; this file makes the handoff
+    inspectable when a binding misses, and survives the process (a resolver miss falls
+    back to it). Best-effort by rule: an evidence write must never break the run."""
+    try:
+        _atomic_write(hs.run_dir / VALUES_FILE,
+                      json.dumps({str(k): str(v) for k, v in (run_values or {}).items()},
+                                 indent=2))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not write %s: %s", VALUES_FILE, exc)
+
+
+def _read_run_values(hs: Any) -> dict[str, str]:
+    """values.json as a dict ({} when absent/unreadable)."""
+    try:
+        path = Path(getattr(hs, "run_dir", "") or ".") / VALUES_FILE
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception as exc:  # noqa: BLE001 - the in-memory store is the primary
+        logger.debug("could not read %s: %s", VALUES_FILE, exc)
+    return {}
 
 
 def _write_progress(hs: "HybridSession", *, task: str, tid: str, subtasks: list[Any],
@@ -585,11 +622,32 @@ class HybridSession:
             if page is not None and not page.is_closed():
                 return page
         self._main_page = self._pick_main_page()
+        if self._main_page is not None:
+            # The pinned page DIED and a survivor takes its place. browser-use's
+            # RecordingWatchdog streams frames from ONE CDP session and silently drops
+            # every other session's (recording_watchdog.on_screencastFrame), so without
+            # a focus event here the run video freezes for the rest of the run while
+            # the run itself carries on. Fire-and-forget from this sync path; keep a
+            # ref so the loop cannot GC the task mid-flight.
+            try:
+                self._bg_focus_task = asyncio.get_running_loop().create_task(
+                    self._focus_browser_use(self._main_page))
+            except RuntimeError:
+                pass  # no running loop (bare construction in unit tests)
         return self._main_page
 
     async def current_url(self) -> str:
         page = self.current_page()
         return page.url if page is not None else ""
+
+    async def probe_condition(self, check: Any) -> bool:
+        """One declared probe check against the live page — the deterministic stand-in
+        for a conditional guard's presence judgment (see run_hybrid_task). Fails
+        closed (absent) on an unevaluable page: the branch is then skipped, and if
+        the condition WAS raised the next segment's failure hands recovery to the
+        agent as usual."""
+        results = await evaluate_checks(self.current_page(), [], (check,))
+        return bool(results and results[0].get("ok"))
 
     async def close_extra_tabs(self) -> None:
         """Re-enforce the tab invariant after an agent segment (a misclick can open a new
@@ -1146,9 +1204,15 @@ def apply_json_path(body: str, path: list[Any]) -> str | None:
     return None
 
 
-def _captured_write_bodies(hs: Any) -> list[dict[str, Any]]:
+def _captured_write_bodies(hs: Any, before: int | None = None) -> list[dict[str, Any]]:
     """This run's create-write records that carry a captured response body, in firing
-    order (the collector's list is chronological, so 'first create wins' falls out)."""
+    order (the collector's list is chronological, so 'first create wins' falls out).
+
+    `before` (a network watermark) keeps only the writes that fired BEFORE that point —
+    what the BINDER must use: a value bound to the segment's OWN create-response can
+    never resolve at load time, because the segment types that value before making the
+    request that would return it. Four such bindings on the Add-Employee segment made
+    it re-author with the LLM on every run (run 20260813_161952)."""
     net = next((c for c in getattr(hs, "collectors", []) or []
                 if getattr(c, "name", "") == "network"), None)
     if net is None:
@@ -1157,8 +1221,125 @@ def _captured_write_bodies(hs: Any) -> list[dict[str, Any]]:
         requests = net.results().get("requests") or []
     except Exception:  # noqa: BLE001 - collector already stopped
         return []
+    if before is not None:
+        requests = requests[:before]
     return [r for r in requests
             if r.get("body") and r.get("method") in ("POST", "PUT", "PATCH")]
+
+
+# Binding transforms (2026-08-12): a typed value that is not extract-EQUAL may still
+# be derived from one — a LINE (or contiguous line run) of a multi-line block, or a
+# strict date REFORMAT. The vocabulary is closed on purpose: no fuzzy matching, and a
+# transform that fails on a fresh source resolves to None (the load refuses and the
+# segment authors live once) — never a stale or wrong slice.
+_DATE_IN_FORMATS = ("%B %d, %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y")
+_DATE_OUT_FORMATS = ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y")
+_DATE_CANDIDATE_RE = re.compile(
+    r"[A-Z][a-z]+ \d{1,2}, \d{4}"      # March 2, 1979
+    r"|\d{1,2} [A-Z][a-z]+ \d{4}"      # 2 March 1979
+    r"|\d{4}-\d{2}-\d{2}"              # 1979-03-02
+    r"|\d{1,2}/\d{1,2}/\d{4}")         # 02/03/1979 (day-first — UK app)
+
+
+def _parse_fuzzy_date(text: Any) -> datetime | None:
+    """First parseable date inside `text` under the strict input formats, else None."""
+    for cand in _DATE_CANDIDATE_RE.findall(str(text or "")):
+        for fmt in _DATE_IN_FORMATS:
+            try:
+                return datetime.strptime(cand, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def _date_out_format(value: Any) -> str | None:
+    """The output format `value` is written in, when the WHOLE value is a date."""
+    v = str(value or "").strip()
+    for fmt in _DATE_OUT_FORMATS:
+        try:
+            datetime.strptime(v, fmt)
+            return fmt
+        except ValueError:
+            continue
+    return None
+
+
+def _source_lines(src: Any) -> list[str]:
+    return [" ".join(ln.split()) for ln in str(src or "").splitlines() if ln.strip()]
+
+
+def _extract_transform_spec(value: str, extracts: dict[str, str] | None
+                            ) -> dict[str, Any] | None:
+    """A binding spec deriving `value` from one of `extracts` via the closed transform
+    vocabulary (line slice, word slice within a line, date reformat), or None. Exact
+    equality is the caller's faster first check.
+
+    The word slice exists because forms SPLIT what pages JOIN: the identity block holds
+    "Jude Williamson" and "86 Seaford Road" on single lines, while the Add Employee form
+    has separate First/Last and Building/Street fields. Without it those values have no
+    structured source at all and the segment can never be committed."""
+    v = str(value).strip()
+    if v:
+        for label, src in (extracts or {}).items():
+            lines = _source_lines(src)
+            if len(lines) < 2:
+                continue
+            for i in range(len(lines)):
+                for n in range(1, len(lines) - i + 1):
+                    for join in (" ", ", "):
+                        if join.join(lines[i:i + n]) == v:
+                            return {"kind": "extract", "label": label,
+                                    "transform": {"line": {"index": i, "count": n,
+                                                           "join": join}}}
+            # No whole-line match: a contiguous WORD run inside one line. Short values
+            # (a 2-character house number) bind here, so there is no length floor —
+            # instead the match must be UNIQUE in the source. A value that could be read
+            # from several positions refuses rather than guessing one (the same rule
+            # learn_json_path applies to ambiguous response paths).
+            hits: list[dict[str, Any]] = []
+            for i, line in enumerate(lines):
+                words = line.split()
+                for w0 in range(len(words)):
+                    for wn in range(1, len(words) - w0 + 1):
+                        if " ".join(words[w0:w0 + wn]) == v:
+                            hits.append({"line": {"index": i, "count": 1, "join": " "},
+                                         "words": {"start": w0, "count": wn}})
+            if len(hits) == 1:
+                return {"kind": "extract", "label": label, "transform": hits[0]}
+    fmt = _date_out_format(v)
+    if fmt:
+        for label, src in (extracts or {}).items():
+            d = _parse_fuzzy_date(src)
+            if d is not None and d.strftime(fmt) == v:
+                return {"kind": "extract", "label": label,
+                        "transform": {"date": fmt}}
+    return None
+
+
+def _apply_extract_transform(src: str, transform: dict[str, Any] | None) -> str | None:
+    """Derive the bound value from a FRESH source value; None on any failure."""
+    if not transform:
+        return str(src).strip() or None
+    line = transform.get("line")
+    if line:
+        lines = _source_lines(src)
+        i, n = int(line.get("index", 0)), int(line.get("count", 1))
+        if not (i >= 0 and n >= 1 and i + n <= len(lines)):
+            return None
+        out = str(line.get("join", " ")).join(lines[i:i + n]).strip()
+        words = transform.get("words")
+        if words:
+            parts = out.split()
+            w0, wn = int(words.get("start", 0)), int(words.get("count", 1))
+            if not (w0 >= 0 and wn >= 1 and w0 + wn <= len(parts)):
+                return None
+            out = " ".join(parts[w0:w0 + wn])
+        return out or None
+    fmt = transform.get("date")
+    if fmt:
+        d = _parse_fuzzy_date(src)
+        return d.strftime(str(fmt)) if d is not None else None
+    return None
 
 
 def _binding_resolver(run_values: dict[str, str], hs: Any):
@@ -1166,8 +1347,16 @@ def _binding_resolver(run_values: dict[str, str], hs: Any):
     def resolve(spec: dict[str, Any]) -> str | None:
         try:
             if spec.get("kind") == "extract":
-                value = (run_values or {}).get(str(spec.get("label")))
-                return str(value).strip() or None if value else None
+                label = str(spec.get("label"))
+                value = (run_values or {}).get(label)
+                if not value:
+                    # Second look at the run's handoff file: it holds every value this
+                    # run has extracted so far, so a resolver created before the
+                    # producing segment ran (or a resumed process) still resolves.
+                    value = _read_run_values(hs).get(label)
+                if not value:
+                    return None
+                return _apply_extract_transform(str(value), spec.get("transform"))
             if spec.get("kind") == "created":
                 for rec in _captured_write_bodies(hs):
                     if rec.get("method") != spec.get("method"):
@@ -1207,7 +1396,10 @@ def _bind_runtime_values(
         spec: dict[str, Any] | None = None
         if label is not None:
             spec = {"kind": "extract", "label": label}
-        else:
+        if spec is None:
+            # Not extract-equal: a line slice or date reformat of one still binds.
+            spec = _extract_transform_spec(value, extracts)
+        if spec is None:
             for rec in bodies:
                 path = learn_json_path(rec.get("body") or "", value)
                 if path is not None:
@@ -1221,18 +1413,29 @@ def _bind_runtime_values(
         params[name] = value
         bindings[name] = spec
         replacements.append((value, "{{%s}}" % name))
+
+    def _sub_whole(text: str, literal: str, token: str) -> str:
+        # Boundary-safe: an occurrence flanked by alphanumerics is PART of some other
+        # value, not this literal — the house number '35' must never rewrite the
+        # unrelated Gross Pay '3500' into '{{bound_N}}00' (run 20260817_115232 replayed
+        # Gross Pay as 6300 exactly that way). Lambda replacement keeps the token
+        # immune to re.sub escape interpretation.
+        return re.sub(r"(?<![A-Za-z0-9])" + re.escape(literal) + r"(?![A-Za-z0-9])",
+                      lambda _m: token, text)
+
     rewritten: list[dict[str, Any]] = []
     for step in steps:
         new_step = dict(step)
         for key in ("text", "value", "expect_text"):
             if isinstance(new_step.get(key), str):
                 for literal, token in replacements:
-                    new_step[key] = new_step[key].replace(literal, token)
+                    new_step[key] = _sub_whole(new_step[key], literal, token)
         if new_step.get("selectors"):
             sels = []
             for sel in new_step["selectors"]:
                 for literal, token in replacements:
-                    sel = sel.replace(_esc(literal), token).replace(literal, token)
+                    sel = _sub_whole(_sub_whole(sel, _esc(literal), token),
+                                     literal, token)
                 sels.append(sel)
             new_step["selectors"] = sels
         rewritten.append(new_step)
@@ -1314,6 +1517,9 @@ async def _author_segment(
     hollow pass — so nothing of it may ever enter the library.
     """
     segment_started = datetime.now().timestamp()
+    # Where the network log stood BEFORE this segment acted: the binder may only bind
+    # typed values to data that already existed (see _captured_write_bodies).
+    writes_before = hs.network_watermark() if hasattr(hs, "network_watermark") else None
     # Authoring records to a TEMP path and promotes only on success: the canonical
     # recording.json always corresponds to the last COMMITTED skill, and a failed
     # re-authoring can no longer destroy it (observed live 2026-07-29: a failed --fresh
@@ -1366,7 +1572,10 @@ async def _author_segment(
         truncate_at = seg.write_step
     try:
         steps = save_steps(sstore.recording_path(sid), sstore.steps_path(sid),
-                           max_steps=truncate_at, emit_start_goto=False)
+                           max_steps=truncate_at, emit_start_goto=False,
+                           # "exactly N clicks" wording pins a lone repeat cluster's
+                           # count — the recorded count can be short one collapsed retry.
+                           repeat_hint=repeat_hint_from_wording(sub.instantiated_prompt))
         if not steps:
             # A zero-step script would replay as a hollow no-op pass. Leave NO entry (the
             # recording stays for diagnosis); the next run authors this segment again.
@@ -1380,6 +1589,18 @@ async def _author_segment(
                             "conditional guard already satisfied this run); nothing to "
                             "commit — future runs re-check it live", sid)
             return seg
+        unanchorable = [s for s in steps if s.get("action") == "unanchorable"]
+        if unanchorable:
+            # A click the compiler could not tie to an exact location. Committing it
+            # would mean recording a TEXT SEARCH, and a replay that hunts for elements
+            # lands on the wrong one (find_click('Net to gross') → 36 matches). Refuse
+            # the whole segment: it authors live every run until the click can be
+            # anchored, which is honest and never wrong.
+            sstore.steps_path(sid).unlink(missing_ok=True)
+            print(f"[*] segment [{sid}]: not cached — "
+                  f"{unanchorable[0].get('why', 'a step has no anchorable element')}; "
+                  f"a recording must locate elements, never search for them")
+            return seg
         # Provenance commit guard — the general, wording-free memory rule: a segment
         # that acted with values sourced from the run's FINDINGS consumed runtime data,
         # and a cached replay would re-use this run's values forever. Since 2026-07-24
@@ -1388,16 +1609,38 @@ async def _author_segment(
         # is rewritten to a {{bound_N}} param resolved fresh from EACH run's own data
         # at load time. Only prose-only values still refuse the commit — those segments
         # keep authoring fresh every run.
-        runtime_values = _findings_sourced_values(
-            steps, sub.instantiated_prompt, findings)
+        # Judge values against the WHOLE task's wording, not just this slice's: a value
+        # another slice spells out ("note ... the Gender (Male)") is prompt data even
+        # when this slice only says "enter the noted gender". Judging it slice-locally
+        # made it runtime data with no structured source, and ONE unbindable value
+        # refuses the entire commit — which is why the Add-Employee recording never
+        # cached (run 20260814_100546). The create-write leg below already uses this
+        # corpus; the findings leg now agrees with it.
+        task_wording = " \n ".join([sub.instantiated_prompt, *completed, *remaining])
+        runtime_values = _findings_sourced_values(steps, task_wording, findings)
         # Findings-independent leg: values the run's own create-writes reported are
         # runtime data even when no finding names them (the findings channel goes
         # quiet once the producer segments replay).
-        bodies = _captured_write_bodies(hs)
-        task_wording = " \n ".join([sub.instantiated_prompt, *completed, *remaining])
+        bodies = _captured_write_bodies(hs, before=writes_before)
         for value in _body_sourced_values(steps, task_wording, bodies):
             if value not in runtime_values:
                 runtime_values.append(value)
+        # Structured-source leg: a typed value that equals an extract an EARLIER
+        # segment produced — or derives from one via the closed transforms (a line of
+        # a block, a date reformat) — is runtime data even when no finding prose names
+        # it. Flagging it here both feeds the binder and stops the consumer gate below
+        # from refusing the exact values bindings can now carry. Deliberately PRIOR
+        # sources only (run_values): a segment's own extracts happen after its load,
+        # so a self-referential binding could never resolve at replay time.
+        prior_sources = dict(run_values or {})
+        for value, kind in _step_value_candidates(steps):
+            v = value.strip()
+            if (kind == "typed" and len(v) >= 3 and v not in runtime_values
+                    and not _names_value(sub.instantiated_prompt, v)):
+                if any(str(s).strip() == v for s in prior_sources.values()) \
+                        or _extract_transform_spec(v, prior_sources) is not None:
+                    runtime_values.append(v)
+        sources = {**(run_values or {}), **(seg.extracted or {})}
         if dynamic:
             # The wording DECLARES consumption of noted data, so this commit is held to
             # a stricter bar than the substring guard alone: every typed value must be
@@ -1405,8 +1648,7 @@ async def _author_segment(
             # An unattributable value may be runtime data the guard cannot see (a
             # re-formatted date), and a consumer recording with no bindable value at all
             # keeps the pre-bindings behavior: author fresh every run.
-            loose = _unattributed_typed_values(steps, sub.instantiated_prompt,
-                                               runtime_values)
+            loose = _unattributed_typed_values(steps, task_wording, runtime_values)
             if loose or not runtime_values:
                 sstore.steps_path(sid).unlink(missing_ok=True)
                 what = (f"unattributable typed value(s) "
@@ -1417,7 +1659,6 @@ async def _author_segment(
                 return seg
         bound = None
         if runtime_values:
-            sources = {**(run_values or {}), **(seg.extracted or {})}
             bound = _bind_runtime_values(steps, runtime_values, sources, bodies)
             if bound is None:
                 sstore.steps_path(sid).unlink(missing_ok=True)
@@ -1543,6 +1784,12 @@ async def run_hybrid_task(
             # page state, so a recording of the TRUE branch must never replay (and a TRUE
             # branch run must never commit one). See decompose.is_conditional_guard.
             is_conditional = is_conditional_guard(sub.template_prompt)
+            # ... unless the slice declares a `probe:` — a deterministic check that
+            # replaces the agent's live presence judgment. A FALSE probe resolves the
+            # segment as a zero-LLM no-op; a TRUE probe lets the branch replay/commit
+            # like an action, because recorded TRUE-branch steps then only ever run
+            # behind a TRUE probe. Ignored on non-conditional slices.
+            probe = getattr(sub, "probe", None) if is_conditional else None
             # Dynamic-input gate: a subtask whose wording USES data noted by an earlier
             # segment ("the noted generated name") must not replay a plain recording once
             # this run HAS such observations — runtime values are never parameterizable
@@ -1620,14 +1867,36 @@ async def run_hybrid_task(
                     break
 
             try:
+                if probe is not None:
+                    if await hs.probe_condition(probe):
+                        print(f"[*] subtask {i} [{sid}]: probe {probe.kind} "
+                              f"\"{probe.arg}\" PRESENT -> condition raised; running "
+                              f"the branch")
+                    else:
+                        skip_reason = "probe_absent"
+                        print(f"[*] subtask {i} [{sid}]: probe {probe.kind} "
+                              f"\"{probe.arg}\" absent -> condition not raised; "
+                              f"moving on (no agent, no replay)")
+                        seg = Segment(
+                            index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
+                            context=context, mode="probe",
+                            kind=getattr(sub, "kind", "action"), ok=True,
+                            gate={"kind": "probe", "ok": True, "present": False,
+                                  "check": f'{probe.kind} "{probe.arg}"'},
+                            skip_reason="probe_absent")
+
                 # Judge, loop, and conditional-guard nodes never touch the library in
                 # EITHER direction: a replayed judge would click through with nobody
                 # looking (hollow pass), a replayed loop would walk a fixed number of
                 # iterations and land anywhere, a replayed conditional would take its
                 # branch unconditionally — and their recordings must never be committed
-                # for the same reasons.
-                if not fresh and not force_author and not is_judge and not is_loop \
-                        and not is_conditional and not is_dynamic \
+                # for the same reasons. Exception: a conditional WITH a declared probe
+                # is action-like on the TRUE path — the probe above already decided the
+                # branch is raised, so its recording replays/commits safely.
+                if seg is None and not fresh and not force_author and not is_judge \
+                        and not is_loop \
+                        and (not is_conditional or probe is not None) \
+                        and not is_dynamic \
                         and sstore.has_script(sid):
                     load_sub = sub if route_values is None else SimpleNamespace(
                         instantiated_prompt=sub.instantiated_prompt, values=route_values)
@@ -1648,12 +1917,30 @@ async def run_hybrid_task(
                                   f"({seg.error}) -> agent takes over in place"
                                   f"{' (dirty state)' if dirty else ''}")
                             if not dirty and route_values is None:
-                                # Failed before touching the page: the recovery run starts from
-                                # the entry's declared context, so it IS a clean re-author.
-                                # (A ROUTED failure never archives the canonical entry — the
-                                # wording mapping may be at fault, not the recording.)
-                                sstore.archive_entry(sid)
+                                # Failed before touching the page: the recovery run starts
+                                # from the entry's declared context, so it IS a clean
+                                # re-author. Retire the old entry only after REPEATED
+                                # consecutive failures (bump_meta above counts them and
+                                # resets on any success) — deleting it on the first miss
+                                # meant one slow render or un-populated list destroyed a
+                                # working recording for good, which is why recordings kept
+                                # "not working the next day". A successful re-author
+                                # overwrites the entry anyway.
+                                # (A ROUTED failure never archives the canonical entry —
+                                # the wording mapping may be at fault, not the recording.)
+                                sstore.archive_if_failing(
+                                    sid, threshold=_ARCHIVE_AFTER_FAILURES)
                             prior = seg.error
+                            # A failed replay can still have READ data off the page
+                            # before it died (extract steps run before the step that
+                            # fails). `seg` is rebound to the authored segment below,
+                            # so harvest those values now or they are lost — and they
+                            # are exactly what a later segment's bindings resolve
+                            # against.
+                            if seg.extracted:
+                                run_values.update({str(k): str(v)
+                                                   for k, v in seg.extracted.items()})
+                                _write_run_values(hs, run_values)
                             # A bound entry's takeover must know THIS run's resolved
                             # values (observed live: a dirty recovery found the stale
                             # record's panel open, had no observation naming the fresh
@@ -1681,6 +1968,9 @@ async def run_hybrid_task(
                                 findings=takeover_findings, run_values=run_values,
                                 start_url=raw_start_url, dynamic=is_consumer)
                             seg.mode = "replay_failed->authored"
+                            # Why the replay failed used to die with the rebound
+                            # segment — stdout only, no artifact. Keep it on the record.
+                            seg.replay_error = prior
                     else:
                         skip_reason = "values_unresolved"
                         print(f"[*] subtask {i} [{sid}]: library hit but values did not "
@@ -1706,10 +1996,11 @@ async def run_hybrid_task(
                         skip_reason = "loop"
                         print(f"[*] subtask {i} [{sid}]: loop node (repeat-until) -> agent "
                               f"runs it live with an extended step budget, never cached")
-                    elif is_conditional:
+                    elif is_conditional and probe is None:
                         skip_reason = "conditional"
                         print(f"[*] subtask {i} [{sid}]: conditional branch guard -> agent "
-                              f"runs it live, never cached")
+                              f"runs it live, never cached (declare a probe: to make "
+                              f"it replayable)")
                     elif is_dynamic:
                         skip_reason = "dynamic"
                         print(f"[*] subtask {i} [{sid}]: uses data noted by an earlier "
@@ -1745,7 +2036,8 @@ async def run_hybrid_task(
                                                 # pre-hybrid behavior this mode degrades
                                                 # FROM, not a library asset.
                                                 commit=not is_judge and not is_loop
-                                                and not is_conditional
+                                                and (not is_conditional
+                                                     or probe is not None)
                                                 and not getattr(sub, "fallback", False))
                     seg.skip_reason = skip_reason
             finally:
@@ -1767,6 +2059,7 @@ async def run_hybrid_task(
                 # Structured twin of the prose findings: the run-value store bindings
                 # resolve against (later collisions win, matching _history_extracts).
                 run_values.update({str(k): str(v) for k, v in seg.extracted.items()})
+                _write_run_values(hs, run_values)
             if seg.finding:
                 findings.append(f"{sub.instantiated_prompt[:80]}: {seg.finding}")
     except KeyboardInterrupt:
@@ -1804,15 +2097,20 @@ async def run_hybrid_task(
     if total_tokens:
         result.usage = {"total_tokens": total_tokens, "total_cost": total_cost}
     replayed = sum(1 for s in segments if s.mode == "replay")
-    authored = len(segments) - replayed
+    probe_skipped = sum(1 for s in segments if s.mode == "probe")
+    authored = len(segments) - replayed - probe_skipped
     # Break the authored count down by WHY each segment did not replay — a bare
     # "0 replayed" hides whether the cache was cold, bypassed (--fresh), or the
-    # subtasks are live-by-kind.
-    reasons = Counter(s.skip_reason for s in segments if s.skip_reason)
+    # subtasks are live-by-kind. Probe-resolved no-ops are neither replayed nor
+    # authored and get their own count.
+    reasons = Counter(s.skip_reason for s in segments
+                      if s.skip_reason and s.mode != "probe")
     breakdown = ", ".join(f"{n} {r}" for r, n in sorted(reasons.items()))
     result.final_result = (
         f"Hybrid run: {len(segments)}/{len(subtasks)} subtasks "
-        f"({replayed} replayed, {authored} authored"
+        f"({replayed} replayed, "
+        + (f"{probe_skipped} probe-skipped, " if probe_skipped else "")
+        + f"{authored} authored"
         + (f": {breakdown}" if breakdown else "") + ")"
         + ("" if all_ok else f" — FAILED at subtask {len(segments) - 1}")
     )

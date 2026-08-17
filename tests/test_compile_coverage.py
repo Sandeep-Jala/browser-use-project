@@ -39,15 +39,37 @@ def test_scrolls_compile(tmp_path):
     ]
 
 
-def test_find_by_text_click_without_metadata_compiles_to_semantic_find_click(tmp_path):
-    # No recorded element -> replay the INTENT with the tool's own algorithm, not a lossy
-    # selector translation.
+def test_find_by_text_click_without_metadata_is_unanchorable(tmp_path):
+    """No recorded element identity -> the click cannot be tied to a location. Recording
+    the tool's TEXT SEARCH instead is what made replays hunt tokens and land on the
+    wrong element, so compile marks the segment unanchorable (the commit is refused and
+    it authors live) rather than baking a search step."""
     history = [_item({"find_by_text": {"text": "View all", "click_first": True}},
                      result=[{"extracted_content": "clicked"}])]
     steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
-    assert steps == [{"action": "find_click", "text": "View all"}]
+    assert [s["action"] for s in steps] == ["unanchorable"]
+    assert "View all" in steps[0]["why"]
     # A non-clicking find_by_text still compiles to nothing.
     history = [_item({"find_by_text": {"text": "View all"}})]
+    assert compile_recording(_write(tmp_path, history), emit_start_goto=False) == []
+
+
+def test_unexecuted_actions_are_never_compiled(tmp_path):
+    """multi_act stops the queue on a refusal: the later actions of that step never ran
+    and have no result slot. Compiling them baked phantom steps — a find_by_text that
+    never happened became find_click('Ayaan Campbell') and failed every replay of the
+    pay-forecast segment (run 20260813_132507)."""
+    history = [{
+        "state": {"url": "http://app/x", "interacted_element": []},
+        "model_output": {"action": [
+            {"input": {"index": 7447, "text": "Ayaan Campbell", "clear": True}},
+            {"wait": {"seconds": 2}},
+            {"find_by_text": {"text": "Ayaan Campbell", "click_first": True}},
+            {"wait": {"seconds": 2}},
+        ]},
+        "result": [{"error": "REFUSED — did NOT type 'Ayaan Campbell': …",
+                    "metadata": {"no_fill": True}}],
+    }]
     assert compile_recording(_write(tmp_path, history), emit_start_goto=False) == []
 
 
@@ -177,18 +199,19 @@ def test_find_by_text_no_click_results_compile_to_nothing(tmp_path):
 
 
 def test_find_by_text_hidden_clicks_replay_the_tool_normal_ones_keep_selectors(tmp_path):
-    """A click made through the tool's hidden-control path (hover-revealed/0-size —
-    observed live: the Reviews 'View all' icon) compiles to a SEMANTIC find_click step:
-    selector+pointer replay is structurally unstable for such controls. A normal
-    find_by_text click (snapshot path, full element identity) keeps the proven selector
-    replay, with the hidden recovery as a safety net."""
+    """A hidden-control click (hover-revealed/0-size — the Reviews 'View all' icon) is
+    anchored like any other click when the capture carries identity; hidden_ok keeps the
+    hover/dispatch recovery as its safety net. A normal find_by_text click (snapshot
+    path, full element identity) keeps the proven selector replay."""
     hidden = [_item({"find_by_text": {"text": "View all", "click_first": True}},
                     result=[{"metadata": {"interacted_element": {
                         "node_name": "button", "ax_name": "View all",
                         "attributes": {"title": "View all", "role": "button"},
+                        "x_path": "html/body/button[2]",
                         "hidden_click": True}}}])]
     steps = compile_recording(_write(tmp_path, hidden), emit_start_goto=False)
-    assert steps == [{"action": "find_click", "text": "View all"}]
+    assert steps[0]["action"] == "click" and steps[0]["hidden_ok"] is True
+    assert steps[0]["selectors"][0] == "xpath=/html/body/button[2]"
 
     normal = [_item({"find_by_text": {"text": "btnInvoice", "click_first": True}},
                     result=[{"metadata": {"interacted_element": {
@@ -230,7 +253,10 @@ def test_labelless_click_recovers_text_from_state_message(tmp_path):
     steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
 
     (step,) = steps
-    assert 'text="Sent"' in step["selectors"]           # no longer xpath-only
+    # The chip carries no identity attribute, so the recorded location IS the anchor
+    # (2026-08-13: text= candidates are gone — a replay locates, it does not search).
+    # The recovered text still guards the landing and feeds heal scoring.
+    assert step["selectors"] == ["xpath=/html/body/div[1]/span/span"]
     assert step["expect_text"] == "Sent"                # wrong-element clicks refuse
     assert step["fingerprint"]["text"] == "Sent"        # heal gets the text signal
     # And the DOM-listing text also names the codegen handle (not 'click').
@@ -498,12 +524,14 @@ async def test_run_steps_extract_query_reads_static_text():
         # The name alone in its <h3> is EXACTLY the query — zero information gained — so
         # the finder expands to the enclosing card (2026-07-29): the whole identity block
         # is the value, and the consuming step parses the facts out of it.
-        assert out["extracted"]["generated_name"] == \
-            "Felix MacDonald 93 Mounthoolie Lane SUNNYSIDE AB1 5AW"
+        # LINE STRUCTURE IS PRESERVED (2026-08-13): bindings slice fields out of a block
+        # by line position, so the block must read back the same way it was captured.
+        assert out["extracted"]["generated_name"].splitlines() == [
+            "Felix MacDonald", "93 Mounthoolie Lane", "SUNNYSIDE", "AB1 5AW"]
         # The address capture already gains beyond its query (city and postcode ride
         # along), so it is NOT expanded — the tightest element stays the anchor.
-        assert out["extracted"]["generated_address"] == \
-            "93 Mounthoolie Lane SUNNYSIDE AB1 5AW"
+        assert out["extracted"]["generated_address"].splitlines() == [
+            "93 Mounthoolie Lane", "SUNNYSIDE", "AB1 5AW"]
 
         # A value that is truly absent still fails honestly.
         out = await run_steps(page, [{"action": "extract", "label": "g",
@@ -1101,8 +1129,13 @@ def test_generic_role_option_pick_compiles_to_by_label_click(tmp_path):
         element=element,
     )]
     steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
-    assert steps == [{"action": "click", "selectors": [
-        'role=option[name="Weekly"]', 'text="Weekly"'], "expect_text": "Weekly"}]
+    # type-then-pick (collapsed by codegen into api.select_option): the menu's list is
+    # filtered into existence by the typing, so the option is there to be clicked.
+    assert steps == [
+        {"action": "type", "text": "Weekly"},
+        {"action": "click", "selectors": ['role=option[name="Weekly"]', 'text="Weekly"'],
+         "expect_text": "Weekly"},
+    ]
 
 
 def test_native_select_pick_still_compiles_to_select_step(tmp_path):
@@ -1117,3 +1150,388 @@ def test_native_select_pick_still_compiles_to_select_step(tmp_path):
     assert len(steps) == 1
     assert steps[0]["action"] == "select"
     assert steps[0]["value"] == "United Kingdom"
+
+
+# ---------------------- repeat-aware collapse + indexed runs ----------------------
+# (2026-08-12: _push_step used to DROP wait-separated repeat clicks — the recorded
+# 5x/14x Save & Next counters compiled to ONE click. Repeats now absorb into a count;
+# id-indexed grid runs collapse to one click_indexed template step.)
+
+
+def _btn(text="Save & Next"):
+    return {"node_name": "button", "ax_name": text,
+            "attributes": {"id": "btnSave"}, "x_path": "html/body/div[1]/button"}
+
+
+def _chk(idv):
+    return {"node_name": "div", "ax_name": None,
+            "attributes": {"id": idv, "role": "checkbox",
+                           "data-automationid": "DetailsRowCheck"},
+            "x_path": "html/body/div[2]/div/div"}
+
+
+def test_wait_separated_repeat_clicks_absorb_into_count(tmp_path):
+    history = []
+    for _ in range(5):
+        history.append(_item({"click": {"index": 1}}, element=_btn()))
+        history.append(_item({"wait": {"seconds": 1}}))
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "wait"]  # trailing settle survives
+    assert steps[0]["count"] == 5
+    assert steps[0]["repeat_wait_s"] == 1.0
+
+
+def test_adjacent_same_target_click_still_collapses_as_retry(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_btn()),
+               _item({"click": {"index": 1}}, element=_btn())]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click"]
+    assert "count" not in steps[0]
+
+
+def test_repeat_hint_pins_single_cluster_count(tmp_path):
+    history = []
+    for _ in range(4):
+        history.append(_item({"click": {"index": 1}}, element=_btn()))
+        history.append(_item({"wait": {"seconds": 2}}))
+    from automation.pipeline.script_compile import save_steps
+    out = tmp_path / "steps.json"
+    steps = save_steps(_write(tmp_path, history), out, emit_start_goto=False,
+                       repeat_hint=5)
+    assert steps[0]["count"] == 5          # wording "exactly 5 clicks" wins
+    assert steps[0]["repeat_wait_s"] == 2.0
+
+
+def test_repeat_hint_never_invents_a_cluster(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_btn())]
+    from automation.pipeline.script_compile import save_steps
+    out = tmp_path / "steps.json"
+    steps = save_steps(_write(tmp_path, history), out, emit_start_goto=False,
+                       repeat_hint=5)
+    assert "count" not in steps[0]
+
+
+def test_repeat_hint_from_wording():
+    from automation.pipeline.script_compile import repeat_hint_from_wording
+    assert repeat_hint_from_wording(
+        "Click Save & Next for the next 5 employees: exactly 5 clicks, waiting") == 5
+    assert repeat_hint_from_wording("exactly 14 more clicks, waiting for") == 14
+    assert repeat_hint_from_wording("click Save & Next exactly 3 times") == 3
+    assert repeat_hint_from_wording("click Save and continue") is None
+
+
+def test_indexed_click_run_collapses_and_normalizes(tmp_path):
+    # The agent skipped index 7 and ticked 20 to compensate (observed live 2026-08-12):
+    # normalization yields the contiguous span 0..19.
+    observed = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    history = [_item({"click": {"index": 1}},
+                     element=_chk(f"row{26102 + 13 * n}-{n}-checkbox"))
+               for n in observed]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert len(steps) == 1
+    s = steps[0]
+    assert s["action"] == "click_indexed"
+    assert s["selector_template"] == 'css=[id$="-{n}-checkbox"]'
+    assert s["start"] == 0 and s["count"] == 20
+    assert s["fingerprint"]["attrs"]["data-automationid"] == "DetailsRowCheck"
+
+
+def test_indexed_run_swallows_interleaved_scrolls_and_waits(tmp_path):
+    history = []
+    for n in range(6):
+        history.append(_item({"click": {"index": 1}},
+                             element=_chk(f"row{100 + n}00-{n}-checkbox")))
+        if n == 2:
+            history.append(_item({"capped_scroll": {"down": True, "pages": 0.5}}))
+        if n == 4:
+            history.append(_item({"wait": {"seconds": 1}}))
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click_indexed"]
+    assert steps[0]["start"] == 0 and steps[0]["count"] == 6
+
+
+def test_indexed_run_preserves_nonzero_start(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_chk(f"row9{n}1-{n}-checkbox"))
+               for n in range(5, 16)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps[0]["action"] == "click_indexed"
+    assert steps[0]["start"] == 5 and steps[0]["count"] == 11
+
+
+def test_short_or_shapeless_runs_stay_individual_clicks(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_chk(f"row111-{n}-checkbox"))
+               for n in range(2)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "click"]
+    history = [_item({"click": {"index": 1}}, element=_btn()),
+               _item({"click": {"index": 1}}, element=_chk("plainid")),
+               _item({"click": {"index": 1}}, element=_btn("Other"))]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert all(s["action"] == "click" for s in steps)
+
+
+def test_volatile_prefix_id_gets_stable_suffix_selector():
+    from automation.pipeline.script_compile import _selectors
+    sels = _selectors(_chk("row26102-3-checkbox"))
+    assert 'css=[id$="-3-checkbox"]' in sels
+    assert not any("row26102" in s for s in sels)
+    assert 'css=[data-automationid="DetailsRowCheck"]' in sels
+
+
+# ---------------------- repeat-aware collapse + indexed runs ----------------------
+# (2026-08-12: _push_step used to DROP wait-separated repeat clicks — the recorded
+# 5x/14x Save & Next counters compiled to ONE click. Repeats now absorb into a count;
+# id-indexed grid runs collapse to one click_indexed template step.)
+
+
+def _btn(text="Save & Next"):
+    return {"node_name": "button", "ax_name": text,
+            "attributes": {"id": "btnSave"}, "x_path": "html/body/div[1]/button"}
+
+
+def _chk(idv):
+    return {"node_name": "div", "ax_name": None,
+            "attributes": {"id": idv, "role": "checkbox",
+                           "data-automationid": "DetailsRowCheck"},
+            "x_path": "html/body/div[2]/div/div"}
+
+
+def test_wait_separated_repeat_clicks_absorb_into_count(tmp_path):
+    history = []
+    for _ in range(5):
+        history.append(_item({"click": {"index": 1}}, element=_btn()))
+        history.append(_item({"wait": {"seconds": 1}}))
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "wait"]  # trailing settle survives
+    assert steps[0]["count"] == 5
+    assert steps[0]["repeat_wait_s"] == 1.0
+
+
+def test_adjacent_same_target_click_still_collapses_as_retry(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_btn()),
+               _item({"click": {"index": 1}}, element=_btn())]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click"]
+    assert "count" not in steps[0]
+
+
+def test_repeat_hint_pins_single_cluster_count(tmp_path):
+    history = []
+    for _ in range(4):
+        history.append(_item({"click": {"index": 1}}, element=_btn()))
+        history.append(_item({"wait": {"seconds": 2}}))
+    from automation.pipeline.script_compile import save_steps
+    out = tmp_path / "steps.json"
+    steps = save_steps(_write(tmp_path, history), out, emit_start_goto=False,
+                       repeat_hint=5)
+    assert steps[0]["count"] == 5          # wording "exactly 5 clicks" wins
+    assert steps[0]["repeat_wait_s"] == 2.0
+
+
+def test_repeat_hint_never_invents_a_cluster(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_btn())]
+    from automation.pipeline.script_compile import save_steps
+    out = tmp_path / "steps.json"
+    steps = save_steps(_write(tmp_path, history), out, emit_start_goto=False,
+                       repeat_hint=5)
+    assert "count" not in steps[0]
+
+
+def test_repeat_hint_from_wording():
+    from automation.pipeline.script_compile import repeat_hint_from_wording
+    assert repeat_hint_from_wording(
+        "Click Save & Next for the next 5 employees: exactly 5 clicks, waiting") == 5
+    assert repeat_hint_from_wording("exactly 14 more clicks, waiting for") == 14
+    assert repeat_hint_from_wording("click Save & Next exactly 3 times") == 3
+    assert repeat_hint_from_wording("click Save and continue") is None
+
+
+def test_indexed_click_run_collapses_and_normalizes(tmp_path):
+    # The agent skipped index 7 and ticked 20 to compensate (observed live 2026-08-12):
+    # normalization yields the contiguous span 0..19.
+    observed = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    history = [_item({"click": {"index": 1}},
+                     element=_chk(f"row{26102 + 13 * n}-{n}-checkbox"))
+               for n in observed]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert len(steps) == 1
+    s = steps[0]
+    assert s["action"] == "click_indexed"
+    assert s["selector_template"] == 'css=[id$="-{n}-checkbox"]'
+    assert s["start"] == 0 and s["count"] == 20
+    assert s["fingerprint"]["attrs"]["data-automationid"] == "DetailsRowCheck"
+
+
+def test_indexed_run_swallows_interleaved_scrolls_and_waits(tmp_path):
+    history = []
+    for n in range(6):
+        history.append(_item({"click": {"index": 1}},
+                             element=_chk(f"row{100 + n}00-{n}-checkbox")))
+        if n == 2:
+            history.append(_item({"capped_scroll": {"down": True, "pages": 0.5}}))
+        if n == 4:
+            history.append(_item({"wait": {"seconds": 1}}))
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click_indexed"]
+    assert steps[0]["start"] == 0 and steps[0]["count"] == 6
+
+
+def test_indexed_run_preserves_nonzero_start(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_chk(f"row9{n}1-{n}-checkbox"))
+               for n in range(5, 16)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps[0]["action"] == "click_indexed"
+    assert steps[0]["start"] == 5 and steps[0]["count"] == 11
+
+
+def test_short_or_shapeless_runs_stay_individual_clicks(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_chk(f"row111-{n}-checkbox"))
+               for n in range(2)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "click"]
+    history = [_item({"click": {"index": 1}}, element=_btn()),
+               _item({"click": {"index": 1}}, element=_chk("plainid")),
+               _item({"click": {"index": 1}}, element=_btn("Other"))]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert all(s["action"] == "click" for s in steps)
+
+
+def test_volatile_prefix_id_gets_stable_suffix_selector():
+    from automation.pipeline.script_compile import _selectors
+    sels = _selectors(_chk("row26102-3-checkbox"))
+    assert 'css=[id$="-3-checkbox"]' in sels
+    assert not any("row26102" in s for s in sels)
+    assert 'css=[data-automationid="DetailsRowCheck"]' in sels
+
+
+# ------------------- extract values stay WHOLE (2026-08-13) -------------------
+# Auto-splitting labeled lines into per-field keys was removed: the keys came from page
+# CONTENT ("PILTON" from an address block), so a binding keyed on one could never
+# resolve on the next identity. Values are stored whole and sliced by binding
+# transforms (line index / date reformat) instead.
+
+
+def test_merge_extract_stores_blocks_whole_without_content_derived_keys():
+    from automation.pipeline.script_compile import merge_extract
+    store = {}
+    block = "Ayaan Campbell\n73 Tadcaster Rd\nPILTON\nPE8 9ZS"
+    merge_extract(store, "identity_block", block)
+    assert list(store) == ["identity_block"]
+    assert store["identity_block"] == block          # line structure preserved
+    merge_extract(store, "dob_block", "Birthday\nMarch 2, 1979")
+    assert list(store) == ["identity_block", "dob_block"]
+
+
+def test_extract_normalizes_identically_when_authored_and_replayed():
+    """Authoring and replay must produce the SAME shape of value: bindings slice fields
+    by LINE POSITION, so a replay that flattened the block made every line-transform
+    binding unresolvable and the form-fill segment re-authored with the LLM every run
+    (runs 20260813_153838 vs _155450 — authored kept the lines, replay lost them)."""
+    from automation.pipeline.script_compile import normalize_block_text
+    raw = "  Arron McIntosh \n\n 41 Gloucester   Road \n CILRHEDYN \n SA35 5WS  "
+    assert normalize_block_text(raw) == (
+        "Arron McIntosh\n41 Gloucester Road\nCILRHEDYN\nSA35 5WS")
+    # Single-line values are unaffected; empties stay empty.
+    assert normalize_block_text("  one   line  ") == "one line"
+    assert normalize_block_text("") == ""
+
+
+async def test_replayed_extract_keeps_block_lines(monkeypatch):
+    """The replay reader itself — a block read back through _extract_value keeps its
+    line structure (this is the value bindings resolve against)."""
+    from automation.pipeline import script_compile as sc
+
+    class _Loc:
+        async def evaluate(self, expr):
+            return ""                       # not a form control
+
+        async def inner_text(self):
+            return "Luis Stevenson\n67 Wressle Road\nPLESHEY\nCM3 2SE"
+
+        async def text_content(self):
+            return ""
+
+        async def input_value(self):
+            return ""
+
+    async def fake_resolve(page, step, timeout_ms, require_editable=False):
+        return _Loc(), "xpath=/html/body/div[2]", None
+
+    monkeypatch.setattr(sc, "_resolve", fake_resolve)
+    value, used, _ = await sc._extract_value(
+        None, {"selectors": ["xpath=/html/body/div[2]"], "label": "name"}, 500)
+    assert value.splitlines() == ["Luis Stevenson", "67 Wressle Road", "PLESHEY",
+                                  "CM3 2SE"]
+    assert used.startswith("xpath=")
+
+
+def test_custom_combobox_pick_replays_by_value_not_a_bare_option_click(tmp_path):
+    """select_dropdown on a non-react-select combobox used to compile to a BARE option
+    click. The list is only populated once the filter text is typed, so replay clicked
+    an option that did not exist yet — the pay-forecast employee pick failed on two
+    consecutive runs with `role=option[name="Abdullah Reilly"] -> no match`
+    (20260813_161952, 20260814_103913). Emitting the type+option pair makes codegen
+    collapse it into api.select_option(value): open the menu, filter, pick, verify."""
+    option_el = {"node_name": "div", "ax_name": "Riley Moore",
+                 "attributes": {"role": "option", "id": "emp-opt-3"},
+                 "x_path": "html/body/div[3]/div[2]"}
+    history = [_item({"select_dropdown": {"index": 15201, "text": "Riley Moore"}},
+                     result=[{"extracted_content": "Selected"}], element=option_el)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    assert [s["action"] for s in steps] == ["type", "click"]
+    assert steps[0]["text"] == "Riley Moore"
+    # Exact location leads (name-guarded below); the by-name candidates back it up.
+    assert steps[1]["selectors"][0] == "xpath=/html/body/div[3]/div[2]"
+    assert 'role=option[name="Riley Moore"]' in steps[1]["selectors"]
+    assert steps[1]["expect_text"] == "Riley Moore"
+    # codegen collapses the pair into the by-value primitive
+    code, _ = transpile("sid", steps)
+    assert "await api.select_option('Riley Moore')" in code
+
+
+def test_send_keys_text_compiles_to_typing_not_a_key_press(tmp_path):
+    """`send_keys` carries EITHER a key chord or raw text. Compiling text as a key press
+    made replay call keyboard.press("4000") -> Playwright `Unknown key: "4000"`, which
+    killed the net-to-gross replay (run 20260814_105247, subtask 4)."""
+    history = [
+        _item({"send_keys": {"keys": "4000"}}),
+        _item({"send_keys": {"keys": "Enter"}}),
+        _item({"send_keys": {"keys": "Control+a"}}),
+        _item({"send_keys": {"keys": "ArrowDown"}}),
+        _item({"send_keys": {"keys": "Riley Moore"}}),
+    ]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps == [
+        {"action": "type", "text": "4000"},
+        {"action": "press", "keys": "Enter"},
+        {"action": "press", "keys": "Control+a"},
+        {"action": "press", "keys": "ArrowDown"},
+        {"action": "type", "text": "Riley Moore"},
+    ]
+
+
+def test_combobox_pick_recorded_on_the_input_emits_an_opener_click(tmp_path):
+    """select_dropdown records the COMBOBOX INPUT (react-select-13-input), because the
+    tool opens the menu, types and picks internally — one action, no separate opener
+    click. Compiling only the pick left replay hunting for options in a CLOSED menu
+    (`role=option[name="Male"] -> no match`, run 20260814_113403). The opener click is
+    part of the pick and must be emitted with it."""
+    combobox = {"node_name": "INPUT", "ax_name": "Gender",
+                "attributes": {"id": "react-select-13-input", "role": "combobox"},
+                "x_path": "html/body/form/div[2]/input"}
+    history = [_item({"select_dropdown": {"index": 2689, "text": "Male"}},
+                     result=[{"extracted_content": "Selected"}], element=combobox)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    assert [s["action"] for s in steps] == ["click", "type", "click"]
+    # 1) open the menu via the combobox itself
+    assert steps[0]["selectors"][0] == "xpath=/html/body/form/div[2]/input"
+    # 2) + 3) filter and pick by value — the option anchor must NOT reuse the input's
+    # xpath (that is the box, not the row).
+    assert steps[1] == {"action": "type", "text": "Male"}
+    assert steps[2]["selectors"][0] == 'role=option[name="Male"]'
+    assert not any(s.startswith("xpath=") for s in steps[2]["selectors"])
+
+    code, _ = transpile("sid", steps)
+    assert "await api.click(" in code and "await api.select_option('Male')" in code

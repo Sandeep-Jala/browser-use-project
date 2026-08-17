@@ -30,7 +30,7 @@ from typing import Any
 
 import yaml
 
-from automation.pipeline.checks import Check, parse_verify
+from automation.pipeline.checks import Check, parse_probe, parse_verify
 from automation.pipeline.subtask_store import is_absolute_http_url
 
 
@@ -50,6 +50,12 @@ class SubtaskDecl:
     closed when the subtask ends and the main app page is never navigated. `verify` is the
     slice's declared deterministic checks (pipeline/checks.py), parsed and token-substituted
     at load time; they gate the segment on top of its base gate and never touch identity.
+    `probe` (leading-"If" conditional slices only) is ONE declared check that stands in
+    for the agent's live presence judgment: absent resolves the segment as a zero-LLM
+    no-op, present runs the branch like a normal action (replayable/committable) —
+    recorded TRUE-branch steps only ever run behind a TRUE probe. Like verify, it is
+    parsed and token-substituted at load, never touches identity, and is ignored on
+    non-conditional slices.
     """
     prompt: str
     values: dict[str, str] | None = None
@@ -58,6 +64,7 @@ class SubtaskDecl:
     kind: str | None = None
     tab_url: str | None = None
     verify: tuple[Check, ...] | None = None
+    probe: Check | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,26 @@ def _parsed_verify(key: str, i: int, d: dict[str, Any]) -> tuple[Check, ...] | N
     return checks
 
 
+def _parsed_probe(key: str, i: int, d: dict[str, Any]) -> Check | None:
+    """One slice's `probe:` mapping → validated Check, {{tokens}} substituted from the
+    slice's values — same load-time substitution contract (and rationale) as
+    _parsed_verify."""
+    raw = d.get("probe")
+    if raw is None:
+        return None
+    values = d.get("values") or {}
+    if isinstance(raw, dict):
+        raw = {k: (_DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), v)
+                   if isinstance(v, str) else v)
+               for k, v in raw.items()}
+    check = parse_probe(raw, where=f"tasks.yaml entry {key!r} subtask {i} probe")
+    if check is not None and _DECL_TOKEN.search(check.arg):
+        raise ValueError(
+            f"tasks.yaml entry {key!r} subtask {i} probe: unresolved token in "
+            f"{check.kind} {check.arg!r} — add it to the subtask's values")
+    return check
+
+
 def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
     """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
     registry must be caught at load, not as a silent no-marker/no-prompt run."""
@@ -127,7 +154,8 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
             SubtaskDecl(prompt=str(d["prompt"]), values=d.get("values"),
                         marker=d.get("marker"), postcondition=d.get("postcondition"),
                         kind=d.get("kind"), tab_url=d.get("tab_url"),
-                        verify=_parsed_verify(key, i, d))
+                        verify=_parsed_verify(key, i, d),
+                        probe=_parsed_probe(key, i, d))
             for i, d in enumerate(entry["subtasks"])
         )
         for i, s in enumerate(subtasks):

@@ -70,6 +70,9 @@ from automation.pipeline.script_compile import (
     FIELD_REFIND_JS as _FIELD_REFIND_JS,
     RAW_FIND_JS as _RAW_FIND_JS,
     RAW_TEXT_FIND_JS as _RAW_TEXT_FIND_JS,
+    SCROLL_CONTAINERS_JS as _SCROLL_CONTAINERS_JS,
+    SCROLL_TOPS_JS as _SCROLL_TOPS_JS,
+    normalize_block_text,
     REVEAL_CSS_JS as _REVEAL_CSS_JS,
     _RS_FILTER_ID,
     value_took as _value_took,
@@ -422,6 +425,16 @@ def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
         return None
 
 
+# Scroll rounds find_by_text spends opening up panels/dialog lists whose rows are
+# rendered only near their own scroll position (Fluent virtualized ScrollablePane).
+# Cap on find_by_text's container-scroll fallback rounds. 6 ran out MID-LIST once the
+# Add Data Request employee list grew past ~60 rows (every run appends an employee; run
+# 20260817_110501 exited partway down ~80 rows and honestly reported "no match"). The
+# loop breaks the moment nothing moves (moved==0), so a high cap costs nothing on short
+# lists — it only ever runs to the actual end of the content.
+_PANEL_SCROLL_ROUNDS = 20
+
+
 # A combobox whose popup is a dialog is a date/time picker (Fluent DatePicker), not an
 # option filter: typed text IS its value and reads back verifiably.
 def _is_date_picker(node: Any) -> bool:
@@ -517,6 +530,72 @@ async def _field_connected(handle) -> bool | None:
     except Exception as exc:  # noqa: BLE001 - an unprobeable node is not proof of staleness
         logger.debug("connectivity probe failed: %s", exc)
         return None
+
+
+async def _in_layer_popup(handle) -> bool:
+    """Is the field inside a transient Fluent layer/callout/dialog? Enter there risks
+    dismiss/reset side effects — observed run 20260813_123549: auto-Enter re-rendered
+    the Salary-to-take-home callout and the batched Calculate click dispatched onto a
+    detached node. The popup's own confirm button is the commit. False when
+    unprobeable: the normal Enter path stays the default, and the dropdown/date-picker
+    rules run before this one."""
+    try:
+        return bool(await _call_on_field(
+            handle,
+            "function(){ return !!(this.closest && this.closest("
+            "'.ms-Layer, #fluent-default-layer-host, [role=\"dialog\"]')); }"))
+    except Exception as exc:  # noqa: BLE001 - unprobeable is not proof of a popup
+        logger.debug("layer-popup probe failed: %s", exc)
+        return False
+
+
+_FIELD_LABEL_JS = """function(){
+  var t = function(s){ return String(s || '').replace(/\\s+/g, ' ').trim(); };
+  var el = this, label = '';
+  var ids = el.getAttribute ? t(el.getAttribute('aria-labelledby')) : '';
+  if (ids) label = t(ids.split(' ').map(function(id){
+    var n = document.getElementById(id); return n ? t(n.textContent) : ''; }).join(' '));
+  if (!label && el.labels && el.labels.length) label = t(el.labels[0].textContent);
+  if (!label && el.closest) { var l = el.closest('label'); if (l) label = t(l.textContent); }
+  var value = '';
+  var box = el.closest ? el.closest('[class*="container"], [role="combobox"]') : null;
+  if (box) {
+    var v = box.querySelector(
+      '[class*="single-value"], [class*="singleValue"], [class*="placeholder"]');
+    value = t(v ? v.textContent : '') || t(box.textContent);
+  }
+  return {label: label.slice(0, 80), value: value.slice(0, 60)};
+}"""
+
+
+async def _dropdown_descriptor(browser_session, node) -> str | None:
+    """Short identity for a combobox a fill just got refused on — "'Tax year' — currently
+    showing '2026/27'". The refusal's remedy re-advertises the SAME index+text, which is
+    right when only the verb was wrong; when the TARGET was wrong, nothing in the message
+    let the agent notice (run 20260817_093555: three refusals kept pointing the agent
+    back at the tax-year box while the task wanted a grid row — react-select inputs
+    carry no label-ish attributes, so the agent's own find_elements sweeps could not
+    tell the three comboboxes apart either). Best-effort: label-ish attributes first,
+    then a live probe for the associated <label>/aria-labelledby text and the widget's
+    visible value; None degrades to the bare message."""
+    attrs = getattr(node, "attributes", None) or {}
+    label = next((str(attrs[a]).strip() for a in ("aria-label", "title", "placeholder")
+                  if str(attrs.get(a) or "").strip()), None)
+    value = None
+    try:
+        handle = await _field_handle(browser_session, node)
+        if handle:
+            got = await _call_on_field(handle, _FIELD_LABEL_JS)
+            if isinstance(got, dict):
+                label = label or (str(got.get("label") or "").strip() or None)
+                value = str(got.get("value") or "").strip() or None
+    except Exception as exc:  # noqa: BLE001 - identity is garnish; the refusal must fire
+        logger.debug("dropdown descriptor probe failed: %s", exc)
+    if label and value and label != value:
+        return f"'{label}' — currently showing '{value}'"
+    if label:
+        return f"'{label}'"
+    return f"currently showing '{value}'" if value else None
 
 
 # Identity ladder for re-finding a detached field's live twin; first attr the stale node
@@ -790,7 +869,22 @@ def _choose_option(options: list[dict[str, Any]], target: str) -> dict[str, Any]
             return opt
     partial = [o for o in options
                if f" {want} " in f" {_norm_phrase(str(o.get('text') or ''))} "]
-    return partial[0] if len(partial) == 1 else None
+    if len(partial) == 1:
+        return partial[0]
+    if partial:
+        return None
+    # Separator-squashed tier: the task's fragment and the option spell the same thing
+    # with different separators ('no-reply' vs 'noreply@actingoffice.com' — run
+    # 20260817_124339 seg 7 missed the From option both ways). Unique containment only,
+    # and never for tiny squashes (a 2-3 char fragment would match half the menu).
+    squash = re.sub(r"[^a-z0-9]+", "", (target or "").lower())
+    if len(squash) >= 4:
+        hits = [o for o in options
+                if squash in re.sub(r"[^a-z0-9]+", "",
+                                    str(o.get("text") or "").lower())]
+        if len(hits) == 1:
+            return hits[0]
+    return None
 
 
 def _cb_option_lines(options: list[dict[str, Any]], limit: int = 10) -> str:
@@ -1459,10 +1553,47 @@ async def _click_outcome_suffix(browser_session, t0: float,
     return suffix, outcome
 
 
+# From an anonymous row checkbox, the ROW's visible text is the only identity a receipt
+# can offer: find the containing row element and return its (whitespace-normalized,
+# capped) text. Run 20260817_124339 seg 6: the ticked checkbox's receipt named nothing,
+# the agent believed it had ticked the noted employee, and the request saved for a
+# different one two rows off — a false pass on real, wrong data.
+_ROW_LABEL_JS = (
+    "function(){ var t = function(s){ return String(s || '')"
+    ".replace(/\\s+/g, ' ').trim(); };"
+    " var r = this.closest('[role=\"row\"], tr, li, [class*=\"List-cell\"]');"
+    " return r ? t(r.textContent).slice(0, 80) : ''; }"
+)
+
+
+def _is_anonymous_toggle(node: Any) -> bool:
+    """A checkbox/radio-ish element with no name of its own — the one click whose
+    receipt would otherwise verify nothing."""
+    attrs = getattr(node, "attributes", None) or {}
+    toggle = (attrs.get("role") or "").strip().lower() in ("checkbox", "switch") \
+        or (attrs.get("type") or "").strip().lower() in ("checkbox", "radio")
+    return toggle and not (attrs.get("aria-label") or "").strip()
+
+
+async def _row_context_label(browser_session, node) -> str | None:
+    """Best-effort row text for an anonymous toggle, read BEFORE the click (the row as
+    the agent saw it — ticking may re-render it). None degrades to today's receipt."""
+    try:
+        handle = await _field_handle(browser_session, node)
+        if not handle:
+            return None
+        label = await _call_on_field(handle, _ROW_LABEL_JS)
+        return (str(label).strip() or None) if label else None
+    except Exception as exc:  # noqa: BLE001 - identity is garnish; the click must run
+        logger.debug("row-context probe failed: %s", exc)
+        return None
+
+
 async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> ActionResult:
     """Delegate the click to the built-in unchanged, then append the network+dialog
     outcome suffix and stamp the structured write_outcome. Plain clicks that fired no
-    writes, probe failures, and error results pass through untouched."""
+    writes, probe failures, and error results pass through untouched. Anonymous
+    checkbox/radio clicks additionally name the ROW they sit in (see _ROW_LABEL_JS)."""
     node = None
     index = getattr(params, "index", None)
     if browser_session is not None and index:
@@ -1470,6 +1601,9 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
             node = await browser_session.get_element_by_index(index)
         except Exception:  # noqa: BLE001 - the built-in will report the real lookup error
             node = None
+    row_label = None
+    if node is not None and _is_anonymous_toggle(node):
+        row_label = await _row_context_label(browser_session, node)
     pre = await _dialog_state(browser_session, node) if node is not None else None
     t0 = time.monotonic()
     res = await builtin_click(params=params, browser_session=browser_session)
@@ -1477,6 +1611,10 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
             or not getattr(res, "extracted_content", None):
         return res
     suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre, node)
+    if row_label:
+        # In FRONT of the network/dialog outcome: the row identity is what the agent
+        # must check against the employee it MEANT to tick.
+        suffix = f' — in row "{row_label}"' + suffix
     if not suffix and outcome is None:
         return res
     update: dict[str, Any] = {"extracted_content": res.extracted_content + suffix}
@@ -1537,12 +1675,24 @@ def build_tools() -> Tools:
             # reported as set, Save silently rejected). Refuse up front and name the
             # action that picks AND verifies — the fill-shaped twin of find_by_text's
             # <select> refusal. text="" (a pure clear) stays allowed for stuck filters.
-            msg = (f"REFUSED — did NOT type '{params.text}': element {params.index} is a "
-                   "dropdown/combobox filter, and typed filter text selects NOTHING (it "
-                   "is discarded when the menu closes). Call "
-                   f"select_dropdown(index={params.index}, text='{params.text}') instead "
-                   "— it opens the menu, clicks the matching option, and verifies the "
-                   "value took, all in one action.")
+            # When the field's identity is readable, say WHAT it is: the remedy repeats
+            # the same index+text, which re-validates a wrong TARGET unless the message
+            # lets the agent notice it (see _dropdown_descriptor).
+            ident = await _dropdown_descriptor(browser_session, node)
+            remedy = (f"select_dropdown(index={params.index}, text='{params.text}') — "
+                      "it opens the menu, clicks the matching option, and verifies the "
+                      "value took, all in one action.")
+            if ident:
+                msg = (f"REFUSED — did NOT type '{params.text}': element {params.index} "
+                       f"is a dropdown/combobox filter ({ident}), and typed filter text "
+                       "selects NOTHING (it is discarded when the menu closes). If that "
+                       "is not the field this step needs, you have the WRONG element — "
+                       "locate the control the task names instead. Otherwise call "
+                       + remedy)
+            else:
+                msg = (f"REFUSED — did NOT type '{params.text}': element {params.index} "
+                       "is a dropdown/combobox filter, and typed filter text selects "
+                       "NOTHING (it is discarded when the menu closes). Call " + remedy)
             logger.info("⛔ %s", msg)
             # error channel: multi_act stops the remaining queued actions on it — a
             # refused fill must not let an already-queued Send/Save fire against the
@@ -1602,7 +1752,11 @@ def build_tools() -> Tools:
             # over the typed text) — and the read-back above runs BEFORE Enter, so such a
             # clobber would wear a clean receipt.
             date_picker = _is_date_picker(node)
-            if not dropdown and not date_picker:
+            # Third suppression class beside the two above: a field inside a transient
+            # layer/callout commits via the popup's own button, never via Enter.
+            in_popup = (not dropdown and not date_picker and bool(handle)
+                        and await _in_layer_popup(handle))
+            if not dropdown and not date_picker and not in_popup:
                 enter = browser_session.event_bus.dispatch(SendKeysEvent(keys="Enter"))
                 await enter
                 await enter.event_result(raise_if_any=True, raise_if_none=False)
@@ -1613,13 +1767,16 @@ def build_tools() -> Tools:
         meta.pop("actual_value", None)  # stale once we repaired; `verified` supersedes it
         # The compiler's signal to mirror the Enter as a replay `press` step; a structured
         # flag, not the receipt text, so rewording the message can't change replays.
-        meta["auto_enter"] = not dropdown and not date_picker
+        meta["auto_enter"] = not dropdown and not date_picker and not in_popup
         if dropdown:
             msg = (f"Typed '{params.text}' (dropdown filter — Enter suppressed; "
                    "click the option you want)")
         elif date_picker:
             msg = (f"Typed '{params.text}' (date picker — Enter suppressed; the date "
                    "commits when you move to the next field. Do NOT open the calendar.)")
+        elif in_popup:
+            msg = (f"Typed '{params.text}' (popup input — Enter suppressed; click the "
+                   "popup's own confirm button)")
         else:
             msg = f"Typed '{params.text}' and pressed Enter"
         if verified is not None and not _value_took(params.text, verified):
@@ -1775,6 +1932,40 @@ def build_tools() -> Tools:
         return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
 
     @tools.action(
+        "Scroll EVERY scrollable container (side panels, dialog lists, popup grids) down "
+        "by `pages` of its own height and report how many moved. Page-level scrolling "
+        "moves the page BEHIND a fixed side panel, not the panel — use THIS when a "
+        "panel or dialog owns its own scrollbar and its list must be scrolled to reveal "
+        "rows further down (virtualized lists render rows only near their scroll "
+        "position). Repeat until the target row is visible or it reports 0 moved — "
+        "0 means every container is at its end and the list is fully revealed. "
+        "Element indexes captured BEFORE this scroll are STALE afterwards: NEVER queue "
+        "a click-by-index behind this action in the same step — after scrolling, "
+        "re-read the page, confirm the target row's NAME is visible, then click it."
+    )
+    async def scroll_panels(pages: float = 0.8, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        frac = max(0.2, min(float(pages), 1.0))
+        try:
+            moved = int(await _eval_js(
+                browser_session, _SCROLL_CONTAINERS_JS % json.dumps(frac)) or 0)
+        except Exception as exc:  # noqa: BLE001 - a scroll must never crash the run
+            logger.warning("scroll_panels failed: %s", exc)
+            return ActionResult(error=f"scroll_panels failed: {exc}")
+        # Virtualized rows render only after the scroll commits — give React a beat so
+        # the agent's NEXT snapshot (or a batched find in this same step) sees them.
+        await asyncio.sleep(0.4)
+        if moved:
+            msg = (f"scroll_panels: scrolled {moved} container(s) down {frac} page(s) — "
+                   "element indexes from before this scroll are now STALE; re-read the "
+                   "page and verify the target row's name before any click.")
+        else:
+            msg = ("scroll_panels: no container moved — every scrollable container is "
+                   "already at its end, the list is fully revealed. If the target is "
+                   "still not on screen it is NOT in this list.")
+        logger.info("📜 %s", msg)
+        return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+
+    @tools.action(
         "Find interactive elements matching `text`, searched in a FRESH page snapshot. Matches "
         "when every word of `text` appears in the element's visible text, aria-label, title, "
         "placeholder, value, name, or id (case-insensitive; punctuation ignored, so '+ Invoice' "
@@ -1823,6 +2014,30 @@ def build_tools() -> Tools:
             try:
                 expr = _RAW_FIND_JS % (json.dumps(tokens), "true" if click_first else "false")
                 raw = await _eval_js(browser_session, expr)
+                # Still nothing? A side panel or dialog list owns its own scroll box and
+                # renders only the rows near its scroll position, so a row outside the
+                # window is not in the DOM at all yet — ABOVE it just like below it.
+                # Reset every scroll box to the TOP first (a down-only sweep from
+                # mid-list can never reach a target above it — run 20260817_133135),
+                # then advance them and look again (the employee picker's new hire was
+                # unreachable below the fold — run 20260814_105247, seg 6). The page's
+                # own scroll is included both ways.
+                if not (raw and not raw.get("error") and raw.get("count")):
+                    await _eval_js(browser_session, _SCROLL_TOPS_JS)
+                    raw = await _eval_js(browser_session, expr)
+                for _ in range(_PANEL_SCROLL_ROUNDS):
+                    if raw and not raw.get("error") and raw.get("count"):
+                        break
+                    moved = await _eval_js(browser_session,
+                                           _SCROLL_CONTAINERS_JS % json.dumps(0.8))
+                    if not moved:
+                        break
+                    raw = await _eval_js(browser_session, expr)
+                if not (raw and not raw.get("error") and raw.get("count")):
+                    # A failed hunt must not leave the page parked at the bottom: the
+                    # agent's next snapshot should show the page's head, not its floor
+                    # (the manual scroll-up from run 20260817_133135, automated).
+                    await _eval_js(browser_session, _SCROLL_TOPS_JS)
             except Exception as exc:  # noqa: BLE001 - fallback is best-effort
                 logger.debug("find_by_text raw-DOM fallback failed: %s", exc)
             if raw and not raw.get("error") and raw.get("count"):
@@ -1834,12 +2049,17 @@ def build_tools() -> Tools:
                     meta = None
                     el = raw.get("element") or {}
                     if el.get("tag"):
-                        meta = {"interacted_element": {
+                        captured = {
                             "node_name": str(el.get("tag") or ""),
                             "attributes": dict(el.get("attrs") or {}),
                             "ax_name": str(raw.get("name") or "").strip(),
                             "hidden_click": True,
-                        }}
+                        }
+                        if el.get("xpath"):
+                            # The exact location, so compile can anchor this click like
+                            # any other instead of recording a text search for it.
+                            captured["x_path"] = str(el["xpath"])
+                        meta = {"interacted_element": captured}
                     # Receipt semantics (why it must scream "already clicked", and the
                     # wrong-control warning on a name mismatch) live in _hidden_click_receipt.
                     msg = _hidden_click_receipt(query, str(raw.get("name") or "").strip())
@@ -2083,7 +2303,12 @@ def build_tools() -> Tools:
             return None
 
         def _raw_capture(raw: dict) -> tuple[str, dict | None]:
-            raw_value = " ".join(str(raw.get("name") or "").split())[:1000]
+            # The VALUE keeps line structure (labeled fields auto-split downstream and
+            # bindings slice line parts); the flat name stays the fallback and the
+            # element ax_name — every matcher assumes whitespace-flattened names.
+            lines = [str(ln) for ln in (raw.get("lines") or []) if str(ln).strip()]
+            raw_value = ("\n".join(lines) if len(lines) >= 2
+                         else " ".join(str(raw.get("name") or "").split()))[:1000]
             raw_element = None
             el = raw.get("element") or {}
             if el.get("tag"):
@@ -2111,7 +2336,10 @@ def build_tools() -> Tools:
                 if exact:
                     chosen = exact
             _idx, node, node_label = chosen[0]
-            text_value = " ".join(node.get_all_children_text(max_depth=5).split())
+            # Line-preserving normalization: spaces collapse WITHIN lines, blank lines
+            # drop, breaks survive — the structure field auto-split and line bindings
+            # rely on.
+            text_value = normalize_block_text(node.get_all_children_text(max_depth=5))
             value = (text_value or node_label or "").strip()[:1000]
             element = _captured_element(node, node_label)
             if value and _norm_phrase(value) == _norm_phrase(query):

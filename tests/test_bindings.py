@@ -16,7 +16,8 @@ from automation.pipeline.hybrid import (_bind_runtime_values, _binding_resolver,
                                         run_hybrid_task)
 from automation.skills import base as skills
 from automation.tasks import SubtaskDecl, TaskSpec
-from tests.test_hybrid import FakeSession, _runner, _seg
+from tests.test_hybrid import (BOUND_PROMPT, BOUND_SPEC, FakeSession, _fill_steps_stub,
+                               _runner, _seg)
 
 
 @pytest.fixture
@@ -38,6 +39,9 @@ class _Net:
 
     def results(self):
         return {"requests": self._requests}
+
+    def write(self):
+        """The run loop flushes collectors at every segment boundary."""
 
 
 def _post(url, body_obj):
@@ -100,6 +104,29 @@ def test_bind_runtime_values_rewrites_every_value_carrier():
 
     # Prose-only (no structured source anywhere) refuses — the segment stays agent-run.
     assert _bind_runtime_values(steps, ["PR/X/DR017"], {}, []) is None
+
+
+def test_bind_runtime_values_never_rewrites_inside_larger_literals():
+    """Run 20260817_115232: the authoring identity's house number '35' (a real
+    standalone field value) substring-matched the unrelated Gross Pay literal '3500',
+    compiling fill('3500') into '{{bound_N}}00' — the next run replayed Gross Pay as
+    6300 (house number 63 + '00'). A flagged literal must bind only where it stands as
+    a whole token (not flanked by alphanumerics); standalone and space/punctuation
+    delimited occurrences keep binding."""
+    steps = [
+        {"action": "fill", "value": "3500"},             # unrelated amount: must stay
+        {"action": "fill", "value": "35"},               # the house-number fill: binds
+        {"action": "fill", "value": "35 Asfordby Rd"},   # space boundary: binds
+    ]
+    extracts = {"identity_block": "Ellis McKenzie\n35 Asfordby Rd\nALDENHAM\nWD2 0SZ"}
+
+    bound = _bind_runtime_values(steps, ["35"], extracts, [])
+    assert bound is not None
+    new_steps, params, _ = bound
+    assert new_steps[0]["value"] == "3500"               # NOT '{{bound_1}}00'
+    assert new_steps[1]["value"] == "{{bound_1}}"
+    assert new_steps[2]["value"] == "{{bound_1}} Asfordby Rd"
+    assert params == {"bound_1": "35"}
 
 
 def test_binding_resolver_first_matching_create_wins():
@@ -412,3 +439,178 @@ async def test_bound_entry_bypasses_noted_data_wording_net(stores, monkeypatch):
     assert fake.replay_calls == 1                      # the consumer REPLAYED
     assert sid in ss.load_manifest()                   # and was not retired
     assert fake.skills_seen[sid].steps[0]["text"] == "PR/X/DR018"
+
+
+# ---------------- transform bindings: line parts + date reformat (2026-08-12) ----------------
+
+
+def test_parse_fuzzy_date_and_output_formats():
+    from automation.pipeline.hybrid import _date_out_format, _parse_fuzzy_date
+    d = _parse_fuzzy_date("Birthday\nMarch 2, 1979")
+    assert d is not None and (d.day, d.month, d.year) == (2, 3, 1979)
+    assert _parse_fuzzy_date("2 March 1979").month == 3
+    assert _parse_fuzzy_date("1979-03-02").day == 2
+    assert _parse_fuzzy_date("02/03/1979").month == 3      # day-first (UK app)
+    assert _parse_fuzzy_date("no date here") is None
+    assert _date_out_format("02/03/1979") == "%d/%m/%Y"
+    assert _date_out_format("1979-03-02") == "%Y-%m-%d"
+    assert _date_out_format("Euan Bruce") is None
+
+
+def test_bind_runtime_values_line_and_date_transforms():
+    """A typed value that is a LINE (or contiguous line run) of an extracted block, or
+    a date REFORMAT of an extracted date, binds with a transform spec instead of
+    refusing — the multi-field identity case."""
+    extracts = {"identity_block": "Euan Bruce\n70 Telford Street\nBARFORD ST JOHN\nOX15 8PG",
+                "dob_block": "Birthday\nMarch 2, 1979"}
+    steps = [
+        {"action": "fill", "selectors": ["css=#street"], "value": "70 Telford Street"},
+        {"action": "fill", "selectors": ["css=#city"],
+         "value": "BARFORD ST JOHN, OX15 8PG"},
+        {"action": "fill", "selectors": ["css=#dob"], "value": "02/03/1979"},
+    ]
+    bound = _bind_runtime_values(
+        steps, ["70 Telford Street", "BARFORD ST JOHN, OX15 8PG", "02/03/1979"],
+        extracts, [])
+    assert bound is not None
+    new_steps, params, bindings = bound
+    # longest-first numbering: city+postcode joined run, then street, then the date
+    assert bindings["bound_1"] == {
+        "kind": "extract", "label": "identity_block",
+        "transform": {"line": {"index": 2, "count": 2, "join": ", "}}}
+    assert bindings["bound_2"] == {
+        "kind": "extract", "label": "identity_block",
+        "transform": {"line": {"index": 1, "count": 1, "join": " "}}}
+    assert bindings["bound_3"] == {
+        "kind": "extract", "label": "dob_block", "transform": {"date": "%d/%m/%Y"}}
+    assert new_steps[0]["value"] == "{{bound_2}}"
+    assert new_steps[2]["value"] == "{{bound_3}}"
+
+
+def test_binding_resolver_applies_transforms_to_fresh_values():
+    """Replay derives the value from THIS run's fresh source; bounds/parse failures
+    refuse (None) so a stale or wrong slice can never be typed."""
+    fresh = {"identity_block": "Struan Boyd\n5 Long Acre\nLEEDS\nLS1 4AB",
+             "dob_block": "Birthday\nJune 14, 1983"}
+    resolve = _binding_resolver(fresh, SimpleNamespace())
+    line = lambda i, n, j=" ": {"kind": "extract", "label": "identity_block",
+                                "transform": {"line": {"index": i, "count": n, "join": j}}}
+    assert resolve(line(0, 1)) == "Struan Boyd"
+    assert resolve(line(1, 1)) == "5 Long Acre"
+    assert resolve(line(2, 2, ", ")) == "LEEDS, LS1 4AB"
+    assert resolve({"kind": "extract", "label": "dob_block",
+                    "transform": {"date": "%d/%m/%Y"}}) == "14/06/1983"
+    assert resolve(line(9, 1)) is None                       # out of bounds
+    assert resolve({"kind": "extract", "label": "identity_block",
+                    "transform": {"date": "%d/%m/%Y"}}) is None   # no date in source
+
+
+async def test_binder_never_binds_a_value_to_the_segments_own_write(stores, monkeypatch,
+                                                                    capsys):
+    """A typed value may only bind to data that exists BEFORE the segment runs. Binding
+    the Add-Employee form's street/first/last to fields of its OWN create-response made
+    four bindings that can never resolve at load time (the POST has not happened yet) —
+    the segment then re-authored with the LLM on every run, permanently
+    (library/b5c40cab30815f2e.template.json, run 20260813_161952)."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "fill", "selectors": ["css=#street"], "value": "86 Seaford Road"},
+        {"action": "click", "selectors": ['css=[id="save"]']},
+    ]))
+    # The ONLY structured source naming that street is the segment's own create-write,
+    # which fires DURING the segment (it is the Save the segment performs).
+    own_write = _post("/payroll/clients/x/employees/",
+                      {"result": {"address": {"street": "86 Seaford Road"}}})
+
+    class _WritesDuringSegment(FakeSession):
+        async def agent_segment(self, sub, *a, **kw):
+            seg = await super().agent_segment(sub, *a, **kw)
+            if "add employee" in sub.instantiated_prompt:
+                self.collectors[0]._requests.append(own_write)   # ITS OWN Save
+            return seg
+
+    fake = _WritesDuringSegment(_runner(), agents=[
+        _seg(True, mode="authored", finding="identity noted",
+             extracted={"identity_block": "Jude Williamson"}),
+        _seg(True, mode="authored"),
+    ])
+    fake.collectors = [_Net([])]
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
+                                   spec=BOUND_SPEC)
+
+    assert result.is_successful is True
+    entry = ss.load_manifest().get(consumer_sid)
+    # No entry at all, or one with no self-referential binding — never a `created`
+    # binding pointing at this segment's own POST.
+    specs = list((entry or {}).get("bindings", {}).values())
+    assert not [s for s in specs if s.get("kind") == "created"]
+
+
+def test_word_slice_bindings_survive_a_fresh_identity():
+    """Forms SPLIT what pages JOIN: the identity block has "Jude Williamson" on one
+    line, the form has separate First/Last fields. A word slice binds those, and the
+    spec re-derives the NEXT run's names from the same positions."""
+    authored = {"name": "Jude Williamson\n86 Seaford Road\nCURRIDGE\nRG18 1BA"}
+    first = hybrid._extract_transform_spec("Jude", authored)
+    last = hybrid._extract_transform_spec("Williamson", authored)
+    street = hybrid._extract_transform_spec("Seaford Road", authored)
+    building = hybrid._extract_transform_spec("86", authored)
+    assert first["transform"]["words"] == {"start": 0, "count": 1}
+    assert last["transform"]["words"] == {"start": 1, "count": 1}
+    assert street["transform"] == {"line": {"index": 1, "count": 1, "join": " "},
+                                   "words": {"start": 1, "count": 2}}
+    # The house number is 2 characters and binds too — short values are fine as long as
+    # exactly one word position matches (see the ambiguity rule below).
+    assert building["transform"] == {"line": {"index": 1, "count": 1, "join": " "},
+                                     "words": {"start": 0, "count": 1}}
+
+    # Next run, different person, same positions.
+    fresh = {"name": "Arron McIntosh\n41 Gloucester Road\nCILRHEDYN\nSA35 5WS"}
+    resolve = hybrid._binding_resolver(fresh, SimpleNamespace())
+    assert resolve(first) == "Arron"
+    assert resolve(last) == "McIntosh"
+    assert resolve(street) == "Gloucester Road"
+    # Out-of-range slices refuse rather than typing something wrong.
+    assert resolve({"kind": "extract", "label": "name",
+                    "transform": {"line": {"index": 0, "count": 1, "join": " "},
+                                  "words": {"start": 5, "count": 1}}}) is None
+
+
+def test_a_value_the_task_spells_anywhere_is_prompt_data_not_runtime():
+    """The gender case (run 20260814_100546): subtask 1 says "note ... the Gender
+    (Male)" and subtask 3 says only "enter the noted name, address, and gender". Judging
+    "Male" against the CURRENT slice's wording alone made it runtime data — unbindable,
+    since no extract holds it — and ONE unbindable value refuses the whole segment's
+    commit, so the Add-Employee recording never cached. The whole task's wording is the
+    right corpus (the create-write leg already uses it)."""
+    from automation.pipeline.hybrid import _findings_sourced_values
+
+    steps = [{"action": "fill", "selectors": ["css=#g"], "value": "Male"},
+             {"action": "fill", "selectors": ["css=#n"], "value": "Riley"}]
+    findings = ["identity noted: Name: Riley Moore Gender: Male Address: 4 Fox Lane"]
+    this_slice = "click Add Employee and fill in the form using the noted details"
+    whole_task = this_slice + " \n From the generated identity note the Gender (Male)"
+
+    assert "Male" in _findings_sourced_values(steps, this_slice, findings)
+    assert "Male" not in _findings_sourced_values(steps, whole_task, findings)
+    # A genuinely run-generated value stays flagged either way.
+    assert "Riley" in _findings_sourced_values(steps, whole_task, findings)
+
+
+def test_short_values_bind_when_the_word_match_is_unambiguous():
+    """A house number is 2 characters ("48 Main St"). A blanket length floor left it
+    unbindable, and one unbindable value refuses the whole segment — which is what kept
+    the Add-Employee recording out of the library in run 20260814_114028. Short values
+    bind when exactly ONE word position matches; ambiguity refuses rather than guesses."""
+    src = {"generated_identity": "Ty Dickson\n48 Main St\nACHAGLASS\nPA29 2XN"}
+    spec = hybrid._extract_transform_spec("48", src)
+    assert spec["transform"] == {"line": {"index": 1, "count": 1, "join": " "},
+                                 "words": {"start": 0, "count": 1}}
+    resolve = hybrid._binding_resolver(
+        {"generated_identity": "Ana Rowe\n7 Kirk Way\nDUNDEE\nDD1 4XX"}, SimpleNamespace())
+    assert resolve(spec) == "7"
+
+    # Ambiguous: the same token appears twice — refuse, never guess which one.
+    assert hybrid._extract_transform_spec("St", {"a": "1 St Mary\nSt Andrews"}) is None

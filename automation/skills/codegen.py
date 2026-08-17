@@ -121,7 +121,22 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
         elif action == "click":
             handle = _handle_for(step, used)
             anchors[handle] = _anchor(step)
-            lines.append(f"    await api.click({handle!r})")
+            count = int(step.get("count", 1))
+            if count > 1:
+                # A recorded "exactly N clicks" cadence: one faithful repeat verb, the
+                # recorded inter-click wait as its floor (api adds the readiness poll).
+                lines.append(f"    await api.repeat_click({handle!r}, {count}, "
+                             f"{float(step.get('repeat_wait_s', 0.0))!r})")
+            else:
+                lines.append(f"    await api.click({handle!r})")
+        elif action == "click_indexed":
+            handle = _handle_for(step, used)
+            anchor: dict[str, Any] = {"selector_template": step["selector_template"]}
+            if step.get("fingerprint"):
+                anchor["fingerprint"] = step["fingerprint"]
+            anchors[handle] = anchor
+            lines.append(f"    await api.click_indexed({handle!r}, "
+                         f"{int(step.get('start', 0))}, {int(step['count'])})")
         elif action == "fill":
             handle = _handle_for(step, used)
             anchors[handle] = _anchor(step)

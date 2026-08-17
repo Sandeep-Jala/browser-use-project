@@ -22,13 +22,17 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 _CHECK_KINDS = ("text_visible", "text_absent", "control_exists", "url_contains",
                 "write_accepted")
 _CHECK_TIMEOUT_S = 10.0
 _CHECK_POLL_S = 0.5
+# Probes ask "is the condition raised RIGHT NOW?", where absent is a routine outcome
+# (a popup that simply didn't appear), so their default poll is short — waiting out
+# verify's settle-oriented window would add dead time to every popup-free run.
+_PROBE_TIMEOUT_S = 3.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,25 @@ def parse_verify(raw: Any, *, where: str = "verify") -> tuple[Check, ...]:
                 f"{label}: timeout_s must be a positive number, got {timeout!r}")
         checks.append(Check(kind=kind, arg=arg.strip(), timeout_s=float(timeout)))
     return tuple(checks)
+
+
+def parse_probe(raw: Any, *, where: str = "probe") -> Check | None:
+    """tasks.yaml `probe:` mapping (exactly ONE check) → validated Check, or None.
+
+    A probe gates a conditional slice's branch on live page state — present runs the
+    branch, absent resolves the segment as a no-op — so both outcomes are valid and
+    the default timeout is _PROBE_TIMEOUT_S; a declared timeout_s still wins.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{where}: must be a single check mapping like "
+            f"\"probe: {{text_visible: '…'}}\", got {type(raw).__name__}")
+    (check,) = parse_verify([raw], where=where)
+    if "timeout_s" not in raw:
+        check = replace(check, timeout_s=_PROBE_TIMEOUT_S)
+    return check
 
 
 async def evaluate_checks(page: Any, requests_window: list[dict[str, Any]],

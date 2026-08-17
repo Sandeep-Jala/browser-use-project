@@ -114,6 +114,10 @@ class _FakeCdp:
             # Stale-node probe: live fields answer True; tests model a re-rendered
             # (detached) node by setting field.connected = False.
             return {"result": {"value": getattr(self.field, "connected", True)}}
+        if "closest" in decl:
+            # Layer-popup probe: tests model a callout-hosted field by setting
+            # field.in_popup = True.
+            return {"result": {"value": getattr(self.field, "in_popup", False)}}
         return {"result": {"value": self.field.value}}
 
     async def _key(self, params, session_id=None):

@@ -40,6 +40,11 @@ _FRAMEWORK_ID = re.compile(
 # ("option-0-0" = first option of the first group — observed on the VAT select), hence the
 # (?:-\d+)* tail.
 _REACT_SELECT_PART = re.compile(r"^react-select-\d+-(?P<part>option-\d+(?:-\d+)*|listbox|placeholder)$")
+# Generic twin of the react-select rule: an auto-generated id whose LEADING token carries
+# the volatile digit run but whose tail is stable ("row26102-0-checkbox" → "-0-checkbox").
+# Virtualized grids (Fluent DetailsList) regenerate the row-block prefix per data load
+# while the tail — including the row INDEX — is the element's durable identity.
+_TRAILING_STABLE_SUFFIX = re.compile(r"^[A-Za-z_]+\d{3,}(?P<suffix>(?:-[A-Za-z0-9_]+)+)$")
 _RS_OPTION = re.compile(r"^(?P<instance>react-select-\d+)-option-\d+(?:-\d+)*$")
 _RS_INPUT = re.compile(r"^(?P<instance>react-select-\d+)-input$")
 # Playwright ARIA roles we can target with get_by_role. Recorded elements carry either an explicit
@@ -75,29 +80,41 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     Replay tries these in order and uses the first that resolves UNIQUELY, so a fragile primary
     anchor (a framework id, a moved node) degrades to a stabler fallback instead of stopping the
     run or clicking the wrong element. Order:
+      0. the positional xpath — deterministic-first (2026-08-12, user choice): the
+         recorded position leads, sanity-gated at resolve time against the fingerprint
+         (_resolve refuses a drifted hit and falls through to the semantic ladder)
       1. get_by_role(role, name)  — semantic + unique, the most durable web locator
       2. a non-auto-generated id
       3. react-select option suffix ([id$="-option-0"]) — instance-counter-independent
       4. a distinguishing attribute (data-testid / name / aria-label / title / placeholder)
       5. href (links)
       6. exact accessible-name text
-      7. the positional xpath (last resort)
     """
     attrs = element.get("attributes") or {}
     tag = (element.get("node_name") or "").lower()
     ax_name = (element.get("ax_name") or "").strip()
-    cands = _selectors_from_parts(tag, attrs, ax_name)
-    # 7. Positional xpath — last resort.
+    cands: list[str] = []
     xpath = element.get("x_path")
     if xpath:
         cands.append("xpath=/" + xpath.lstrip("/"))
+    cands.extend(_selectors_from_parts(tag, attrs, ax_name))
     return cands
 
 
 def _selectors_from_parts(tag: str, attrs: dict[str, Any], ax_name: str) -> list[str]:
-    """Ranked candidates (ranks 1-6) from raw element parts. Shared by compile-time
+    """Ranked HARD-IDENTITY candidates from raw element parts. Shared by compile-time
     `_selectors` and replay-time heal promotion, so a healed winner is ranked through the
-    exact same durability policy as a freshly recorded element."""
+    exact same durability policy as a freshly recorded element.
+
+    Attribute identity ONLY — no `role=[name=…]`, no `text="…"` (2026-08-13, user
+    directive "use xpaths for everything, no random searches"). Those two locate by
+    what an element SAYS, which is what made replays hunt for elements and land on the
+    wrong one; the recorded xpath (rank 0, added by `_selectors`) plus these attributes
+    locate WHERE it is and WHAT it is. An element with neither is unanchorable by
+    design — compile marks it and the segment authors live rather than replaying a
+    search. (Dropdown OPTION picks keep name matching in `_dropdown_option_steps`: an
+    option is chosen BY ITS VALUE, and a positional xpath there would pick whatever row
+    happens to sit in that slot.)"""
     # A real label is short. A long ax_name is a screen-reader announcement (react-select emits
     # "option Bike, selected. Select is focused, type to refine list, ..." onto its cell), which
     # changes every render and must never anchor a selector.
@@ -105,11 +122,6 @@ def _selectors_from_parts(tag: str, attrs: dict[str, Any], ax_name: str) -> list
     if len(ax_name) > 60:
         ax_name = ""
     cands: list[str] = []
-
-    # 1. Role + accessible name — Playwright's most durable, unambiguous locator.
-    role = _role_of(attrs, tag)
-    if role and ax_name:
-        cands.append(f'role={role}[name="{_esc(ax_name)}"]')
 
     idv = attrs.get("id")
     if idv:
@@ -121,17 +133,22 @@ def _selectors_from_parts(tag: str, attrs: dict[str, Any], ax_name: str) -> list
         m = _REACT_SELECT_PART.match(idv)
         if m:
             cands.append(f'css=[id$="-{m.group("part")}"]')
+        # 3b. Generic volatile-prefix id with a stable tail (virtualized grid rows).
+        #     An ambiguous suffix is safe: _resolve requires a unique match per candidate
+        #     and falls through to the next selector on a miss.
+        elif _is_dynamic_id(idv) and not _FRAMEWORK_ID.match(idv):
+            m2 = _TRAILING_STABLE_SUFFIX.match(idv)
+            if m2:
+                cands.append(f'css=[id$="{_esc(m2.group("suffix"))}"]')
 
     # 4. Distinguishing attributes.
-    for key in ("data-testid", "name", "aria-label", "title", "placeholder"):
+    for key in ("data-testid", "data-automationid", "name", "aria-label", "title",
+                "placeholder"):
         if attrs.get(key):
             cands.append(_attr_sel(key, attrs[key]))
     # 5. href for links.
     if attrs.get("href"):
         cands.append(f'css={tag or "*"}[href="{_esc(attrs["href"])}"]')
-    # 6. Exact accessible-name text.
-    if ax_name:
-        cands.append(f'text="{_esc(ax_name)}"')
 
     seen: set[str] = set()
     return [c for c in cands if not (c in seen or seen.add(c))]
@@ -207,7 +224,8 @@ def _recovered_selectors(attrs: dict[str, str]) -> list[str]:
 # Attributes kept in a fingerprint — the durable, identifying ones (a self-healing scorer
 # weighs them at replay). `class`/`value` are deliberately excluded: they churn on this React
 # app and would drag the score toward the wrong element.
-_FP_ATTRS = ("id", "name", "aria-label", "placeholder", "title", "data-testid", "type", "href")
+_FP_ATTRS = ("id", "name", "aria-label", "placeholder", "title", "data-testid",
+             "data-automationid", "type", "href")
 
 
 def _sm_child_text(state_message: str, backend_id: Any) -> str:
@@ -309,15 +327,17 @@ def _attach_fp(step: dict[str, Any], element: dict[str, Any]) -> dict[str, Any]:
 
 
 def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
-    """Append a step, collapsing the agent's slow-app retries against the last real step.
+    """Append a step, distinguishing slow-app retries from intentional repeats.
 
-    The app re-renders slowly, so during authoring the agent often clicks the same control
-    several times before it registers (e.g. "+ Invoice" clicked twice). Fast replay doesn't
-    need those retries — the first click already takes effect and NAVIGATES, so a second click
-    on the same target then finds nothing and eats the full locator timeout. We therefore drop
-    a click that repeats the last interaction's selector, and for a repeated fill on the same
-    field we keep only the latest value (the last write wins). We compare against the last
-    *non-wait* step so a retry separated by a recorded wait is still collapsed.
+    An ADJACENT click on the same target (no recorded wait between) is the agent
+    retrying a click the slow app hadn't registered yet ("+ Invoice" clicked twice) —
+    replay doesn't need it, so it is dropped as before. A same-target click SEPARATED
+    by a recorded wait is a deliberate cadence ("click Save & Next exactly 5 times,
+    waiting after each") — dropping those compiled the 5x/14x counter recordings to a
+    single click (observed 2026-08-12). Such repeats now absorb into the first click's
+    `count`, and the intervening waits become its `repeat_wait_s` floor instead of
+    bare wait steps. For a repeated fill on the same field the latest value still
+    wins (the last write is the one the form kept).
     """
     if step.get("action") in ("click", "fill"):
         prev_idx = next(
@@ -332,15 +352,140 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
         ):
             if step["action"] == "fill":
                 steps[prev_idx] = step  # same field typed again → keep the final value
-            # repeated click → drop it (the first already fired)
+                return
+            waits_between = steps[prev_idx + 1:]   # only waits, by prev_idx construction
+            if not waits_between:
+                return  # adjacent retry → the first click already fired
+            prev["count"] = int(prev.get("count", 1)) + 1
+            wait_s = max((float(w.get("seconds") or 0) for w in waits_between), default=0.0)
+            prev["repeat_wait_s"] = max(float(prev.get("repeat_wait_s", 0.0)), wait_s)
+            del steps[prev_idx + 1:]
             return
     steps.append(step)
+
+
+# Playwright key names accepted by keyboard.press (plus single characters and F1-F12);
+# anything else in a send_keys payload is TEXT to be typed, not a key to be pressed.
+_KEY_NAMES = {
+    "enter", "tab", "escape", "esc", "backspace", "delete", "insert", "home", "end",
+    "pageup", "pagedown", "arrowup", "arrowdown", "arrowleft", "arrowright", "space",
+    "capslock", "contextmenu", "numlock", "pause", "printscreen",
+}
+_MODIFIER_NAMES = {"control", "ctrl", "shift", "alt", "meta", "command", "cmd"}
+_FKEY_RE = re.compile(r"f[1-9]|f1[0-2]", re.IGNORECASE)
+
+
+def _is_key_chord(keys: str) -> bool:
+    """Is this a keyboard.press key or chord ("Enter", "Control+a", "ArrowDown")?"""
+    parts = [p.strip() for p in str(keys).split("+") if p.strip()]
+    if not parts:
+        return False
+    *mods, last = parts
+    if any(m.lower() not in _MODIFIER_NAMES for m in mods):
+        return False
+    return (len(last) == 1 or last.lower() in _KEY_NAMES
+            or _FKEY_RE.fullmatch(last) is not None)
 
 
 def _mirror_enter(steps: list[dict[str, Any]], enter_after: bool) -> None:
     """Mirror the auto-Enter input tool's Enter (agent_tools) as a replay `press` step."""
     if enter_after:
         _push_step(steps, {"action": "press", "keys": "Enter"})
+
+
+def _indexed_id_readings(step: dict[str, Any]) -> list[tuple[int, str]] | None:
+    """All (index, tail) readings of a click step's element id.
+
+    "row26102-0-checkbox" reads as (0, "checkbox"); an id with several integer tokens
+    yields one reading per token and the run matcher keeps whichever tail stays
+    constant. None for non-clicks, clicks already carrying a repeat count, and ids
+    without a pure-integer token."""
+    if step.get("action") != "click" or step.get("count"):
+        return None
+    idv = str(((step.get("fingerprint") or {}).get("attrs") or {}).get("id") or "")
+    tokens = idv.split("-")
+    if len(tokens) < 2:
+        return None
+    readings = [(int(tok), "-".join(tokens[pos + 1:]))
+                for pos, tok in enumerate(tokens) if tok.isdigit()]
+    return readings or None
+
+
+def _collapse_indexed_runs(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse a run of ≥3 clicks over id-indexed siblings (virtualized grid rows,
+    "row{volatile}-{n}-checkbox") into ONE `click_indexed` template step.
+
+    The rows' structural xpaths are identical and their id prefixes regenerate per
+    data load, so N baked anchors cannot replay; the id's index component is the only
+    durable per-row identity. Interleaved waits/scrolls INSIDE the run are absorbed
+    (replay scrolls each index into view itself); a wait after the last member
+    survives as the run's settle. Observed indices are normalized to the contiguous
+    span from the lowest (length = number of recorded clicks): an authoring quirk — a
+    skipped or doubled row — must not become the routine."""
+    out: list[dict[str, Any]] = []
+    i, n = 0, len(steps)
+    while i < n:
+        best: tuple[int, list[int], dict[str, Any], str] | None = None
+        for idx0, tail in _indexed_id_readings(steps[i]) or []:
+            indices, j, last_end = [idx0], i + 1, i + 1
+            while j < n:
+                st = steps[j]
+                if st.get("action") in ("wait", "scroll"):
+                    j += 1
+                    continue
+                match = next((v for v, t in (_indexed_id_readings(st) or [])
+                              if t == tail and v > indices[-1]), None)
+                if match is None:
+                    break
+                indices.append(match)
+                j += 1
+                last_end = j
+            if len(indices) >= 3 and (best is None or len(indices) > len(best[1])):
+                best = (last_end, indices, steps[i], tail)
+        if best is None:
+            out.append(steps[i])
+            i += 1
+            continue
+        last_end, indices, first, tail = best
+        collapsed: dict[str, Any] = {
+            "action": "click_indexed",
+            "selector_template": f'css=[id$="-{{n}}{("-" + tail) if tail else ""}"]',
+            "start": min(indices),
+            "count": len(indices),
+        }
+        if first.get("fingerprint"):
+            collapsed["fingerprint"] = first["fingerprint"]
+        out.append(collapsed)
+        i = last_end
+    return out
+
+
+# The click count a slice's wording pins: "exactly 5 clicks" / "exactly 14 more
+# clicks" / "exactly 3 times".
+_REPEAT_HINT_RE = re.compile(r"\bexactly\s+(\d+)\s+(?:more\s+)?(?:clicks?|times)\b",
+                             re.IGNORECASE)
+
+
+def repeat_hint_from_wording(prompt: str) -> int | None:
+    """The repeat count the slice wording states, or None. Compile normalizes a lone
+    repeat cluster to this number: the recorded count can be off by a collapsed
+    retry, and the wording is the contract the counter slices are written against."""
+    m = _REPEAT_HINT_RE.search(prompt or "")
+    return int(m.group(1)) if m else None
+
+
+def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None) -> list[dict[str, Any]]:
+    """Pin the single repeat cluster's count to the wording's number. Never invents a
+    cluster (a lone click stays a lone click) and never guesses among several."""
+    if hint:
+        clusters = [s for s in steps
+                    if s.get("action") == "click" and int(s.get("count", 1)) > 1]
+        if len(clusters) == 1 and int(clusters[0]["count"]) != int(hint):
+            logger.warning("repeat cluster recorded %s clicks but the wording says "
+                           "exactly %s — pinning to the wording",
+                           clusters[0]["count"], hint)
+            clusters[0]["count"] = int(hint)
+    return steps
 
 
 # The app's react-select "+ Create \"<name>\"" option. Its label embeds the (per-replay
@@ -423,11 +568,19 @@ def _dropdown_option_steps(
         return None  # no label anywhere — generic (positional) handling is all we have
     part = _REACT_SELECT_PART.match(attrs.get("id") or "")
     positional = f'css=[id$="-{part.group("part")}"]' if part else 'css=[id$="-option-0"]'
-    click_step = {"action": "click", "selectors": [
+    sels = [
         f'role=option[name="{_esc(label)}"]',
         f'text="{_esc(label)}"',
         positional if typed else 'css=[id$="-option-0"]',
-    ]}
+    ]
+    xpath = element.get("x_path")
+    if xpath and ax_name:
+        # Exact location first — safe here ONLY because the pick is name-guarded below:
+        # if the option now sitting at that position is a different one, expect_text
+        # refuses it and the by-name candidate takes over. Without a recorded name
+        # (filter-typed picks) the xpath stays out: nothing would catch a wrong row.
+        sels.insert(0, "xpath=/" + str(xpath).lstrip("/"))
+    click_step = {"action": "click", "selectors": sels}
     if ax_name:
         # The pick must land on an option NAMED what was recorded — the positional
         # fallback otherwise clicks whatever now sits at that index. Only the element's
@@ -449,7 +602,8 @@ def _dropdown_option_steps(
 # the site-boundary invariant never drops them: if the site redirected spontaneously around
 # one (an ad firing during the settle), dropping the read would not prevent the redirect at
 # replay — and it may carry an observation later steps need.
-_READ_ONLY_ACTIONS = {"extract_data", "capped_scroll", "scroll", "wait", "done"}
+_READ_ONLY_ACTIONS = {"extract_data", "capped_scroll", "scroll", "scroll_panels",
+                      "wait", "done"}
 
 
 def _reg_host(url: Any) -> str:
@@ -518,6 +672,17 @@ def compile_recording(
                 continue
             name = next(iter(action))
             params = action[name] or {}
+            # An action with NO result slot never ran: multi_act stops the queue on a
+            # refusal or error, leaving the later actions of that step undispatched.
+            # Compiling them bakes phantom steps — a find_by_text that never happened
+            # became find_click('Aaran Duncan') and failed every replay of the
+            # pay-forecast segment (run 20260813_132507). Results are aligned to
+            # actions by index; a wholly result-less item is legacy shape, left alone.
+            if results and i >= len(results) and name != "done":
+                logger.info("compile: skipping recorded %s at step %d — it never "
+                            "executed (the step's action queue stopped earlier)",
+                            name, item_idx)
+                continue
             if exits_site and name not in _READ_ONLY_ACTIONS:
                 logger.warning(
                     "compile: dropping recorded %s at step %d — it navigated the tab off "
@@ -545,34 +710,39 @@ def compile_recording(
                 query = str(params.get("text") or "").strip()
                 element = _with_recovered_text(element,
                                                item.get("state_message") or "")
-                if element and not element.get("hidden_click"):
-                    synth = _dropdown_option_steps(element, steps,
-                                                   item.get("state_message") or "")
-                    if synth is not None:
-                        for s in synth:
-                            _push_step(steps, s)
+                synth = (_dropdown_option_steps(element, steps,
+                                                item.get("state_message") or "")
+                         if element else None)
+                if synth is not None:
+                    for s in synth:
+                        _push_step(steps, s)
+                else:
+                    # hidden_ok: find_by_text can reach controls a re-render hides;
+                    # replay keeps the hover/dispatch recovery as a safety net. A hidden
+                    # capture that carries identity is anchored like any other click —
+                    # only a capture with NO identity at all is unanchorable.
+                    sels = _selectors(element) if element else []
+                    if sels:
+                        step = {"action": "click", "selectors": sels, "hidden_ok": True}
+                        # The landed element must carry the recorded name (or, for a
+                        # blob-named row, the query the tool matched on): an xpath or
+                        # stale-href fallback resolving into a DIFFERENT control must
+                        # refuse, not click (the wrong-row guard, now also for
+                        # unparameterized clicks).
+                        label = _ax_label(element) or query
+                        if label:
+                            step["expect_text"] = label
+                        _push_step(steps, _attach_fp(step, element))
                     else:
-                        sels = _selectors(element)
-                        if sels:
-                            # hidden_ok: find_by_text can reach controls a re-render hides;
-                            # replay keeps the hover/dispatch recovery as a safety net.
-                            step = {"action": "click", "selectors": sels,
-                                    "hidden_ok": True}
-                            # The landed element must carry the recorded name (or, for a
-                            # blob-named row, the query the tool matched on): an xpath or
-                            # stale-href fallback resolving into a DIFFERENT control must
-                            # refuse, not click (the wrong-row guard, now also for
-                            # unparameterized clicks).
-                            label = _ax_label(element) or query
-                            if label:
-                                step["expect_text"] = label
-                            _push_step(steps, _attach_fp(step, element))
-                elif query:
-                    # The click went through the tool's hidden-control path (or the saved
-                    # history lacks the element entirely): no selector+pointer translation
-                    # is stable for such controls, so replay the INTENT — a find_click step
-                    # runs the exact same in-page algorithm the tool used (RAW_FIND_JS).
-                    _push_step(steps, {"action": "find_click", "text": query})
+                        # No anchorable identity was captured. Recording the tool's TEXT
+                        # SEARCH instead is what put find_click('Net to gross') — 36
+                        # matches — into replays; a recording must locate elements, never
+                        # hunt for them. Mark it: _author_segment refuses the commit and
+                        # this segment authors live every run until it can be anchored.
+                        _push_step(steps, {
+                            "action": "unanchorable",
+                            "why": f"find_by_text click on {query!r} captured no anchorable "
+                                   f"element identity (no xpath, no distinguishing attribute)"})
             elif name == "extract_data":
                 # The tool records {label, value, query, interacted_element} in its result
                 # metadata (persisted by runner.restore_result_metadata); a valueless call
@@ -623,10 +793,43 @@ def compile_recording(
                     synth = _dropdown_option_steps(element, steps,
                                                    item.get("state_message") or "")
                     if synth is None and option:
-                        synth = [{"action": "click", "selectors": [
-                            f'role=option[name="{_esc(option)}"]',
-                            f'text="{_esc(option)}"',
-                        ], "expect_text": option}]
+                        # Type-then-pick, never a bare option click: the menu's list is
+                        # only populated once the filter text is typed, so a lone click
+                        # hunts for an option that does not exist yet (the pay-forecast
+                        # employee pick missed on two consecutive runs —
+                        # `role=option[name="Abdullah Reilly"] -> no match`). codegen
+                        # collapses this pair into api.select_option(value), which opens
+                        # the menu, filters, picks by VALUE and reads the value back.
+                        attrs_el = element.get("attributes") or {}
+                        is_option_el = (
+                            str(attrs_el.get("role") or "").lower() == "option"
+                            or "-option-" in str(attrs_el.get("id") or ""))
+                        synth = []
+                        opt_sels = [f'role=option[name="{_esc(option)}"]',
+                                    f'text="{_esc(option)}"']
+                        xp = element.get("x_path")
+                        if is_option_el:
+                            if xp:
+                                # The recorded row itself — guarded by expect_text below,
+                                # so a shifted list refuses rather than picking whoever
+                                # now sits in that slot.
+                                opt_sels.insert(0, "xpath=/" + str(xp).lstrip("/"))
+                        else:
+                            # The recorded element is the COMBOBOX, not a row: the tool
+                            # opened the menu, typed and picked inside one action, so
+                            # nothing else in the script opens it. Emit that opener —
+                            # without it replay searched a CLOSED menu and the gender
+                            # pick failed every replay (run 20260814_113403). The
+                            # combobox's own xpath must never anchor the option row.
+                            opener = _selectors(element)
+                            if opener:
+                                synth.append(_attach_fp(
+                                    {"action": "click", "selectors": opener}, element))
+                        synth += [
+                            {"action": "type", "text": option},
+                            {"action": "click", "selectors": opt_sels,
+                             "expect_text": option},
+                        ]
                     for s in synth:
                         _push_step(steps, s)
                 elif option:
@@ -728,7 +931,15 @@ def compile_recording(
                          "value": Path(str(params["path"])).name,
                          "hidden_ok": True}, element))
             elif name == "send_keys" and params.get("keys"):
-                _push_step(steps, {"action": "press", "keys": params["keys"]})
+                keys = str(params["keys"])
+                if _is_key_chord(keys):
+                    _push_step(steps, {"action": "press", "keys": keys})
+                else:
+                    # Raw TEXT sent through the keyboard tool (the agent typing into an
+                    # already-focused field — how the net-to-gross popup got its amount).
+                    # Replay must type it: keyboard.press("4000") raises `Unknown key`
+                    # and failed that segment on every replay (run 20260814_105247).
+                    _push_step(steps, {"action": "type", "text": keys})
             elif name in ("capped_scroll", "scroll"):
                 # Discovery scrolling is load-bearing: the target section must be scrolled
                 # into view before the following click can resolve (observed: the Reviews
@@ -742,6 +953,18 @@ def compile_recording(
                 _push_step(steps, {"action": "scroll",
                                    "down": bool(params.get("down", True)),
                                    "pages": min(pages, 1.0)})
+            elif name == "scroll_panels":
+                # Container scrolling must stay container scrolling at replay: folding it
+                # into a viewport "scroll" step would wheel the page BEHIND the fixed
+                # panel the agent was scrolling (run 20260817_110501 — the Add Data
+                # Request employee list owns its scroll box).
+                pages = params.get("pages", 0.8)
+                try:
+                    pages = float(pages)
+                except (TypeError, ValueError):
+                    pages = 0.8
+                _push_step(steps, {"action": "scroll_panels",
+                                   "pages": max(0.2, min(pages, 1.0))})
             elif name == "wait":
                 # Keep the agent's deliberate pauses (capped). They are load-bearing on this
                 # slow React app: they let the invoice form and its react-select menus finish
@@ -751,13 +974,34 @@ def compile_recording(
                 if isinstance(secs, (int, float)) and secs > 0:
                     _push_step(steps, {"action": "wait", "seconds": min(float(secs), 3.0)})
             # `done` is intentionally dropped — Playwright auto-waits on locators.
-    return steps
+    return _collapse_indexed_runs(steps)
+
+
+def normalize_block_text(text: Any) -> str:
+    """Whitespace-collapse WITHIN each line, drop blank lines, keep the line breaks.
+
+    Extract values must normalize identically whether they were read by the authoring
+    tool or by a replayed skill: bindings slice fields out by LINE POSITION, so a
+    replay that flattened the block ("Name 12 High St TOWN" instead of three lines)
+    silently made every line-transform binding unresolvable — the form-fill segment
+    then re-authored with the LLM on every run (observed between runs 20260813_153838
+    and _155450)."""
+    return "\n".join(
+        ln for ln in (" ".join(part.split()) for part in str(text or "").splitlines())
+        if ln)
 
 
 def merge_extract(store: dict[str, str], label: str, value: str) -> str:
     """Record an extract under `label` WITHOUT clobbering a different value already
     there — a collision stores under `label_2`, `label_3`, … and a re-read of an
     already-stored value is a no-op (agent retries must not multiply keys).
+
+    Values are stored WHOLE (line structure preserved). Auto-splitting them into
+    per-field keys was tried 2026-08-12 and removed 2026-08-13: the sub-keys came from
+    page CONTENT, so an address block yielded `pilton` on one run and `catterline` on
+    the next, and any binding keyed on one could never resolve again. Fields are sliced
+    out of the whole block by the binding transforms instead (line index / date
+    reformat) — a line POSITION is stable across identities, a town name is not.
 
     The clobbering this replaces lost real data (observed live: the generated NAME was
     extracted as 'identity_block', then the ADDRESS extract reused the label and
@@ -789,11 +1033,15 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def save_steps(
     recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True,
+    emit_start_goto: bool = True, repeat_hint: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Compile `recording_path` and write the step list to `steps_path` atomically."""
-    steps = compile_recording(recording_path, max_steps=max_steps,
-                              emit_start_goto=emit_start_goto)
+    """Compile `recording_path` and write the step list to `steps_path` atomically.
+    `repeat_hint` is the slice wording's "exactly N clicks" count (see
+    repeat_hint_from_wording) — it pins a lone repeat cluster's count."""
+    steps = _apply_repeat_hint(
+        compile_recording(recording_path, max_steps=max_steps,
+                          emit_start_goto=emit_start_goto),
+        repeat_hint)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 
@@ -831,6 +1079,27 @@ _COMPOSED_WALK_JS = """\
     };
     var inShadowTree = function (e) {
       return !!(e.getRootNode && e.getRootNode() !== document);
+    };
+    // Positional path of an element, document-rooted. Shared by BOTH raw finders so
+    // every captured element carries the exact location (2026-08-13: the control
+    // finder used to return none, which is why find_by_text clicks could not be
+    // anchored and compiled to text searches instead).
+    var xpathOf = function (e) {
+      if (!e || e === document.documentElement) return '/html';
+      var ix = 1, sib, n = 0;
+      for (sib = e.parentNode ? e.parentNode.firstElementChild : null; sib;
+           sib = sib.nextElementSibling) {
+        if (sib.tagName === e.tagName) { n++; if (sib === e) ix = n; }
+      }
+      return xpathOf(e.parentElement) + '/' + e.tagName.toLowerCase() +
+             (n > 1 ? '[' + ix + ']' : '');
+    };
+    // A positional xpath resolves against the DOCUMENT at replay time; for a
+    // shadow-tree element it would land on some unrelated light-DOM node. No anchor
+    // is honest — a wrong-element anchor is not.
+    var safeXpath = function (e) {
+      if (inShadowTree(e)) return '';
+      try { return xpathOf(e); } catch (err) { return ''; }
     };
 """
 
@@ -920,7 +1189,8 @@ __WALK__
       .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
     return { count: out.length, clicked: clicked, refused: refused, name: top.name,
              names: out.slice(0, 8).map(function (o) { return o.name; }),
-             element: { tag: top.el.tagName.toLowerCase(), attrs: attrs } };
+             element: { tag: top.el.tagName.toLowerCase(), attrs: attrs,
+                        xpath: safeXpath(top.el) } };
   } catch (e) { return { error: String(e) }; }
 })()
 """.replace("__WALK__", _COMPOSED_WALK_JS)
@@ -1034,24 +1304,19 @@ __WALK__
     var attrs = {};
     ['id', 'aria-label', 'title', 'name', 'placeholder', 'data-testid', 'href', 'role']
       .forEach(function (a) { var v = top.el.getAttribute(a); if (v) attrs[a] = v; });
-    var xp = function (e) {
-      if (!e || e === document.documentElement) return '/html';
-      var ix = 1, sib, n = 0;
-      for (sib = e.parentNode ? e.parentNode.firstElementChild : null; sib;
-           sib = sib.nextElementSibling) {
-        if (sib.tagName === e.tagName) { n++; if (sib === e) ix = n; }
-      }
-      return xp(e.parentElement) + '/' + e.tagName.toLowerCase() +
-             (n > 1 ? '[' + ix + ']' : '');
-    };
-    // A positional xpath resolves against the DOCUMENT at replay time; for a shadow-tree
-    // element it would land on some unrelated light-DOM node. No anchor is honest — a
-    // wrong-element anchor is not.
-    var xpath = '';
-    if (!inShadowTree(top.el)) {
-      try { xpath = xp(top.el); } catch (e) {}
-    }
+    var xpath = safeXpath(top.el);   // shared walker, spliced in above
+    // Per-line text of the chosen block: extract_data stores this line structure so
+    // bindings can slice stable line POSITIONS out of it. The NAME stays
+    // whitespace-flattened — every matcher assumes flat names.
+    // A <select>'s innerText is every option label concatenated — never the chosen
+    // value — so its reported text (the SELECTED option, resolved above) is the whole
+    // value and there are no block lines to keep.
+    var blockLines = top.el.tagName === 'SELECT' ? [] :
+      String(top.el.innerText || '').split('\n')
+        .map(function (s) { return s.replace(/\s+/g, ' ').trim(); })
+        .filter(function (s) { return s.length > 0; }).slice(0, 60);
     return { count: scored.length, name: top.text.slice(0, 1000), expanded: expanded,
+             lines: blockLines,
              names: scored.slice(0, 5).map(function (o) { return o.text.slice(0, 80); }),
              element: { tag: top.el.tagName.toLowerCase(), attrs: attrs, xpath: xpath } };
   } catch (e) { return { error: String(e) }; }
@@ -1427,14 +1692,81 @@ def _names_value(text: str, value: str) -> bool:
                for i in range(len(have) - len(want) + 1))
 
 
+# Identity attributes the xpath sanity gate compares. TEXT is deliberately absent: an
+# element's text is the DATA it displays, and the fresh-data pages xpath exists for
+# (the generated identity block) show different text every run — comparing it vetoed
+# exactly the extracts the anchor was added to serve (run 20260813_132507, seg 1).
+_FP_GATE_ATTRS = ("id", "name", "aria-label", "data-testid", "data-automationid")
+
+_FP_GATE_JS = (
+    "el => ({tag: el.tagName.toLowerCase(), attrs: Object.fromEntries("
+    "['id','name','aria-label','data-testid','data-automationid']"
+    ".map(a => [a, el.getAttribute(a)]))})"
+)
+
+
+async def _xpath_matches_fingerprint(candidate: Any,
+                                     fingerprint: dict[str, Any] | None) -> bool:
+    """Sanity gate for a positional-xpath hit: the landed element must still BE the
+    recorded one — same tag and same hard identity attributes. A positional path
+    resolves confidently on a shifted layout, onto the WRONG element; identity is what
+    tells them apart, and unlike text it does not change when the page's data does.
+    Volatile ids are skipped (they are regenerated per render). Nothing to compare →
+    allow; unverifiable → refuse (the attribute ladder is right behind)."""
+    fp = fingerprint or {}
+    if not fp:
+        return True
+    tag = str(fp.get("tag") or "")
+    want = {k: str(v) for k, v in ((fp.get("attrs") or {}).items())
+            if k in _FP_GATE_ATTRS and v
+            and not (k == "id" and _is_dynamic_id(str(v)))}
+    if not tag and not want:
+        return True
+    try:
+        got = await candidate.evaluate(_FP_GATE_JS)
+    except Exception:  # noqa: BLE001 - unverifiable = fail this candidate
+        return False
+    if tag and str((got or {}).get("tag") or "").lower() != tag.lower():
+        return False
+    got_attrs = (got or {}).get("attrs") or {}
+    return all(str(got_attrs.get(k) or "") == v for k, v in want.items())
+
+
+# Accessible-name approximation for controls whose name lives OUTSIDE the element:
+# aria-labelledby targets, then label[for=id], then an enclosing <label>, then title.
+# Fluent Toggles are the motivating case (runs 20260817_114057/115232): the recorded
+# fingerprint text "Student loan" is the toggle's ACCESSIBILITY name via label[for],
+# but the button's own inner_text/aria-label are empty — the gate refused the RIGHT
+# element on every replay and archive_if_failing retired the entry after 2 runs.
+_CAND_ACC_NAME_JS = (
+    "el => { const t = s => (s || '').replace(/\\s+/g, ' ').trim();"
+    " const ids = el.getAttribute('aria-labelledby');"
+    " let out = '';"
+    " if (ids) out = t(ids.split(/\\s+/).map(i => {"
+    "   const n = document.getElementById(i); return n ? n.textContent : ''; })"
+    "   .join(' '));"
+    " if (!out && el.id) { const l = document.querySelector("
+    "   'label[for=' + JSON.stringify(el.id) + ']'); if (l) out = t(l.textContent); }"
+    " if (!out) { const l = el.closest('label'); if (l) out = t(l.textContent); }"
+    " if (!out) out = t(el.getAttribute('title'));"
+    " return out; }"
+)
+
+
 async def _candidate_names_value(loc: Any, expect: str) -> bool:
     """Does this resolved candidate visibly carry `expect` as its name? Checks rendered
-    text first, aria-label second (icon-ish controls); unreadable nodes fail closed —
-    a value-anchored click must never act on an element it cannot verify."""
-    for reader in ("inner_text", "aria"):
+    text first, aria-label second (icon-ish controls), then the ASSOCIATED name
+    (aria-labelledby / label[for] / enclosing label / title) — the name layer record-time
+    capture reads for toggles and checkboxes, whose own text is empty. Unreadable nodes
+    fail closed — a value-anchored click must never act on an element it cannot verify."""
+    for reader in ("inner_text", "aria", "assoc"):
         try:
-            text = (await loc.inner_text(timeout=1000) if reader == "inner_text"
-                    else (await loc.get_attribute("aria-label")) or "")
+            if reader == "inner_text":
+                text = await loc.inner_text(timeout=1000)
+            elif reader == "aria":
+                text = (await loc.get_attribute("aria-label")) or ""
+            else:
+                text = str(await loc.evaluate(_CAND_ACC_NAME_JS) or "")
         except Exception:  # noqa: BLE001 - unreadable this way; try the next reader
             continue
         if _names_value(text, expect):
@@ -1511,6 +1843,11 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
             candidate = loc.nth(visible[0])
         else:
             errors.append(f"{sel} -> {len(visible)} visible matches (ambiguous)")
+            continue
+        if sel.startswith("xpath=") and not await _xpath_matches_fingerprint(
+                candidate, step.get("fingerprint")):
+            errors.append(f"{sel} -> landed element no longer matches the recorded "
+                          f"identity (positional drift)")
             continue
         if require_editable:
             try:
@@ -1613,6 +1950,9 @@ async def _reveal_hidden_click(page: Page, step: dict[str, Any]) -> str | None:
             loc = page.locator(sel)
             try:
                 if await loc.count() == 1:
+                    if sel.startswith("xpath=") and not await _xpath_matches_fingerprint(
+                            loc.first, step.get("fingerprint")):
+                        continue
                     target, used_sel = loc.first, sel
                     break
             except Exception:  # noqa: BLE001 - try the next candidate
@@ -1794,6 +2134,94 @@ async def _select_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
     return sel, healed
 
 
+# Scroll every scrollable CONTAINER (and the document) by a fraction of its own height.
+# A side panel / dialog list owns its scroll box, and it usually renders only the rows
+# near its scroll position — so a row further down is not in the DOM at all until that
+# box moves. Wheeling at the viewport centre moves whatever sits under the cursor (the
+# page behind the panel), which is why the employee picker's later rows were
+# unreachable (run 20260814_105247, seg 6). Returns how many boxes actually moved, so a
+# caller can tell "nothing left to scroll" from "scrolled, try the search again".
+# Placeholder: %s = fraction of each container's height to advance.
+SCROLL_CONTAINERS_JS = r"""
+(function () {
+  try {
+    var FRAC = %s;
+    var moved = 0;
+__WALK__
+    var boxes = [];
+    walkAll(function (e) {
+      var st;
+      try { st = getComputedStyle(e); } catch (err) { return; }
+      var oy = st.overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && e.scrollHeight > e.clientHeight + 4) {
+        boxes.push(e);
+      }
+    });
+    boxes.forEach(function (e) {
+      var before = e.scrollTop;
+      e.scrollTop = before + Math.max(40, e.clientHeight * FRAC);
+      if (e.scrollTop !== before) moved++;
+    });
+    var doc = document.scrollingElement || document.documentElement;
+    if (doc && doc.scrollHeight > doc.clientHeight + 4) {
+      var b4 = doc.scrollTop;
+      doc.scrollTop = b4 + Math.max(40, doc.clientHeight * FRAC);
+      if (doc.scrollTop !== b4) moved++;
+    }
+    return moved;
+  } catch (e) { return 0; }
+})()
+""".replace("__WALK__", _COMPOSED_WALK_JS)
+
+
+async def _scroll_containers(page: Page, fraction: float = 0.8) -> int:
+    """Advance every scrollable container; returns how many moved (0 = nothing left)."""
+    try:
+        moved = await page.evaluate(SCROLL_CONTAINERS_JS % json.dumps(float(fraction)))
+        await page.wait_for_timeout(_SETTLE_MS)
+        return int(moved or 0)
+    except Exception as exc:  # noqa: BLE001 - scrolling is best-effort
+        logger.debug("container scroll failed: %s", exc)
+        return 0
+
+
+# Reset every scrollable container AND the page to the top. The hunt companion to
+# SCROLL_CONTAINERS_JS: a down-only sweep from an arbitrary position can never reach a
+# target ABOVE it, and a failed sweep used to leave the page parked at the very bottom
+# (run 20260817_133135 — the user had to scroll back up by hand). Sweeps now START here,
+# and failed hunts END here.
+SCROLL_TOPS_JS = r"""
+(function () {
+  try {
+    var moved = 0;
+__WALK__
+    walkAll(function (e) {
+      var st;
+      try { st = getComputedStyle(e); } catch (err) { return; }
+      var oy = st.overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && e.scrollTop > 0) {
+        e.scrollTop = 0; moved++;
+      }
+    });
+    var doc = document.scrollingElement || document.documentElement;
+    if (doc && doc.scrollTop > 0) { doc.scrollTop = 0; moved++; }
+    return moved;
+  } catch (e) { return 0; }
+})()
+""".replace("__WALK__", _COMPOSED_WALK_JS)
+
+
+async def _scroll_tops(page: Page) -> int:
+    """Scroll page + containers to the top; returns how many scrollers moved."""
+    try:
+        moved = await page.evaluate(SCROLL_TOPS_JS)
+        await page.wait_for_timeout(_SETTLE_MS)
+        return int(moved or 0)
+    except Exception as exc:  # noqa: BLE001 - scrolling is best-effort
+        logger.debug("scroll-to-top failed: %s", exc)
+        return 0
+
+
 async def _wheel_scroll(page: Page, pages: float, down: bool = True) -> None:
     """User-faithful scroll: real wheel input at the viewport center. window.scrollBy is a
     NO-OP inside Fluent ScrollablePanes (the app scrolls an inner container, not the
@@ -1807,6 +2235,29 @@ async def _wheel_scroll(page: Page, pages: float, down: bool = True) -> None:
 # Wheel-scroll rounds find_click hunts before giving up: a virtualized pane renders a
 # section's DOM only once the viewport nears it.
 _FIND_CLICK_ROUNDS = 4
+
+
+async def _resolve_with_scroll(page: Page, step: dict[str, Any], timeout_ms: int,
+                               rounds: int = _FIND_CLICK_ROUNDS) -> tuple[Any, str]:
+    """_resolve with find_click's wheel-scroll rounds: a virtualized pane renders a
+    row's DOM only once the viewport nears it, so a miss wheel-scrolls down and
+    retries. Returns (locator, selector_label); raises after the last round."""
+    last: Exception | None = None
+    for round_no in range(rounds + 1):
+        try:
+            loc, sel, _healed = await _resolve(page, step, timeout_ms)
+            return loc, sel
+        except Exception as exc:  # noqa: BLE001 - miss; scroll and retry
+            last = exc
+            if round_no == 0:
+                # Sweep from the TOP: a down-only hunt from mid-page can never reach
+                # a target rendered above it (run 20260817_133135).
+                await _scroll_tops(page)
+            elif round_no < rounds:
+                await _wheel_scroll(page, 0.6)
+    await _scroll_tops(page)   # a failed hunt must not leave the page at the bottom
+    raise RuntimeError(f"indexed click: {step.get('selectors')} not found after "
+                       f"{rounds} scroll rounds") from last
 
 
 async def _find_click(page: Page, text: str, verify_name: bool = False) -> str:
@@ -1850,8 +2301,18 @@ async def _find_click(page: Page, text: str, verify_name: bool = False) -> str:
             name = str(raw.get("name") or text)
             logger.info("🔎 find_click(%r): clicked %r (round %d)", text, name, round_no)
             return name
-        if round_no < _FIND_CLICK_ROUNDS:
-            await _wheel_scroll(page, 0.6)
+        if round_no == 0:
+            # Sweep from the TOP: a target above the current scroll position is
+            # otherwise unreachable — virtualized rows above the window are pruned
+            # from the DOM just like the ones below it (run 20260817_133135).
+            await _scroll_tops(page)
+        elif round_no < _FIND_CLICK_ROUNDS:
+            # Panels and dialog lists own their scroll boxes and render only the rows
+            # near their scroll position; move those FIRST, then the page under the
+            # cursor for everything else.
+            if not await _scroll_containers(page, 0.8):
+                await _wheel_scroll(page, 0.6)
+    await _scroll_tops(page)   # a failed hunt must not leave the page at the bottom
     raise RuntimeError(f"find_click: no clickable match for {text!r} "
                        f"after {_FIND_CLICK_ROUNDS} scroll rounds")
 
@@ -1890,7 +2351,7 @@ async def _extract_value(page: Page, step: dict[str, Any], timeout_ms: int
             for reader in (_control_value, loc.inner_text, loc.text_content,
                            loc.input_value):
                 try:
-                    value = " ".join(str(await reader() or "").split())
+                    value = normalize_block_text(await reader() or "")
                 except Exception:  # noqa: BLE001 - e.g. input_value on a non-input
                     value = ""
                 if value:
@@ -1911,7 +2372,9 @@ async def _extract_value(page: Page, step: dict[str, Any], timeout_ms: int
                 # that captured it) — re-find it with the same static-text algorithm.
                 raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(tokens))
             if raw and not raw.get("error") and raw.get("count"):
-                value = " ".join(str(raw.get("name") or "").split())
+                lines = [str(ln) for ln in (raw.get("lines") or []) if str(ln).strip()]
+                value = ("\n".join(lines) if len(lines) >= 2
+                         else normalize_block_text(raw.get("name") or ""))
                 used = used or f"find:{step['query']}"
     if not value:
         raise RuntimeError(f"extract {str(step.get('label') or 'value')!r}: no visible "
@@ -2029,12 +2492,32 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
             if action == "goto":
                 await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
             elif action == "click":
-                sel, healed = await _click_with_flyout_recovery(page, steps, idx, timeout_ms)
-                entry = {"step": idx, "action": action, "used": sel}
-                if healed:
-                    entry["healed"] = healed
-                log.append(entry)
-                await page.wait_for_timeout(_SETTLE_MS)
+                # Tier-0 parity for compiled repeats: N clicks with the recorded wait
+                # between (the tier-1 verb adds the readiness poll on top).
+                for rep in range(int(step.get("count", 1))):
+                    sel, healed = await _click_with_flyout_recovery(page, steps, idx,
+                                                                    timeout_ms)
+                    entry = {"step": idx, "action": action, "used": sel}
+                    if healed:
+                        entry["healed"] = healed
+                    log.append(entry)
+                    await page.wait_for_timeout(_SETTLE_MS)
+                    if rep < int(step.get("count", 1)) - 1 and step.get("repeat_wait_s"):
+                        await page.wait_for_timeout(
+                            int(min(float(step["repeat_wait_s"]), 3.0) * 1000))
+            elif action == "click_indexed":
+                template = str(step.get("selector_template") or "")
+                for n in range(int(step.get("start", 0)),
+                               int(step.get("start", 0)) + int(step.get("count", 0))):
+                    isel = template.replace("{n}", str(n))
+                    loc, sel = await _resolve_with_scroll(
+                        page, {"selectors": [isel]}, 2500)
+                    try:
+                        await loc.click(timeout=5000)
+                    except Exception:  # noqa: BLE001 - pointer interception; force like clicks do
+                        await loc.click(timeout=5000, force=True)
+                    log.append({"step": idx, "action": "click", "used": sel})
+                    await page.wait_for_timeout(_SETTLE_MS)
             elif action == "fill":
                 sel, healed = await _fill_with_retry(page, step, timeout_ms)
                 entry = {"step": idx, "action": action, "used": sel}
@@ -2060,6 +2543,8 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
             elif action == "scroll":
                 await _wheel_scroll(page, float(step.get("pages", 0.5)),
                                     down=bool(step.get("down", True)))
+            elif action == "scroll_panels":
+                await _scroll_containers(page, float(step.get("pages", 0.8)))
             elif action == "find_click":
                 name = await _find_click(page, step.get("text", ""),
                                          verify_name=bool(step.get("verify_name")))
@@ -2097,6 +2582,18 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
 _MAX_SELECTORS = 8
 
 
+def merge_promoted_selectors(new_sels: list[str], old_sels: list[str],
+                             cap: int) -> list[str]:
+    """Healed selectors prepend — but NEVER above a leading recorded `xpath=`. The
+    exact location stays rank 0 (2026-08-13 directive); a heal is an added fallback,
+    not a demotion of the anchor the recording is built on."""
+    lead = [s for s in old_sels[:1] if s.startswith("xpath=")]
+    rest = old_sels[len(lead):]
+    seen: set[str] = set()
+    return [s for s in lead + new_sels + rest
+            if not (s in seen or seen.add(s))][:cap]
+
+
 def promote_healed(steps_path: str | Path, replay_log: list[dict[str, Any]]) -> list[int]:
     """Persist successful replay healings into the golden script (atomic rewrite).
 
@@ -2126,9 +2623,7 @@ def promote_healed(steps_path: str | Path, replay_log: list[dict[str, Any]]) -> 
 
         new_sels = _selectors_from_parts(tag, attrs, text)
         old_sels = _step_selectors(step)  # normalizes the legacy single-`selector` form
-        seen: set[str] = set()
-        merged = [s for s in new_sels + old_sels
-                  if not (s in seen or seen.add(s))][:_MAX_SELECTORS]
+        merged = merge_promoted_selectors(new_sels, old_sels, _MAX_SELECTORS)
         if merged != old_sels:
             step["selectors"] = merged
             step.pop("selector", None)
