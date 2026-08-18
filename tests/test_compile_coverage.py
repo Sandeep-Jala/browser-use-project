@@ -1079,11 +1079,12 @@ def test_discovery_loop_notice_fires_on_pure_discovery_streaks():
         return [{n: {}, "interacted_element": None} for n in names]
 
     # A streak of 4 read-only discovery actions -> nudge; re-fires at 8, silent between.
+    # (`scroll` here was `capped_scroll` until that tool was dropped for the built-in.)
     assert discovery_loop_notice(acts("click", "list_actions", "search_page",
-                                      "capped_scroll", "find_elements")) is not None
-    assert discovery_loop_notice(acts("list_actions", "search_page", "capped_scroll")) is None
+                                      "scroll", "find_elements")) is not None
+    assert discovery_loop_notice(acts("list_actions", "search_page", "scroll")) is None
     assert discovery_loop_notice(
-        acts("list_actions", "search_page", "capped_scroll", "find_elements",
+        acts("list_actions", "search_page", "scroll", "find_elements",
              "list_actions")) is None                       # streak 5: between multiples
     assert discovery_loop_notice(
         acts(*(["list_actions"] * 8))) is not None          # streak 8: re-fires
@@ -1535,3 +1536,111 @@ def test_combobox_pick_recorded_on_the_input_emits_an_opener_click(tmp_path):
 
     code, _ = transpile("sid", steps)
     assert "await api.click(" in code and "await api.select_option('Male')" in code
+
+
+async def test_a_select_inside_the_captured_block_reads_as_its_selected_option():
+    """Run 20260818_103055 subtask 1: extract_data('Gender') on fakenamegenerator returned
+    the option list of every dropdown on the page —
+
+        'Gender Random Male Female Name set American Arabic ... Country Australia ...'
+
+    — and the agent burned 4 more steps trying to get the value out of it. The probe's
+    <select> rule only fired when the select WAS the match: query 'Gender' matches the
+    <label>, whose text equals the query, so the zero-information-gain expansion climbs to
+    the form block and takes it with plain innerText, which for a closed <select> is every
+    option. The only query that returned the value was the one that already contained it
+    ('Male'), which is backwards for extraction — and extract_data commits a REPLAYABLE
+    step, so the blob became the value future replays would re-read and bind."""
+    import json as _json
+
+    from playwright.async_api import async_playwright
+
+    from automation.pipeline.script_compile import RAW_TEXT_FIND_JS
+    from tests.test_heal_promotion import _launch
+
+    # The live page's shape: three labelled selects sharing one block.
+    form = """
+      <h3>Your Randomly Generated Identity</h3>
+      <div class="form">
+        <label for="g">Gender</label>
+        <select id="g"><option>Random</option><option selected>Male</option>
+          <option>Female</option></select>
+        <label for="n">Name set</label>
+        <select id="n"><option>American</option><option selected>Scottish</option>
+          <option>Klingon</option></select>
+        <label for="c">Country</label>
+        <select id="c"><option>Australia</option>
+          <option selected>United Kingdom</option></select>
+      </div>
+    """
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(form)
+
+        raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["gender"]))
+        got = raw["name"]
+        assert raw["expanded"] is True          # the label alone teaches nothing
+        assert "Male" in got                    # ...so the block answers, with the VALUES
+        for unchosen in ("Random", "Female", "American", "Klingon", "Australia"):
+            assert unchosen not in got, f"{unchosen!r} is not chosen: {got!r}"
+        assert "Scottish" in got and "United Kingdom" in got   # the other two, correctly
+
+        # The select-as-match branch is untouched.
+        raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["male"]))
+        assert raw["name"] == "Male"
+
+        # A block with NO select captures exactly what it captured before: the identity
+        # card the aux-tab flow actually depends on.
+        await page.set_content("""
+          <div class="card"><h3>Harrison Sutherland</h3>
+            <div>36 Hull Road</div><div>PAGLESHAM EASTEND</div><div>SS4 6HJ</div></div>
+        """)
+        raw = await page.evaluate(RAW_TEXT_FIND_JS % _json.dumps(["harrison", "sutherland"]))
+        assert raw["expanded"] is True
+        assert raw["name"] == "Harrison Sutherland 36 Hull Road PAGLESHAM EASTEND SS4 6HJ"
+
+
+def test_fluent_counter_ids_are_volatile_but_app_authored_ids_are_not():
+    """Run 20260818_11xx, Net-to-Gross seg: the popup fill's only two anchors were
+    css=[id="TextField99"] and an xpath GATED on that same id, and the id is a Fluent
+    getId() mount counter — yesterday's recording of the identical input said
+    TextField69. Both anchors died ("no match" | "positional drift") and the step could
+    never replay. _is_dynamic_id already feeds the selector builder AND the fingerprint
+    gate; it just scored TextField99 as stable because _DYNAMIC_ID wants 3+ digits."""
+    from automation.pipeline.script_compile import _is_dynamic_id
+
+    for volatile in ("TextField99", "TextField69", "Toggle21", "Toggle2105",
+                     "Dropdown4", "ComboBox7", "id__42", "SearchBox129"):
+        assert _is_dynamic_id(volatile), volatile
+    # btnReverseCalc10 is this very skill's WORKING anchor (the Feb-27 pencil) — an
+    # app-authored id that happens to end in digits. A generic letters+digits rule would
+    # swallow it and break the two click steps that replay fine today.
+    for stable in ("btnReverseCalc10", "btnInvoice", "gender", "productItems", "cb2"):
+        assert not _is_dynamic_id(stable), stable
+
+
+def test_a_query_derived_expect_is_stamped_scattered(tmp_path):
+    """find_by_text matches on a HAYSTACK (text + every descendant icon's aria-label,
+    each token anywhere). When the clicked element has no accessible name of its own,
+    compile records that QUERY as the step's identity — and replay's _names_value wants
+    the tokens CONSECUTIVE, which a grid row can never satisfy. Mark the provenance so
+    replay can verify the way the query matched."""
+    row = {"node_name": "tr", "attributes": {},
+           "x_path": "html/body/table/tbody/tr[11]"}
+    history = [_item({"find_by_text": {"text": "Feb-27 Net to gross", "click_first": True}},
+                     result=[{"extracted_content": "clicked",
+                              "metadata": {"interacted_element": row}}])]
+    step = compile_recording(_write(tmp_path, history), emit_start_goto=False)[0]
+    assert step["expect_text"] == "Feb-27 Net to gross"
+    assert step["expect_scattered"] is True
+
+    # A real accessible name keeps the strict rule: it names ONE element, not a haystack.
+    named = {"node_name": "button", "ax_name": "Save", "attributes": {"id": "btnSave"},
+             "x_path": "html/body/button"}
+    history = [_item({"find_by_text": {"text": "Save", "click_first": True}},
+                     result=[{"extracted_content": "clicked",
+                              "metadata": {"interacted_element": named}}])]
+    step = compile_recording(_write(tmp_path, history), emit_start_goto=False)[0]
+    assert step["expect_text"] == "Save"
+    assert "expect_scattered" not in step

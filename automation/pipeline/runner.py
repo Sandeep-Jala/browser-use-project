@@ -137,7 +137,7 @@ def _search_typed_text(last_action: dict[str, Any] | None) -> str | None:
 
 # Read-only discovery actions: none of these change the page, so a long unbroken run of
 # them means the agent is hunting in circles instead of acting.
-_DISCOVERY_ACTIONS = {"list_actions", "search_page", "find_elements", "capped_scroll",
+_DISCOVERY_ACTIONS = {"list_actions", "search_page", "find_elements",
                       "scroll", "find_by_text_lookup"}
 # Consecutive discovery actions before the loop nudge fires (and re-fires every multiple).
 _DISCOVERY_LOOP_AT = 4
@@ -420,7 +420,7 @@ class Runner:
             # output from small/low-effort models.
             include_tool_call_examples=True,
             extend_system_message=self.extend_system_message,
-            # Custom actions the prompts rely on (skip_step, fail_and_stop, capped_scroll,
+            # Custom actions the prompts rely on (skip_step, fail_and_stop, scroll_panels,
             # detect_layout_issues, run_accessibility_scan) plus all built-ins. None → built-ins.
             tools=self.tools,
             # browser-use's end-of-run judge (use_judge defaults True) is OFF — the

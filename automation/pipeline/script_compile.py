@@ -31,9 +31,21 @@ _DYNAMIC_ID = re.compile(r"\d{3,}")
 #   react-select-6-input / react-select-9-option-0   (react-select — the marquee offender here)
 #   :r3: / :ra:                                       (React useId / Radix / MUI)
 #   mui-42 / headlessui-menu-3                        (MUI / Headless UI)
+#   TextField99 / Toggle21 / Dropdown4                Fluent getId() — a MOUNT counter
 _FRAMEWORK_ID = re.compile(
     r"^(react-select-\d+|:r[0-9a-z]+:|mui-\d+|headlessui-[\w-]*\d+|radix-[\w:-]+)",
     re.IGNORECASE,
+)
+# Fluent's getId('TextField') ids are a per-mount counter, so the SAME control is
+# TextField69 one run and TextField99 the next (run 20260818, Net-to-Gross popup: the
+# fill's only anchors were css=[id="TextField99"] and an xpath gated on that id — "no
+# match" and "positional drift", a step that could never replay). _DYNAMIC_ID's 3+ digit
+# rule misses a young counter, so the family is listed explicitly. NOT a generic
+# letters+digits rule: that also swallows btnReverseCalc10, the app-authored pencil id
+# this very skill anchors its working click steps on.
+_FLUENT_COUNTER_ID = re.compile(
+    r"^(TextField|Toggle|Dropdown|ComboBox|Checkbox|ChoiceGroup|DatePicker|SpinButton"
+    r"|Slider|Callout|Layer|Tooltip|id__)\d+$"
 )
 # A react-select descendant id carries a STABLE suffix ("option-0", "listbox") we can anchor on
 # independently of the volatile instance counter. GROUPED menus nest the index
@@ -54,7 +66,8 @@ _TAG_ROLE = {"a": "link", "button": "button"}
 
 def _is_dynamic_id(idv: str) -> bool:
     """True if an id is auto-generated and unsafe to anchor on across re-renders."""
-    return bool(_DYNAMIC_ID.search(idv) or _FRAMEWORK_ID.match(idv))
+    return bool(_DYNAMIC_ID.search(idv) or _FRAMEWORK_ID.match(idv)
+                or _FLUENT_COUNTER_ID.match(idv))
 
 
 def _esc(value: str) -> str:
@@ -280,6 +293,14 @@ def _with_recovered_text(element: dict[str, Any] | None,
     enriched = dict(element)
     enriched["ax_name"] = text
     return enriched
+
+
+def _refused_scroll(results: list[Any], i: int) -> bool:
+    """Did the scroll action at history position `i` refuse instead of moving anything?
+    (agent_tools stamps metadata no_scroll when a dismiss-on-scroll popup was open.)"""
+    md = results[i].get("metadata") if i < len(results) and \
+        isinstance(results[i], dict) else None
+    return bool(isinstance(md, dict) and md.get("no_scroll"))
 
 
 def _ax_label(element: dict[str, Any]) -> str:
@@ -729,9 +750,21 @@ def compile_recording(
                         # stale-href fallback resolving into a DIFFERENT control must
                         # refuse, not click (the wrong-row guard, now also for
                         # unparameterized clicks).
-                        label = _ax_label(element) or query
+                        ax = _ax_label(element)
+                        label = ax or query
                         if label:
                             step["expect_text"] = label
+                        if label and not ax:
+                            # The name is the agent's QUERY, and find_by_text matched it
+                            # on a haystack (text + every descendant icon label, each
+                            # token anywhere) — not as the element's own name. Replay's
+                            # consecutive-token rule can never satisfy that: the Feb-27
+                            # grid row took 'Feb-27' from its month cell and 'Net to
+                            # gross' from the pencil's aria-label, so every replay
+                            # refused it and only the hover fallback clicked (run
+                            # 20260818). Record the provenance so _resolve verifies the
+                            # way the query matched.
+                            step["expect_scattered"] = True
                         _push_step(steps, _attach_fp(step, element))
                     else:
                         # No anchorable identity was captured. Recording the tool's TEXT
@@ -940,11 +973,19 @@ def compile_recording(
                     # Replay must type it: keyboard.press("4000") raises `Unknown key`
                     # and failed that segment on every replay (run 20260814_105247).
                     _push_step(steps, {"action": "type", "text": keys})
+            elif name in ("capped_scroll", "scroll", "scroll_panels") and \
+                    _refused_scroll(results, i):
+                # The tool was REFUSED while a popup was open (agent_tools
+                # _refuse_if_callout): nothing moved. Compiling it would bake the very
+                # page-scroll that dismisses that popup into every future replay — the
+                # phantom-action rule the no_click probes and no_fill refusals follow.
+                continue
             elif name in ("capped_scroll", "scroll"):
                 # Discovery scrolling is load-bearing: the target section must be scrolled
                 # into view before the following click can resolve (observed: the Reviews
-                # panel's "View all" icon). capped_scroll is our tool ({pages}); the
-                # built-in scroll uses {num_pages}.
+                # panel's "View all" icon). capped_scroll was OUR tool ({pages}) until
+                # 2026-08-18, when the built-in scroll ({num_pages}) replaced it — the
+                # name stays handled so recordings made before that still replay.
                 pages = params.get("pages", params.get("num_pages", 0.5))
                 try:
                     pages = float(pages)
@@ -1175,7 +1216,18 @@ __WALK__
       refused = 'invisible-name-mismatch';
     } else if (DOCLICK) {
       try {
-        top.el.scrollIntoView({ block: 'center' });
+        // A Fluent Callout on screen closes itself the moment anything outside it
+        // scrolls, and this click needs no scroll at all: the events below are
+        // DISPATCHED, not aimed at coordinates, so they land wherever the element
+        // sits. Guarding inside the shared JS keeps authoring (find_by_text) and
+        // replay (find_click) byte-identical — a behaviour only one side has is a
+        // step that cannot replay.
+        var calloutOpen = false, cs = document.querySelectorAll('.ms-Callout');
+        for (var ci = 0; ci < cs.length; ci++) {
+          var cr = cs[ci].getBoundingClientRect();
+          if (cr.width > 0 && cr.height > 0) { calloutOpen = true; break; }
+        }
+        if (!calloutOpen) top.el.scrollIntoView({ block: 'center' });
         // Full mousedown→mouseup→click sequence: React widgets (react-select options)
         // select on mousedown and ignore a bare .click().
         ['mousedown', 'mouseup', 'click'].forEach(function (t) {
@@ -1228,6 +1280,37 @@ __WALK__
     // option text (options are zero-rect while the menu is closed and would otherwise
     // knock the select out of the deepest-only filter below, losing the match entirely).
     var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1, OPTION: 1, OPTGROUP: 1 };
+    // The text a capture REPORTS. A <select>'s innerText is every option label
+    // concatenated — never the value a user sees chosen — and that is true whether the
+    // select IS the match or merely sits INSIDE it. Run 20260818_103055 subtask 1:
+    // extract_data('Gender') matched the <label>, expanded to the enclosing form block
+    // (below), and reported 'Gender Random Male Female Name set American ... Country
+    // Australia ...' — the option lists of all three dropdowns. Substituting each
+    // descendant select with its selected option turns that same block into
+    // 'Gender Male Name set Scottish Country United Kingdom'.
+    // innerText stays the path for select-free elements: it respects visibility, which a
+    // textContent walk cannot. The walk runs only where a select is actually present.
+    var renderedText = function (el) {
+      if (el.tagName === 'SELECT') {
+        var sel = el.selectedOptions && el.selectedOptions[0];
+        return (sel && sel.text) || el.value || '';
+      }
+      if (!el.querySelector || !el.querySelector('select')) return el.innerText || '';
+      var out = [];
+      var walk = function (n) {
+        if (n.nodeType === 3) { out.push(n.data); return; }
+        if (n.nodeType !== 1) return;
+        if (n.tagName === 'SELECT') {
+          var o = n.selectedOptions && n.selectedOptions[0];
+          out.push((o && o.text) || n.value || '');
+          return;
+        }
+        if (SKIP[n.tagName]) return;
+        for (var c = n.firstChild; c; c = c.nextSibling) walk(c);
+      };
+      walk(el);
+      return out.join(' ');
+    };
     // One composed pass collects the candidate elements AND the whole-page text for the
     // every-token gate (body.textContent alone misses shadow content).
     var all = [], whole = '';
@@ -1262,20 +1345,16 @@ __WALK__
     deepest.forEach(function (e) {
       var r = e.getBoundingClientRect();
       if (!(r.width > 0 && r.height > 0)) return;      // display:none / detached
-      var text = (e.innerText || '').replace(/\s+/g, ' ').trim();
+      var text = renderedText(e).replace(/\s+/g, ' ').trim();
       if (!text) return;                                // hidden by an ancestor
       scored.push({ el: e, text: text });
     });
     if (!scored.length) return { count: 0 };
     scored.sort(function (a, b) { return a.text.length - b.text.length; });
     var top = scored[0];
-    // A <select>'s rendered text is its option labels concatenated — never the value a
-    // user sees chosen. Report the SELECTED option instead. (Inputs cannot reach here:
-    // their textContent is empty, so they never match the tokens.)
-    if (top.el.tagName === 'SELECT') {
-      var sel_opt = (top.el.selectedOptions && top.el.selectedOptions[0]) || null;
-      top = { el: top.el, text: (sel_opt && sel_opt.text) || top.el.value || top.text };
-    }
+    // (A <select> match already carries its SELECTED option as its text — renderedText
+    // resolved it when the candidate was scored. Inputs cannot reach here at all: their
+    // textContent is empty, so they never match the tokens.)
     // Zero-information-gain expansion: a capture that is EXACTLY the query teaches nothing
     // (a generated name alone in its own <h3> — the caller wanted the card AROUND it).
     // Climb to the nearest ancestor that adds text; if that first-gaining ancestor is
@@ -1289,7 +1368,7 @@ __WALK__
       if (normText(top.text) === queryNorm) {
         var anc = composedParent(top.el);
         while (anc && anc !== document.body) {
-          var ancText = (anc.innerText || '').replace(/\s+/g, ' ').trim();
+          var ancText = renderedText(anc).replace(/\s+/g, ' ').trim();
           if (normText(ancText) !== queryNorm) {
             if (ancText.length && ancText.length <= 1000) {
               top = { el: anc, text: ancText };
@@ -1311,8 +1390,13 @@ __WALK__
     // A <select>'s innerText is every option label concatenated — never the chosen
     // value — so its reported text (the SELECTED option, resolved above) is the whole
     // value and there are no block lines to keep.
+    // A block holding a <select> has no trustworthy line structure once the options are
+    // replaced by the chosen value (the walk joins text, it cannot reproduce layout line
+    // breaks), so it reports as one line. The consumer of `lines` is bindings' stable
+    // line POSITIONS, and its subject — the generated identity card — holds no selects,
+    // so that path keeps innerText's exact line split.
     var blockLines = top.el.tagName === 'SELECT' ? [] :
-      String(top.el.innerText || '').split('\n')
+      String(renderedText(top.el) || '').split('\n')
         .map(function (s) { return s.replace(/\s+/g, ' ').trim(); })
         .filter(function (s) { return s.length > 0; }).slice(0, 60);
     return { count: scored.length, name: top.text.slice(0, 1000), expanded: expanded,
@@ -1753,20 +1837,81 @@ _CAND_ACC_NAME_JS = (
 )
 
 
+# Accessible-name approximation for an element with NO text of its own that holds a
+# LABELLED child — an icon-only table cell / wrapper (run 20260818_091836 seg 4: the
+# Net-to-Gross grid cell, whose pencil renders as a CSS glyph, so inner_text is '').
+# Capture reads exactly this layer: browser-use builds a cell's ax_name from its
+# CONTENTS, so compile stamps expect_text="Net to gross" for an element whose own name
+# is empty, and the gate refused it on every replay. The empty-own-text condition is
+# what keeps this narrow: an element that DOES render text has already been judged on
+# that text by the inner_text reader, and a child icon must not overrule it.
+_CAND_DESC_NAME_JS = (
+    "el => { const t = s => (s || '').replace(/\\s+/g, ' ').trim();"
+    " if (t(el.innerText)) return '';"
+    " const kids = el.querySelectorAll('[aria-label],[title],[data-icon-name]');"
+    " const out = [];"
+    " for (let i = 0; i < kids.length && i < 12; i++) {"
+    "   out.push(t(kids[i].getAttribute('aria-label')),"
+    "            t(kids[i].getAttribute('title')),"
+    "            t(kids[i].getAttribute('data-icon-name'))); }"
+    " return out.filter(Boolean).join(' ').slice(0, 200); }"
+)
+
+
+# The haystack RAW_FIND_JS matches a find_by_text QUERY against: the element's own
+# label-ish attributes and text, PLUS every descendant's icon/title/label hints. Replay
+# reads the same surface back for a step whose expect_text is a query rather than a name
+# (`expect_scattered`), so a click is re-verified by the predicate that made it.
+_CAND_HAYSTACK_JS = (
+    "el => { const t = s => (s || '').replace(/\\s+/g, ' ').trim();"
+    " const bits = [el.getAttribute('title'), el.getAttribute('aria-label'),"
+    "   el.getAttribute('name'), el.innerText];"
+    " el.querySelectorAll('[data-icon-name],[title],[aria-label]').forEach(c => {"
+    "   bits.push(c.getAttribute('data-icon-name'), c.getAttribute('title'),"
+    "             c.getAttribute('aria-label')); });"
+    " return bits.filter(Boolean).map(t).join(' '); }"
+)
+
+
+def _holds_tokens(text: str, expect: str) -> bool:
+    """Every token of `expect` present SOMEWHERE in `text` — RAW_FIND_JS's own rule.
+    Weaker than _names_value's consecutive run, and deliberately so: it is only used
+    where the recorded name came from a scattered-token search in the first place. Each
+    token must still be there, so a neighbouring row missing one of them is refused."""
+    have = set(_query_tokens(text))
+    want = _query_tokens(expect)
+    return bool(want) and all(tok in have for tok in want)
+
+
+async def _candidate_holds_tokens(loc: Any, expect: str) -> bool:
+    """The scattered twin of _candidate_names_value. Unreadable nodes fail closed."""
+    try:
+        hay = str(await loc.evaluate(_CAND_HAYSTACK_JS) or "")
+    except Exception:  # noqa: BLE001 - a candidate we cannot read is never acted on
+        return False
+    return _holds_tokens(hay, expect)
+
+
 async def _candidate_names_value(loc: Any, expect: str) -> bool:
     """Does this resolved candidate visibly carry `expect` as its name? Checks rendered
     text first, aria-label second (icon-ish controls), then the ASSOCIATED name
     (aria-labelledby / label[for] / enclosing label / title) — the name layer record-time
-    capture reads for toggles and checkboxes, whose own text is empty. Unreadable nodes
-    fail closed — a value-anchored click must never act on an element it cannot verify."""
-    for reader in ("inner_text", "aria", "assoc"):
+    capture reads for toggles and checkboxes, whose own text is empty — and finally, for
+    an element with no text at all, the name of the LABELLED CHILD it holds (an icon-only
+    cell; see _CAND_DESC_NAME_JS). Every reader mirrors a layer capture's ax_name is built
+    from: a name this gate cannot read back is a step that can never replay. Unreadable
+    nodes fail closed — a value-anchored click must never act on an element it cannot
+    verify."""
+    for reader in ("inner_text", "aria", "assoc", "desc"):
         try:
             if reader == "inner_text":
                 text = await loc.inner_text(timeout=1000)
             elif reader == "aria":
                 text = (await loc.get_attribute("aria-label")) or ""
-            else:
+            elif reader == "assoc":
                 text = str(await loc.evaluate(_CAND_ACC_NAME_JS) or "")
+            else:
+                text = str(await loc.evaluate(_CAND_DESC_NAME_JS) or "")
         except Exception:  # noqa: BLE001 - unreadable this way; try the next reader
             continue
         if _names_value(text, expect):
@@ -1826,8 +1971,9 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
             errors.append(f"{sel} -> {count} match(es), none visible")
             continue
         if expect:
-            named = [n for n in visible
-                     if await _candidate_names_value(loc.nth(n), expect)]
+            verify = (_candidate_holds_tokens if step.get("expect_scattered")
+                      else _candidate_names_value)
+            named = [n for n in visible if await verify(loc.nth(n), expect)]
             if not named:
                 errors.append(f'{sel} -> {len(visible)} visible match(es), '
                               f'none named "{expect}"')
@@ -1869,7 +2015,11 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
         healed = await _heal_locate(page, fingerprint, require_editable)
         if healed is not None:
             winner = healed[2] or {}
-            if expect and not _names_value(str(winner.get("text") or ""), expect):
+            winner_text = str(winner.get("text") or "")
+            expect_ok = (_holds_tokens(winner_text, expect)
+                         if step.get("expect_scattered")
+                         else _names_value(winner_text, expect))
+            if expect and not expect_ok:
                 # A fingerprint heal scores STRUCTURE, not the value — on a value-anchored
                 # step a confident structural match to the wrong-named row is exactly the
                 # wrong-business click this gate exists for.

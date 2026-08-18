@@ -293,7 +293,7 @@ page may have changed":
      element with its CURRENT click index. Then click that
      index, or pass click_first=true when the label is unique.
   4. If find_by_text returns 0 matches, the element is not on
-     the page: use capped_scroll, or apply the ELEMENT NOT
+     the page: use scroll, or apply the ELEMENT NOT
      FOUND POLICY. Never re-issue the same query.
 
 find_elements is for STRUCTURAL queries only (table rows,
@@ -465,15 +465,14 @@ decision has been made. Call the tool immediately.
     - The overall workflow can still reach a meaningful conclusion.
 
 ───────────────────────────────────────────────────────────
-SCROLLING RULE — Use capped_scroll for ALL discovery scrolling
+SCROLLING RULE — small steps for ALL discovery scrolling
 ───────────────────────────────────────────────────────────
 When scrolling to find elements, sections, or content:
-  • ALWAYS use the capped_scroll tool, NOT the raw scroll tool.
-  • capped_scroll enforces a maximum of 0.5 pages per call.
+  • Use the scroll tool with a MAXIMUM of 0.5 pages per call.
   • For discovery (looking for an unknown element): use 0.2 pages.
   • For navigating a known gap: use up to 0.5 pages.
-  • Do NOT use scroll values larger than 0.5 — the tool will cap it anyway,
-    but using large values is a signal you are trying to skip content.
+  • Do NOT use scroll values larger than 0.5 — nothing caps it for you,
+    and a large value skips content you were sent to find.
   • After each scroll call, check if the target is now visible before
     scrolling again. Do not pre-issue multiple scrolls.
 

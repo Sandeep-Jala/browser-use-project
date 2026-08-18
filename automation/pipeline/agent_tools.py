@@ -5,7 +5,6 @@ NOT part of browser-use's built-in set:
 
   * skip_step(reason)          — escape hatch: abandon the current objective, keep going.
   * fail_and_stop(reason)      — escape hatch: terminate the whole run as a failure.
-  * capped_scroll(down, pages) — discovery scroll capped at 0.5 pages per call.
   * find_by_text(text)         — find interactive elements by label in a FRESH snapshot,
                                  returning their current click indexes (optionally clicking).
   * extract_data(text, label)  — capture a piece of on-page data by a REPLAYABLE locator:
@@ -547,6 +546,72 @@ async def _in_layer_popup(handle) -> bool:
     except Exception as exc:  # noqa: BLE001 - unprobeable is not proof of a popup
         logger.debug("layer-popup probe failed: %s", exc)
         return False
+
+
+# Document-level twin of _in_layer_popup, narrowed to the DISMISS-ON-SCROLL family:
+# Fluent Callouts (and the ContextualMenus/pickers built on them) close themselves when
+# anything outside scrolls. Panels and Modals do NOT — and must stay out of this probe:
+# the Add Data Request side PANEL owns the employee list whose rows only container
+# scrolling reveals (runs 20260814_105247 / 20260817_110501 / 20260817_133135), so a
+# guard that counted panels would kill the hunt those runs exist to protect.
+_CALLOUT_OPEN_JS = r"""
+(function () {
+  try {
+    var els = document.querySelectorAll('.ms-Callout'), n = 0;
+    for (var i = 0; i < els.length; i++) {
+      var r = els[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) n++;
+    }
+    return { open: n };
+  } catch (e) { return { error: String(e) }; }
+})()
+"""
+
+
+async def _callout_open(browser_session) -> bool:
+    """Is a dismiss-on-scroll popup on screen right now? False when unprobeable — the
+    scroll hunt stays the default rather than being suppressed by a broken probe."""
+    try:
+        got = await _eval_js(browser_session, _CALLOUT_OPEN_JS)
+    except Exception as exc:  # noqa: BLE001 - a probe must never fail the lookup
+        logger.debug("callout probe failed: %s", exc)
+        return False
+    return bool(isinstance(got, dict) and not got.get("error") and got.get("open"))
+
+
+# Keys that scroll the PAGE. Escape/Tab/Enter/arrows/Space are deliberately absent: they
+# are how the agent closes a popup, moves between its fields and walks a combobox INSIDE
+# it, and inside a text box they type or move the caret. Refusing those would trap the
+# agent in the popup the refusal itself tells it to close.
+_PAGE_SCROLL_KEYS = frozenset({"pagedown", "pageup"})
+
+
+async def _refuse_if_callout(browser_session, action: str):
+    """Refuse a page-MOVING action while a dismiss-on-scroll popup is open; None when the
+    action may proceed.
+
+    A Fluent Callout closes itself the moment anything outside it scrolls (the user's own
+    words, 2026-08-18: "if you click on it and then scroll or do something, the popup
+    vanishes"). find_by_text's hunt was gated on 08-17; this is the same gate for every
+    remaining way the page can move. It reuses `_callout_open` unchanged, so Panels and
+    Modals — the Add Data Request employee list, whose rows ONLY container scrolling
+    reveals — never trip it, and an unprobeable page still scrolls.
+
+    ERROR channel on purpose (the `input` dropdown refusal's rule): multi_act stops the
+    rest of a batched step, so a queued click cannot fire against a popup the refused
+    scroll would have closed. The message must name the way OUT or the agent deadlocks.
+    """
+    if not await _callout_open(browser_session):
+        return None
+    msg = (f"REFUSED — did NOT {action}: a POPUP is open on this page and it DISMISSES "
+           "ITSELF when anything outside it scrolls. A popup owns the screen, so nothing "
+           "it holds is behind a scroll: its fields are already in the page state — read "
+           "them by index and act on them there. If you genuinely need the page BEHIND "
+           "it, close the popup FIRST (press Escape, or click its own Cancel/close "
+           "button), then scroll. Do NOT re-click the control that opened the popup "
+           "either — that dismisses it too.")
+    logger.info("⛔ %s", msg)
+    return ActionResult(error=msg, metadata={"no_scroll": True})
 
 
 _FIELD_LABEL_JS = """function(){
@@ -1545,6 +1610,22 @@ async def _click_outcome_suffix(browser_session, t0: float,
                        "opened (e.g. an email panel after a save) or may close on its "
                        "own — re-read the page and continue from what it actually "
                        "shows.")
+        elif closed is False and not fired and _LIVE_NETWORK is not None:
+            # Writes WERE watched and none fired: that is what a client-side commit
+            # looks like (an in-page calculator/picker that recomputes and closes its
+            # own popup a render later), not evidence of failure. Run 20260817_163352
+            # seg 4: the Net-to-Gross Calculate had already applied £4,000.00 to the
+            # Feb-27 row when this branch called it a probable save failure — the agent
+            # redid the work, dismissed the popup by re-clicking its pencil, and typed
+            # the amount into the grid cell behind it. The observation stays; the
+            # failure verdict does not.
+            suffix += (" — the dialog is STILL OPEN this soon after the click, and no "
+                       "write fired. A client-side commit looks exactly like this and "
+                       "its popup can close a render later, so this is NOT evidence of "
+                       "failure: READ THE PAGE for the change this dialog makes and "
+                       "decide from what it shows. Re-enter the data only if the page "
+                       "still shows the old value — and never re-click the control that "
+                       "opened this popup while it is open, which only dismisses it.")
         elif closed is False:
             suffix += (" — the dialog is STILL OPEN after this click. If this was a "
                        "save/submit it likely did NOT go through: look for validation "
@@ -1899,37 +1980,45 @@ def build_tools() -> Tools:
     async def fail_and_stop(reason: str) -> ActionResult:
         return await _fail_and_stop_result(reason)
 
-    @tools.action(
-        "Scroll for discovery, capped at 0.5 pages per call (values above 0.5 are clamped). "
-        "down=True scrolls down, False scrolls up; pages is the fraction of a viewport to move "
-        "(use ~0.2 to hunt for an unknown element). Scrolls the main window, falling back to the "
-        "largest scrollable container if the window itself does not move."
-    )
-    # NOTE: `browser_session` is intentionally UNANNOTATED and LAST. browser-use injects it by
-    # NAME; adding a `: BrowserSession` hint makes its registry compare our imported class against
-    # its own and raise "conflicts with special argument injected". Do not annotate it.
-    async def capped_scroll(down: bool = True, pages: float = 0.2, browser_session=None) -> ActionResult:
-        capped = max(0.0, min(float(pages), 0.5))
-        js = (
-            "(function(){var dir=%s?1:-1;var px=Math.round(%f*window.innerHeight)*dir;"
-            "var y0=window.scrollY;window.scrollBy(0,px);"
-            "if(window.scrollY!==y0)return 'window';"
-            "var els=[].slice.call(document.querySelectorAll('*')).filter(function(e){"
-            "var s=getComputedStyle(e);return /(auto|scroll)/.test(s.overflowY)&&"
-            "e.scrollHeight>e.clientHeight+4;});"
-            "els.sort(function(a,b){return b.clientHeight*b.clientWidth-a.clientHeight*a.clientWidth;});"
-            "if(els.length){els[0].scrollBy(0,px);return 'container';}return 'none';})()"
-            % ("true" if down else "false", capped)
-        )
-        try:
-            where = await _eval_js(browser_session, js)
-        except Exception as exc:  # noqa: BLE001 - a scroll must never crash the run
-            logger.warning("capped_scroll failed: %s", exc)
-            return ActionResult(error=f"capped_scroll failed: {exc}")
-        direction = "down" if down else "up"
-        moved = "nothing scrolled (already at edge)" if where == "none" else f"scrolled the {where}"
-        msg = f"capped_scroll {direction} {capped} page(s): {moved}"
-        return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+    # The page-MOVING built-ins get the same callout guard as our own scroll tools
+    # (find_text's entire job is "Scroll to text"). Same-name registration overrides
+    # them; the originals are captured FIRST, exactly as for `click` above — and with
+    # the same caveat: browser-use re-registers built-ins when set_coordinate_clicking
+    # flips, which would silently drop these wrappers.
+    _builtin_scroll = tools.registry.registry.actions["scroll"]
+    _builtin_scroll_fn = _builtin_scroll.function
+
+    @tools.action(_builtin_scroll.description, param_model=_builtin_scroll.param_model)
+    async def scroll(params, browser_session=None) -> ActionResult:
+        refused = await _refuse_if_callout(browser_session, "scroll the page")
+        if refused is not None:
+            return refused
+        return await _builtin_scroll_fn(params=params, browser_session=browser_session)
+
+    _builtin_find_text = tools.registry.registry.actions["find_text"]
+    _builtin_find_text_fn = _builtin_find_text.function
+
+    @tools.action(_builtin_find_text.description,
+                  param_model=_builtin_find_text.param_model)
+    async def find_text(params, browser_session=None) -> ActionResult:
+        refused = await _refuse_if_callout(browser_session, "scroll to that text")
+        if refused is not None:
+            return refused
+        return await _builtin_find_text_fn(params=params, browser_session=browser_session)
+
+    _builtin_send_keys = tools.registry.registry.actions["send_keys"]
+    _builtin_send_keys_fn = _builtin_send_keys.function
+
+    @tools.action(_builtin_send_keys.description,
+                  param_model=_builtin_send_keys.param_model)
+    async def send_keys(params, browser_session=None) -> ActionResult:
+        keys = str(getattr(params, "keys", "") or "")
+        if any(k.strip().lower() in _PAGE_SCROLL_KEYS
+               for k in keys.replace("+", " ").split()):
+            refused = await _refuse_if_callout(browser_session, f"press {keys}")
+            if refused is not None:
+                return refused
+        return await _builtin_send_keys_fn(params=params, browser_session=browser_session)
 
     @tools.action(
         "Scroll EVERY scrollable container (side panels, dialog lists, popup grids) down "
@@ -1944,6 +2033,11 @@ def build_tools() -> Tools:
         "re-read the page, confirm the target row's NAME is visible, then click it."
     )
     async def scroll_panels(pages: float = 0.8, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        # Even container scrolling is refused while a callout is open: SCROLL_CONTAINERS_JS
+        # moves EVERY scrollable container, including the ones outside the popup.
+        refused = await _refuse_if_callout(browser_session, "scroll the containers")
+        if refused is not None:
+            return refused
         frac = max(0.2, min(float(pages), 1.0))
         try:
             moved = int(await _eval_js(
@@ -2011,6 +2105,7 @@ def build_tools() -> Tools:
             # control). Query the live DOM directly and, when click_first, click it via its
             # own handler — the only way to reach a functional 0x0 element.
             raw = None
+            popup = False
             try:
                 expr = _RAW_FIND_JS % (json.dumps(tokens), "true" if click_first else "false")
                 raw = await _eval_js(browser_session, expr)
@@ -2022,22 +2117,36 @@ def build_tools() -> Tools:
                 # then advance them and look again (the employee picker's new hire was
                 # unreachable below the fold — run 20260814_105247, seg 6). The page's
                 # own scroll is included both ways.
+                #
+                # NOT while a CALLOUT is open. A callout owns the screen: what it holds
+                # is never behind a page scroll, so the hunt has nothing to win — and a
+                # Fluent Callout DISMISSES ON SCROLL, so it has the popup to lose.
+                # (Panels/modals are excluded from the probe on purpose — their lists
+                # are exactly what the hunt is for; see _CALLOUT_OPEN_JS.)
+                # Run 20260817_163352 seg 4: find_by_text('Net amount') — a LABEL, which
+                # RAW_FIND_JS (controls only) can never match — swept ~22 scrollTops
+                # across the open Net-to-Gross callout; the static-text probe below then
+                # honestly reported the label "not in this page's DOM" because the sweep
+                # had just closed the popup it lived in.
                 if not (raw and not raw.get("error") and raw.get("count")):
-                    await _eval_js(browser_session, _SCROLL_TOPS_JS)
-                    raw = await _eval_js(browser_session, expr)
-                for _ in range(_PANEL_SCROLL_ROUNDS):
-                    if raw and not raw.get("error") and raw.get("count"):
-                        break
-                    moved = await _eval_js(browser_session,
-                                           _SCROLL_CONTAINERS_JS % json.dumps(0.8))
-                    if not moved:
-                        break
-                    raw = await _eval_js(browser_session, expr)
-                if not (raw and not raw.get("error") and raw.get("count")):
-                    # A failed hunt must not leave the page parked at the bottom: the
-                    # agent's next snapshot should show the page's head, not its floor
-                    # (the manual scroll-up from run 20260817_133135, automated).
-                    await _eval_js(browser_session, _SCROLL_TOPS_JS)
+                    popup = await _callout_open(browser_session)
+                if not popup:
+                    if not (raw and not raw.get("error") and raw.get("count")):
+                        await _eval_js(browser_session, _SCROLL_TOPS_JS)
+                        raw = await _eval_js(browser_session, expr)
+                    for _ in range(_PANEL_SCROLL_ROUNDS):
+                        if raw and not raw.get("error") and raw.get("count"):
+                            break
+                        moved = await _eval_js(browser_session,
+                                               _SCROLL_CONTAINERS_JS % json.dumps(0.8))
+                        if not moved:
+                            break
+                        raw = await _eval_js(browser_session, expr)
+                    if not (raw and not raw.get("error") and raw.get("count")):
+                        # A failed hunt must not leave the page parked at the bottom: the
+                        # agent's next snapshot should show the page's head, not its floor
+                        # (the manual scroll-up from run 20260817_133135, automated).
+                        await _eval_js(browser_session, _SCROLL_TOPS_JS)
             except Exception as exc:  # noqa: BLE001 - fallback is best-effort
                 logger.debug("find_by_text raw-DOM fallback failed: %s", exc)
             if raw and not raw.get("error") and raw.get("count"):
@@ -2109,12 +2218,29 @@ def build_tools() -> Tools:
                 # no_click: a probe that touched nothing — same compile rule as below.
                 return ActionResult(extracted_content=msg, long_term_memory=msg,
                                     include_in_memory=True, metadata={"no_click": True})
+            if popup:
+                # A popup IS open and nothing in it (or behind it) matches. Sending the
+                # agent scroll-hunting here is the one move that destroys the popup, and
+                # so is re-clicking the control that opened it — both happened in run
+                # 20260817_163352 seg 4 while the Net-to-Gross callout was on screen.
+                msg = (
+                    f"find_by_text('{query}'): no match, and a POPUP/dialog is open on "
+                    f"this page ({page_url}). Its fields are in the page state — read "
+                    "them by index rather than by name (a popup's inputs are often "
+                    "unlabelled, so the label beside the box is NOT the control's own "
+                    "text). Do NOT scroll and do NOT re-click the control that opened "
+                    "the popup: either one dismisses it. If you meant something behind "
+                    "the popup, close the popup first."
+                )
+                logger.info("🔎 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
             msg = (
                 f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
                 "The element is not in this page's DOM. FIRST check: is this the page you think "
                 "you are on? If a previous click navigated you away (e.g. back to a list page), "
-                "recover with go_back or re-open the right section. Otherwise scroll with "
-                "capped_scroll or apply the ELEMENT NOT FOUND POLICY; do not repeat this exact query."
+                "recover with go_back or re-open the right section. Otherwise scroll (0.5 "
+                "pages at most) or apply the ELEMENT NOT FOUND POLICY; do not repeat this query."
             )
             logger.info("🔎 %s", msg)
             # no_click: this was a PROBE that touched nothing — without the stamp, compile
