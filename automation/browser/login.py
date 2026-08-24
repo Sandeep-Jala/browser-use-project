@@ -21,7 +21,7 @@ from playwright.async_api import Page, Playwright, TimeoutError as PlaywrightTim
 
 from automation.config import Config
 from automation.browser.error_capture import save_login_error_screenshot
-from automation.pipeline.script_compile import REVEAL_CSS_JS
+from automation.pipeline.script_compile import CALLOUT_SCROLL_PIN_JS, REVEAL_CSS_JS
 
 
 class LoginError(RuntimeError):
@@ -108,6 +108,13 @@ async def login(playwright: Playwright, config: Config, cdp_url: str) -> str:
             await page.context.add_init_script(REVEAL_CSS_JS)
         except Exception:  # noqa: BLE001 - cosmetic here; re-asserts cover it
             pass
+    # The callout scroll pin, ungated: a Fluent Callout dismisses on any outside scroll, so
+    # a popup opened from a partly-clipped control dies before its field can be typed into.
+    # Installed here too so the very first document of the run already carries it.
+    try:
+        await page.context.add_init_script(CALLOUT_SCROLL_PIN_JS)
+    except Exception:  # noqa: BLE001 - hybrid's install and the per-step re-assert cover it
+        pass
 
     try:
         print(f"[*] Navigating to {config.login_url}...")

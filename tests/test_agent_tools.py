@@ -5,9 +5,12 @@ carry their meaning only in a child glyph, which browser-use serializes away —
 edit, and delete icons all reach the agent as a nameless `<button/>`. `_descendant_icon_hints`
 recovers that meaning from the child so nameless icon buttons become findable."""
 
+import pathlib
+
 from automation.pipeline import agent_tools
 from automation.pipeline.agent_tools import (
     _descendant_icon_hints,
+    ensure_callout_scroll_pin,
     ensure_reveal_css,
     read_new_notifications,
 )
@@ -139,6 +142,75 @@ async def test_reveal_css_never_raises_and_skips_none_session(monkeypatch):
     assert calls == [1]
     await ensure_reveal_css(None)      # no session -> no eval
     assert calls == [1]
+
+
+# --------------------------- callout scroll pin (2026-08-24) ---------------------------
+# A Fluent Callout dismisses on any OUTSIDE scroll, and the scroll that kills it is usually
+# not ours: a control PARTLY outside the viewport bounds is still visible and clickable, so
+# the click scrolls it into view to reach it and the popup that click opened dies on that
+# movement (user's own mechanism, 2026-08-24). The pin reverts the scroll AND swallows the
+# event, verified in a real browser: scrollIntoView on a below-the-fold target moved the
+# page to y=317, the pin put it back to 0, and a Fluent-shaped dismisser registered AFTER
+# the pin never fired. In-callout scrolling stayed live (innerScrollTop 50).
+
+
+async def test_scroll_pin_evals_the_shared_installer(monkeypatch):
+    """Identity, not a lookalike: the pin the agent installs per step must be the same
+    constant login.py and HybridSession.open init-script, or a document could carry a
+    different pin than the one the run was verified with."""
+    calls = []
+
+    async def fake_eval(_session, expr):
+        calls.append(expr)
+    monkeypatch.setattr(agent_tools, "_eval_js", fake_eval)
+
+    await ensure_callout_scroll_pin(object())
+    assert calls == [agent_tools._CALLOUT_SCROLL_PIN_JS]
+
+
+async def test_scroll_pin_never_raises_and_skips_none_session(monkeypatch):
+    calls = []
+
+    async def boom(_s, _e):
+        calls.append(1)
+        raise RuntimeError("cdp down")
+    monkeypatch.setattr(agent_tools, "_eval_js", boom)
+
+    await ensure_callout_scroll_pin(object())   # swallowed: never fails a step
+    assert calls == [1]
+    await ensure_callout_scroll_pin(None)       # no session -> no eval
+    assert calls == [1]
+
+
+def test_scroll_pin_is_idempotent_and_self_contained():
+    """The pin guards on a window flag so repeated installs are no-ops, probes `.ms-Callout`
+    ONLY (Panels and Modals scroll freely — the Data Request employee list depends on it),
+    and swallows the event as well as reverting: Fluent dismisses on the EVENT, so reverting
+    alone would leave the popup already closed."""
+    js = agent_tools._CALLOUT_SCROLL_PIN_JS
+    assert "if (window[FLAG]) return { already: true }" in js
+    assert ".ms-Callout" in js and ".ms-Panel" not in js and ".ms-Modal" not in js
+    assert "stopImmediatePropagation" in js          # the load-bearing half
+    assert "callout.contains(t)) return" in js       # in-popup scrolling stays live
+    # Registered in the CAPTURE phase on both window and document, so it runs before the
+    # dismisser Fluent attaches when the callout opens.
+    assert js.count("addEventListener('scroll', onScroll, true)") == 2
+
+
+def test_field_focus_never_scrolls_the_page():
+    """Focusing a field the browser thinks is off-screen scrolls the page to the caret, and
+    that movement dismisses an open Callout. Every acting focus() must pass preventScroll —
+    the pin would revert it, but not moving is cheaper and covers documents the pin missed."""
+    from automation.pipeline import script_compile as sc
+    for mod in (agent_tools, sc):
+        offenders = [
+            (n, line.strip())
+            for n, line in enumerate(pathlib.Path(mod.__file__).read_text().splitlines(), 1)
+            # Comments may DISCUSS a bare focus() (agent_tools documents that react-select
+            # ignores one); only real calls matter.
+            if ".focus()" in line and not line.lstrip().startswith(("#", "//"))
+        ]
+        assert not offenders, f"{mod.__name__} bare focus() call(s): {offenders}"
 
 
 # ------------------------------- extract_data -------------------------------

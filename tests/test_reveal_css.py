@@ -140,7 +140,7 @@ async def test_replay_segment_injects_reveal_css_when_flag_on(monkeypatch):
     monkeypatch.setattr(hybrid.skills, "execute", _fake_execute)
     hs, page = _session(True)
     seg = await hs.replay_segment(_sub(), "sid", "/clients", None, hybrid.Gate(kind="steps"))
-    assert page.evals == [sc.REVEAL_CSS_JS]
+    assert sc.REVEAL_CSS_JS in page.evals
     assert seg.ok
 
 
@@ -148,5 +148,18 @@ async def test_replay_segment_skips_reveal_css_when_flag_off(monkeypatch):
     monkeypatch.setattr(hybrid.skills, "execute", _fake_execute)
     hs, page = _session(False)
     seg = await hs.replay_segment(_sub(), "sid", "/clients", None, hybrid.Gate(kind="steps"))
-    assert page.evals == []
+    assert sc.REVEAL_CSS_JS not in page.evals
     assert seg.ok
+
+
+async def test_replay_segment_always_injects_the_callout_scroll_pin(monkeypatch):
+    """The pin is NOT gated on reveal_hidden_controls: a popup dismissed by a scroll loses
+    the value being typed into it, which is correctness rather than cosmetics. Replay needs
+    it most — a replay-only run executes no agent step, so the per-step heal never fires,
+    and a compiled skill clicks a popup opener and fills its field with no pause between."""
+    monkeypatch.setattr(hybrid.skills, "execute", _fake_execute)
+    for flag in (True, False):
+        hs, page = _session(flag)
+        seg = await hs.replay_segment(_sub(), "sid", "/clients", None, hybrid.Gate(kind="steps"))
+        assert sc.CALLOUT_SCROLL_PIN_JS in page.evals, flag
+        assert seg.ok

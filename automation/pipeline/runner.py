@@ -603,6 +603,9 @@ class Runner:
             # covers tabs created outside login.py's init-scripted context.
             if self.config.reveal_hidden_controls:
                 await agent_tools.ensure_reveal_css(session)
+            # Same per-step heal for the callout scroll pin, but ungated: a popup dismissed
+            # by a scroll loses the value being typed into it (see ensure_callout_scroll_pin).
+            await agent_tools.ensure_callout_scroll_pin(session)
             await _surface_notifications(_agent)
             _surface_downloads(_agent)
             if pause_state["requested"]:

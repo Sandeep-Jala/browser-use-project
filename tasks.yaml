@@ -891,10 +891,9 @@ payroll_detailed_review_fps_part1:
   tags: [payroll]
   subtasks:
     - prompt: >-
-        Go to the Payroll module, search for and select the business name FOOD LIMITED, then
-        go to the Data Request section.
+        Go to the Payroll module, search for and select the business name FOOD LIMITED.
     - prompt: >-
-        Click + Request, click Payroll Review, click Detailed, change the date combobox to
+        Now Go to Data Request Section. Click + Request, click Payroll Review, click Detailed, change the date combobox to
         May-26, select the first 12 employees in the list, and click Save.
     - prompt: >-
         In the Send Email section that opens, open the From dropdown and select the no-reply
@@ -915,7 +914,7 @@ payroll_detailed_review_fps_part2:
         anything.
     - prompt: >-
         Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
-        ref. no. link to open the Payroll Review panel, and click Get OTP, click on the number to copy it click the cross icon to close the dialog.
+        ref. no. to open the Payroll Review panel, and click Get OTP, note and remember the OTP, click the cross icon to close the dialog.
     - prompt: >-
         Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, enter the OTP got it from the previous step and click proceed Securely. 
     - prompt: >-

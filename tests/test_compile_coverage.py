@@ -74,6 +74,42 @@ def test_unexecuted_actions_are_never_compiled(tmp_path):
     assert compile_recording(_write(tmp_path, history), emit_start_goto=False) == []
 
 
+def test_index_miss_actions_are_never_compiled(tmp_path):
+    """An indexed action whose element index had already fallen out of the selector map
+    returns "not available" INSTEAD of acting — but it still carries the interacted
+    element captured from the pre-action DOM, which is why it used to compile. Recording
+    step 0 of the Send Email segment (038d896c619d0a0c) misclicked the panel's close-X;
+    the #mailbtn click queued behind it never ran, yet became a step, so every replay
+    clicked a Send button its own previous step had just removed from the page."""
+    miss = ("Element index 5913 not available - page may have changed. "
+            "Try refreshing browser state.")
+    history = [{
+        "state": {"url": "http://app/x", "interacted_element": [
+            {"node_name": "BUTTON", "ax_name": None, "attributes": {"type": "button"},
+             "x_path": "html/body/div[2]/div/div[1]/div/button"},
+            {"node_name": "BUTTON", "ax_name": "Send", "attributes": {"id": "mailbtn"},
+             "x_path": "html/body/div[2]/div/div[3]/span/button[1]"},
+        ]},
+        "model_output": {"action": [
+            {"click": {"index": 5813}},
+            {"click": {"index": 5913}},
+        ]},
+        "result": [
+            {"extracted_content": 'Clicked button ""'},
+            {"extracted_content": miss},
+        ],
+    }]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert len(steps) == 1
+    assert steps[0]["action"] == "click"
+    assert "mailbtn" not in json.dumps(steps)
+    # The same message on the `error` channel, and on a non-click indexed tool, also drops.
+    history[0]["model_output"]["action"][1] = {"select_dropdown": {"index": 5913,
+                                                                  "text": "no-reply"}}
+    history[0]["result"][1] = {"error": miss}
+    assert len(compile_recording(_write(tmp_path, history), emit_start_goto=False)) == 1
+
+
 def test_restore_result_metadata_reinjects_dropped_field(tmp_path):
     rec = tmp_path / "rec.json"
     rec.write_text(json.dumps({"history": [

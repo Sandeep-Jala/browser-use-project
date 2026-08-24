@@ -303,6 +303,24 @@ def _refused_scroll(results: list[Any], i: int) -> bool:
     return bool(isinstance(md, dict) and md.get("no_scroll"))
 
 
+# The sentence every indexed tool returns INSTEAD of acting when the index it was given
+# has fallen out of the selector map: browser_use.tools.service (click, input,
+# dropdown_options, select_dropdown) and our own overrides in agent_tools (input,
+# select_dropdown) word it identically and stamp no metadata, so the text is the signal.
+_INDEX_MISS = "not available - page may have changed"
+
+
+def _index_miss(results: list[Any], i: int) -> bool:
+    """Did the indexed action at history position `i` return WITHOUT acting because its
+    element index was gone? Unlike the no_click/no_fill/no_scroll refusals, this one
+    carries no metadata — the message is all the recording keeps of it."""
+    r = results[i] if i < len(results) and isinstance(results[i], dict) else None
+    if r is None:
+        return False
+    return any(_INDEX_MISS in str(r.get(k) or "")
+               for k in ("extracted_content", "long_term_memory", "error"))
+
+
 def _ax_label(element: dict[str, Any]) -> str:
     """The element's short accessible name for landed-click verification ('' when the
     recorder captured none, or only a >60-char announcement blob). Editable elements
@@ -737,6 +755,20 @@ def compile_recording(
             if results and i >= len(results) and name != "done":
                 logger.info("compile: skipping recorded %s at step %d — it never "
                             "executed (the step's action queue stopped earlier)",
+                            name, item_idx)
+                continue
+            # An indexed action whose element index was already gone never touched the
+            # page either — it returned the "not available" message instead of acting.
+            # It still carries an interacted_element (captured from the PRE-action DOM
+            # snapshot), which is exactly why it used to compile: recording step 0 of the
+            # Send Email segment (038d896c619d0a0c) misclicked the panel's close-X and
+            # the #mailbtn click queued behind it never ran, yet became a step. Every
+            # replay then clicked a Send button its own previous step had just removed
+            # from the page. Same phantom-action rule as the no_click/no_fill/no_scroll
+            # refusals below, for the one shape that stamps no metadata.
+            if "index" in params and _index_miss(results, i):
+                logger.info("compile: skipping recorded %s at step %d — its element "
+                            "index was no longer available, so it never acted",
                             name, item_idx)
                 continue
             if exits_site and name not in _READ_ONLY_ACTIONS:
@@ -1469,7 +1501,7 @@ __WALK__
     if (matches.length !== 1) return { count: matches.length };
     var el = matches[0];
     if (OP === 'focus') {
-      try { el.focus(); } catch (e) {}
+      try { el.focus({preventScroll: true}); } catch (e) {}
       if (CLEAR && el.select) { try { el.select(); } catch (e) {} }
       else if (!CLEAR && el.setSelectionRange) {
         try {
@@ -1644,6 +1676,122 @@ _REVEAL_INSTALL_TEMPLATE = r"""
 })()
 """
 REVEAL_CSS_JS = _REVEAL_INSTALL_TEMPLATE % (json.dumps(REVEAL_STYLE_ID), json.dumps(REVEAL_CSS))
+
+# --- Callout scroll pin ----------------------------------------------------------------------
+# A Fluent Callout dismisses itself when anything OUTSIDE it scrolls. Every earlier guard
+# chased one SOURCE of that scroll — our scroll tools (_refuse_if_callout), our text hunt
+# (2026-08-17), browser-use's own nudge (the 2026-08-20 pre-scroll band, which moved the page
+# on purpose and so was still movement). None of them held, because the scroll that kills the
+# popup is not always ours.
+#
+# The user's mechanism (2026-08-24, their words): the page normally never moves on a click.
+# It moves when the target sits PARTLY OUTSIDE the viewport bounds but is still visible and
+# clickable — the click must scroll it into view to reach it. The popup opens, something then
+# scrolls (the click's scroll-into-view settling, or the callout autofocusing its first field,
+# which makes the browser scroll to it), and the callout vanishes with the Net amount box.
+# Full screen only helps by accident: the pencil lands fully inside the bounds, so no scroll
+# is needed.
+#
+# So stop chasing sources and take the invariant instead: while a callout is open, the page
+# does not move. An outside scroll is
+#   1. REVERTED to the position held when the callout opened, and
+#   2. STOPPED with stopImmediatePropagation, so Fluent never receives the event at all.
+# (2) is the load-bearing half: Fluent dismisses on the EVENT, not on the resulting offset,
+# so reverting alone would leave the popup already closed. Our listener is installed at
+# document start and Fluent registers its own on open, so ours runs first among same-phase
+# listeners and can still swallow the event.
+#
+# Scrolling INSIDE the callout is untouched — its own scrollable content must keep working,
+# and Fluent does not dismiss on it. Panels and Modals never enter this at all: the probe is
+# `.ms-Callout` only, exactly as _CALLOUT_OPEN_JS, so the Add Data Request employee list
+# whose rows only container scrolling reveals is unaffected.
+CALLOUT_SCROLL_PIN_FLAG = "__ao_callout_scroll_pin"
+
+_CALLOUT_SCROLL_PIN_TEMPLATE = r"""
+(function () {
+  try {
+    var FLAG = %s;
+    if (window[FLAG]) return { already: true };
+    var S = { reverts: 0, stopped: 0, last: null, pinnedAt: null, open: false };
+    window[FLAG] = S;
+
+    var openCallout = function () {
+      try {
+        var els = document.querySelectorAll('.ms-Callout');
+        for (var i = 0; i < els.length; i++) {
+          var r = els[i].getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return els[i];
+        }
+      } catch (e) {}
+      return null;
+    };
+
+    var pageXY = function () {
+      return { x: window.scrollX || window.pageXOffset || 0,
+               y: window.scrollY || window.pageYOffset || 0 };
+    };
+
+    // Baseline: the page offset to hold for as long as the callout lives. Sampled the
+    // moment the callout appears; refreshed on every ordinary scroll while none is open,
+    // so it is already correct even when the callout opens between two frames.
+    var baseline = pageXY();
+    var callout = null;
+
+    var check = function () {
+      var found = openCallout();
+      if (found && !callout) {          // opened
+        callout = found;
+        baseline = pageXY();
+        S.open = true;
+        S.pinnedAt = baseline;
+      } else if (!found && callout) {   // closed
+        callout = null;
+        S.open = false;
+      }
+    };
+
+    var dirty = false;
+    var observer = new MutationObserver(function () {
+      if (dirty) return;                // one cheap probe per frame at most
+      dirty = true;
+      requestAnimationFrame(function () { dirty = false; check(); });
+    });
+    try {
+      observer.observe(document.documentElement || document, {childList: true, subtree: true});
+    } catch (e) {}
+
+    var onScroll = function (ev) {
+      try {
+        check();
+        var t = ev.target;
+        if (!callout) {                 // no popup: just keep the baseline current
+          if (t === document || t === window || t === document.documentElement ||
+              t === document.body) baseline = pageXY();
+          return;
+        }
+        // Scrolling inside the popup is legitimate and never dismisses it.
+        if (t && t.nodeType === 1 && t !== document.documentElement &&
+            t !== document.body && callout.contains(t)) return;
+        var now = pageXY();
+        if (now.x !== baseline.x || now.y !== baseline.y) {
+          window.scrollTo({left: baseline.x, top: baseline.y, behavior: 'instant'});
+          S.reverts++;
+          S.last = {from: now, to: baseline, target: t && t.nodeName ? t.nodeName : String(t)};
+        }
+        // Fluent dismisses on the EVENT. Swallow it so the popup never learns.
+        S.stopped++;
+        ev.stopImmediatePropagation();
+      } catch (e) {}
+    };
+
+    window.addEventListener('scroll', onScroll, true);
+    document.addEventListener('scroll', onScroll, true);
+    return { installed: true };
+  } catch (e) { return { error: String(e) }; }
+})()
+"""
+
+CALLOUT_SCROLL_PIN_JS = _CALLOUT_SCROLL_PIN_TEMPLATE % json.dumps(CALLOUT_SCROLL_PIN_FLAG)
 
 # After an interaction, give the slow React app a beat to open a menu / commit react-select
 # state / re-render before the next locator query, so replay doesn't outrun the UI.

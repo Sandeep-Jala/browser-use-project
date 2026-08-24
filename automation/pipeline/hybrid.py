@@ -63,7 +63,8 @@ from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloa
                                            get_decomposition, is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
-from automation.pipeline.script_compile import (REVEAL_CSS_JS, _atomic_write, _esc,
+from automation.pipeline.script_compile import (CALLOUT_SCROLL_PIN_JS, REVEAL_CSS_JS,
+                                                _atomic_write, _esc,
                                                 repeat_hint_from_wording,
                                                 _names_value, merge_extract,
                                                 promote_healed, save_steps)
@@ -571,6 +572,16 @@ class HybridSession:
                     await ctx.add_init_script(REVEAL_CSS_JS)
                 except Exception as exc:  # noqa: BLE001 - re-asserts cover a miss
                     logger.debug("reveal init script install failed: %s", exc)
+        # The callout scroll pin, on the same long-lived connection but NOT gated on
+        # reveal_hidden_controls: it is correctness (a popup that vanishes loses the value
+        # being typed), not cosmetics. Installing at document start matters — the pin's
+        # scroll listener must be registered BEFORE Fluent registers the one it dismisses
+        # on, and same-phase listeners fire in registration order.
+        for ctx in hs.pw_browser.contexts:
+            try:
+                await ctx.add_init_script(CALLOUT_SCROLL_PIN_JS)
+            except Exception as exc:  # noqa: BLE001 - the per-step re-assert covers a miss
+                logger.debug("callout scroll pin install failed: %s", exc)
         # Route downloads to the run's artifacts with their REAL suggested filenames
         # (behavior "allow"). Two layers fight us here, both observed live: browser-use
         # classifies a CDP-attached session as REMOTE and skips its own
@@ -902,6 +913,17 @@ class HybridSession:
                 await page.evaluate(REVEAL_CSS_JS)
             except Exception as exc:  # noqa: BLE001 - best-effort; replay proceeds anyway
                 logger.debug("reveal css injection skipped: %s", exc)
+        # Same re-assert for the callout scroll pin, ungated. Replay needs it MORE than the
+        # live path, not less: a replay-only run executes no agent step, so the per-step
+        # heal (agent_tools.ensure_callout_scroll_pin) never fires, and a compiled skill
+        # clicks a popup opener and fills its field back to back with no LLM pause in
+        # between — exactly the window in which a scroll dismissal goes unnoticed. Run
+        # 20260824_121419 seg 4 died there: the Net-amount input resolved to "1 match(es),
+        # none visible".
+        try:
+            await page.evaluate(CALLOUT_SCROLL_PIN_JS)
+        except Exception as exc:  # noqa: BLE001 - best-effort; replay proceeds anyway
+            logger.debug("callout scroll pin injection skipped: %s", exc)
         outcome = await skills.execute(skill, page)
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)

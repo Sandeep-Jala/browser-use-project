@@ -72,6 +72,7 @@ from automation.pipeline.script_compile import (
     SCROLL_CONTAINERS_JS as _SCROLL_CONTAINERS_JS,
     SCROLL_TOPS_JS as _SCROLL_TOPS_JS,
     normalize_block_text,
+    CALLOUT_SCROLL_PIN_JS as _CALLOUT_SCROLL_PIN_JS,
     REVEAL_CSS_JS as _REVEAL_CSS_JS,
     _RS_FILTER_ID,
     value_took as _value_took,
@@ -329,6 +330,29 @@ async def ensure_reveal_css(browser_session: BrowserSession | None) -> None:
         await _eval_js(browser_session, _REVEAL_CSS_JS)
     except Exception as exc:  # noqa: BLE001 - styling must never break a step
         logger.debug("ensure_reveal_css skipped: %s", exc)
+
+
+async def ensure_callout_scroll_pin(browser_session: BrowserSession | None) -> None:
+    """Install the callout scroll pin (script_compile.CALLOUT_SCROLL_PIN_JS, idempotent)
+    into the agent's CURRENT document.
+
+    A Fluent Callout dismisses itself when anything OUTSIDE it scrolls, and the scroll that
+    kills it is usually not ours: a control sitting PARTLY outside the viewport bounds is
+    still visible and clickable, so the click has to scroll it into view to reach it, and
+    the popup that click opened dies on that movement (user, 2026-08-24). The pin reverts
+    such a scroll and swallows the event so the popup never learns of it.
+
+    Same shape as ensure_reveal_css: the init scripts in login.py/HybridSession.open cover
+    documents born inside those contexts, and this per-step pass heals what they cannot
+    reach — a tab browser-use creates via CDP outside them. Ungated and best-effort: a
+    popup that vanishes loses the value being typed, so this is correctness, but it must
+    never be able to break a step either."""
+    if browser_session is None:
+        return
+    try:
+        await _eval_js(browser_session, _CALLOUT_SCROLL_PIN_JS)
+    except Exception as exc:  # noqa: BLE001 - the init scripts are the primary path
+        logger.debug("ensure_callout_scroll_pin skipped: %s", exc)
 
 
 # --- Layout heuristic (runs entirely in the page) --------------------------------------------
@@ -859,14 +883,14 @@ _CB_OPS_JS = """
   };
   var SEQ = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
   if (OP === 'open') {
-    try { input.focus(); } catch (e) {}
+    try { input.focus({preventScroll: true}); } catch (e) {}
     fire(input, SEQ);
     return { ok: true };
   }
   if (OP === 'escape') {
     // react-select's own Escape handling: closes the menu and clears the typed filter
     // (a stuck filter is why a dead combobox keeps showing 'No options' for any text).
-    try { input.focus(); } catch (e) {}
+    try { input.focus({preventScroll: true}); } catch (e) {}
     ['keydown', 'keyup'].forEach(function (t) {
       try {
         input.dispatchEvent(new KeyboardEvent(t, { key: 'Escape', code: 'Escape',
@@ -1028,7 +1052,7 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         # and give the narrowed/loaded list one more look.
         try:
             await _eval_js(browser_session,
-                           f"document.getElementById({json.dumps(input_id)}).focus()")
+                           f"document.getElementById({json.dumps(input_id)}).focus({{preventScroll: true}})")
             cdp_session = await browser_session.get_or_create_cdp_session()
             await cdp_session.cdp_client.send.Input.insertText(
                 params={"text": target}, session_id=cdp_session.session_id)
@@ -1068,7 +1092,7 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         if options and chosen is None:
             try:
                 await _eval_js(browser_session,
-                               f"document.getElementById({json.dumps(input_id)}).focus()")
+                               f"document.getElementById({json.dumps(input_id)}).focus({{preventScroll: true}})")
                 cdp_session = await browser_session.get_or_create_cdp_session()
                 await cdp_session.cdp_client.send.Input.insertText(
                     params={"text": target}, session_id=cdp_session.session_id)
@@ -1174,7 +1198,12 @@ async def _press(handle, key: str, code: str, vk: int, *,
 async def _keyboard_clear(handle) -> bool:
     """Empty the field with real keystrokes. True once a readback shows it empty."""
     try:
-        await _call_on_field(handle, "function(){ this.focus(); return true; }")
+        await _call_on_field(handle,
+            # preventScroll: focusing a field the browser thinks is off-screen scrolls
+            # the page to the caret, and that movement dismisses an open Callout. The
+            # scroll pin would revert it, but not moving at all is cheaper and also
+            # covers a document the pin failed to install into.
+            "function(){ this.focus({preventScroll: true}); return true; }")
         current = await _field_value(handle)
         if current is None:
             return False  # unreadable: let browser-use's own clear have its turn
