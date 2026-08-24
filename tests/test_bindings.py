@@ -614,3 +614,57 @@ def test_short_values_bind_when_the_word_match_is_unambiguous():
 
     # Ambiguous: the same token appears twice — refuse, never guess which one.
     assert hybrid._extract_transform_spec("St", {"a": "1 St Mary\nSt Andrews"}) is None
+
+
+def test_the_binder_matches_its_source_ignoring_case():
+    """fakenamegenerator prints the TOWN in UK postal ALL-CAPS ("HOOTON", "BUTT GREEN")
+    while the agent often types it title-cased into the form. Case-sensitive matching gave
+    that one value no structured source, and ONE unbindable value refuses the whole
+    commit — so the Add-Employee recording kept re-authoring at ~300-480k tokens a run
+    (measured 2026-08-24 across three live runs; the same refusal cost run 20260819_145019
+    its entry). The binding stores the SOURCE, so a replay types the page's own casing."""
+    ident = {"identity": "Paul Hughes\n38 Scotswood Road\nHOOTON\nL66 1BW"}
+
+    # A whole line, and a word run inside one, both bind regardless of how it was typed.
+    for typed in ("HOOTON", "Hooton", "hooton"):
+        spec = hybrid._extract_transform_spec(typed, ident)
+        assert spec == {"kind": "extract", "label": "identity",
+                        "transform": {"line": {"index": 2, "count": 1, "join": " "}}}, typed
+    assert hybrid._extract_transform_spec("scotswood road", ident)["transform"] == {
+        "line": {"index": 1, "count": 1, "join": " "}, "words": {"start": 1, "count": 2}}
+
+    # The replay re-derives from the SOURCE, so it types the page's casing, not the
+    # authoring run's.
+    resolve = hybrid._binding_resolver(
+        {"identity": "Cyrus Simpson\n53 Colorado Way\nRHYD-Y-FRO\nSA8 9GQ"},
+        SimpleNamespace())
+    assert resolve(hybrid._extract_transform_spec("Hooton", ident)) == "RHYD-Y-FRO"
+
+    # Whole-value equality (the fast path in _bind_runtime_values) is case-blind too.
+    steps = [{"action": "fill", "selectors": ["css=#t"], "value": "Hooton"}]
+    bound = _bind_runtime_values(steps, ["Hooton"], {"town": "HOOTON"}, [])
+    assert bound is not None
+    rewritten, params, bindings = bound
+    assert rewritten[0]["value"] == "{{bound_1}}"
+    assert bindings["bound_1"] == {"kind": "extract", "label": "town"}
+    assert params["bound_1"] == "Hooton"
+
+
+def test_drop_unattributable_fills_removes_only_the_invented_values():
+    """Unit view of the 2026-08-24 gate relaxation: only the typed steps carrying an
+    unattributable value go; clicks, selects the task asked for, and every other fill
+    survive untouched."""
+    steps = [
+        {"action": "fill", "selectors": ["css=#first"], "value": "Paul"},
+        {"action": "fill", "selectors": ["css=#town"], "value": "HOOTON"},
+        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
+        {"action": "type", "selectors": ["css=#note"], "text": "Merseyside"},
+        {"action": "select", "selectors": ["css=#cat"], "value": "A"},
+        {"action": "click", "selectors": ['text="Save"']},
+    ]
+    kept, dropped = hybrid._drop_unattributable_fills(steps, ["Merseyside"])
+    assert dropped == ["Merseyside", "Merseyside"]      # the fill AND the type
+    assert [s.get("value") or s.get("text") for s in kept] == [
+        "Paul", "HOOTON", "A", None]
+    # Nothing to drop is a no-op that returns the list unchanged.
+    assert hybrid._drop_unattributable_fills(steps, []) == (steps, [])

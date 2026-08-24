@@ -8,6 +8,7 @@ import pytest
 
 from automation.pipeline import subtask_store as ss
 from automation.pipeline.runner import restore_result_metadata
+from automation.pipeline import script_compile as sc
 from automation.pipeline.script_compile import compile_recording
 from automation.skills.codegen import lint_code, transpile
 
@@ -1644,3 +1645,37 @@ def test_a_query_derived_expect_is_stamped_scattered(tmp_path):
     step = compile_recording(_write(tmp_path, history), emit_start_goto=False)[0]
     assert step["expect_text"] == "Save"
     assert "expect_scattered" not in step
+
+
+def test_undeclared_same_target_repeat_dissolves_to_one_click():
+    """The Download-menu bug (segment e665b42d2c22fcee, 2026-08-24): the agent clicked
+    Download, waited, and clicked it AGAIN (re-clicking what it thought had not
+    registered). _push_step read the wait as a deliberate rhythm and fused the pair into
+    repeat_click('download', 2) — which opens the menu and then shuts it, so every replay
+    hunted Excel on a closed menu. Nothing caught it: the skill still downloaded
+    something, so the entry sat at uses=2, fail_count=0.
+
+    A cadence is only real when the slice ASKS for one, so an unpinned cluster dissolves
+    to a single click and the recorded inter-click wait survives as settle time."""
+    steps = [
+        {"action": "click", "selectors": ['text="Download"'], "count": 2,
+         "repeat_wait_s": 1.0},
+        {"action": "click", "selectors": ['text="Excel"']},
+    ]
+    out = sc._apply_repeat_hint(steps, None)
+    assert [s["action"] for s in out] == ["click", "wait", "click"]
+    assert "count" not in out[0] and "repeat_wait_s" not in out[0]
+    assert out[1]["seconds"] == 1.0
+
+    # A declared cadence is untouched, and still pinned to the wording's number.
+    counter = [{"action": "click", "selectors": ['text="Save & Next"'], "count": 4}]
+    assert sc._apply_repeat_hint(counter, 5)[0]["count"] == 5
+    assert sc.repeat_hint_from_wording("click Save & Next exactly 5 times") == 5
+    assert sc.repeat_hint_from_wording(
+        "Then click Download and select PDF, then click Download again and "
+        "select Excel.") is None
+
+    # click_indexed clusters are a different mechanism (N distinct rows) — never dissolved.
+    indexed = [{"action": "click_indexed", "selector_template": 'css=[id$="-{n}"]',
+                "start": 0, "count": 3}]
+    assert sc._apply_repeat_hint(indexed, None) == indexed

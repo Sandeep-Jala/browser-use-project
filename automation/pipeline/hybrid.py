@@ -1130,6 +1130,35 @@ def _unattributed_typed_values(steps: list[dict[str, Any]], prompt: str,
     return out
 
 
+def _drop_unattributable_fills(steps: list[dict[str, Any]], loose: list[str]
+                               ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Remove the typed steps carrying `loose` values, returning (steps, dropped labels).
+
+    An unattributable value is one NEITHER the task wording asked for NOR any observed
+    page data supplied — the agent invented it. The Add Employee form's optional County
+    field is the standing case: fakenamegenerator's address card has no county, so the
+    agent derives one from the postcode ("Merseyside" for L66, run 20260824_101412).
+
+    Baking that literal and trusting archive-on-failure does NOT self-correct: a wrong
+    county still saves, the create-write fires, the gate passes, and every later run
+    writes the authoring run's county forever. Dropping the step instead fails LOUDLY or
+    not at all — an optional field simply stays empty (the correct record), and a field
+    that turns out to be required makes the save fail, which archive_if_failing retires
+    after two consecutive misses so the next run authors a clean replacement."""
+    if not loose:
+        return steps, []
+    unwanted = {v.strip() for v in loose}
+    kept, dropped = [], []
+    for step in steps:
+        key = "text" if step.get("action") == "type" else "value"
+        value = str(step.get(key) or "").strip()
+        if step.get("action") in ("fill", "select", "type") and value in unwanted:
+            dropped.append(value)
+            continue
+        kept.append(step)
+    return kept, dropped
+
+
 def _body_sourced_values(steps: list[dict[str, Any]], task_wording: str,
                          bodies: list[dict[str, Any]]) -> list[str]:
     """Step values that THIS RUN's create-write responses report (as a unique JSON leaf)
@@ -1277,8 +1306,17 @@ def _extract_transform_spec(value: str, extracts: dict[str, str] | None
     The word slice exists because forms SPLIT what pages JOIN: the identity block holds
     "Jude Williamson" and "86 Seaford Road" on single lines, while the Add Employee form
     has separate First/Last and Building/Street fields. Without it those values have no
-    structured source at all and the segment can never be committed."""
+    structured source at all and the segment can never be committed.
+
+    Matching ignores CASE. fakenamegenerator prints the town in UK postal ALL-CAPS
+    ("HOOTON", "BUTT GREEN") and the agent often types it title-cased; treating those as
+    different facts left that one value with no source, and ONE unbindable value refuses
+    the whole commit — the Add-Employee segment then authored live at ~300-480k tokens a
+    run (run 20260819_145019; re-measured across three runs 2026-08-24). The binding
+    stores the SOURCE, so a replay types the page's own casing — the same value, spelled
+    the way the page spells it."""
     v = str(value).strip()
+    vf = v.casefold()
     if v:
         for label, src in (extracts or {}).items():
             lines = _source_lines(src)
@@ -1287,7 +1325,7 @@ def _extract_transform_spec(value: str, extracts: dict[str, str] | None
             for i in range(len(lines)):
                 for n in range(1, len(lines) - i + 1):
                     for join in (" ", ", "):
-                        if join.join(lines[i:i + n]) == v:
+                        if join.join(lines[i:i + n]).casefold() == vf:
                             return {"kind": "extract", "label": label,
                                     "transform": {"line": {"index": i, "count": n,
                                                            "join": join}}}
@@ -1301,7 +1339,7 @@ def _extract_transform_spec(value: str, extracts: dict[str, str] | None
                 words = line.split()
                 for w0 in range(len(words)):
                     for wn in range(1, len(words) - w0 + 1):
-                        if " ".join(words[w0:w0 + wn]) == v:
+                        if " ".join(words[w0:w0 + wn]).casefold() == vf:
                             hits.append({"line": {"index": i, "count": 1, "join": " "},
                                          "words": {"start": w0, "count": wn}})
             if len(hits) == 1:
@@ -1392,7 +1430,7 @@ def _bind_runtime_values(
     for n, value in enumerate(sorted(values, key=len, reverse=True), start=1):
         name = f"bound_{n}"
         label = next((lb for lb, v in (extracts or {}).items()
-                      if str(v).strip() == value), None)
+                      if str(v).strip().casefold() == str(value).strip().casefold()), None)
         spec: dict[str, Any] | None = None
         if label is not None:
             spec = {"kind": "extract", "label": label}
@@ -1637,7 +1675,8 @@ async def _author_segment(
             v = value.strip()
             if (kind == "typed" and len(v) >= 3 and v not in runtime_values
                     and not _names_value(sub.instantiated_prompt, v)):
-                if any(str(s).strip() == v for s in prior_sources.values()) \
+                if any(str(s).strip().casefold() == v.casefold()
+                       for s in prior_sources.values()) \
                         or _extract_transform_spec(v, prior_sources) is not None:
                     runtime_values.append(v)
         sources = {**(run_values or {}), **(seg.extracted or {})}
@@ -1649,13 +1688,24 @@ async def _author_segment(
             # re-formatted date), and a consumer recording with no bindable value at all
             # keeps the pre-bindings behavior: author fresh every run.
             loose = _unattributed_typed_values(steps, task_wording, runtime_values)
-            if loose or not runtime_values:
+            if loose:
+                # User-approved 2026-08-24: DROP the invented value rather than refuse the
+                # whole commit over it. Refusing cost the Add Employee segment its entry on
+                # every run where the agent filled the optional County field (~300-480k
+                # tokens re-authoring); baking the literal instead would pass forever while
+                # writing the authoring run's county into every later employee. See
+                # _drop_unattributable_fills for why dropping is the self-correcting one.
+                steps, dropped = _drop_unattributable_fills(steps, loose)
+                if dropped:
+                    print(f"[*] segment [{sid}]: dropped unattributable typed value(s) "
+                          f"{', '.join(v[:32] for v in dropped[:3])} from the recording "
+                          f"(neither the task nor the page supplied them) -> replays with "
+                          f"those fields left as the form defaults them")
+            if not runtime_values:
                 sstore.steps_path(sid).unlink(missing_ok=True)
-                what = (f"unattributable typed value(s) "
-                        f"{', '.join(v[:32] for v in loose[:3])}" if loose
-                        else "no bindable runtime value in the recording")
-                print(f"[*] segment [{sid}]: consumes noted data with {what} -> not "
-                      f"cached; future runs author it with their own fresh values")
+                print(f"[*] segment [{sid}]: consumes noted data with no bindable runtime "
+                      f"value in the recording -> not cached; future runs author it with "
+                      f"their own fresh values")
                 return seg
         bound = None
         if runtime_values:

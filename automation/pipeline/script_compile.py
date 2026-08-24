@@ -496,17 +496,52 @@ def repeat_hint_from_wording(prompt: str) -> int | None:
 
 
 def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None) -> list[dict[str, Any]]:
-    """Pin the single repeat cluster's count to the wording's number. Never invents a
-    cluster (a lone click stays a lone click) and never guesses among several."""
+    """Reconcile recorded repeat clusters with the slice WORDING.
+
+    Wording that pins a count ("exactly 5 clicks") keeps its single cluster and has the
+    number normalized to the wording — the recorded count can be off by a collapsed
+    retry, and the wording is the contract the counter slices are written against. Never
+    invents a cluster (a lone click stays a lone click) and never guesses among several.
+
+    Wording that declares NO cadence DISSOLVES its clusters back to one click. _push_step
+    reads two same-target clicks separated by a wait as a deliberate rhythm, which is only
+    true when the slice asked for a rhythm. On a TOGGLE it is actively wrong: the Download
+    menu button recorded click/wait/click (the agent re-clicking what it thought had not
+    registered) compiled to repeat_click('download', 2) — open the menu, then shut it —
+    and every replay then hunted Excel on a closed menu, which is the reported symptom
+    (segment e665b42d2c22fcee, 2026-08-24; the gate never caught it because the skill
+    still downloaded *something*: uses=2, fail_count=0). Undeclared same-target repeats
+    are retries, and one click is the faithful reading of a retry.
+
+    The recorded inter-click wait survives as a plain wait step: the second click is gone,
+    but the app still earned that settle time before whatever follows."""
+    clusters = [s for s in steps
+                if s.get("action") == "click" and int(s.get("count", 1)) > 1]
+    if not clusters:
+        return steps
     if hint:
-        clusters = [s for s in steps
-                    if s.get("action") == "click" and int(s.get("count", 1)) > 1]
         if len(clusters) == 1 and int(clusters[0]["count"]) != int(hint):
             logger.warning("repeat cluster recorded %s clicks but the wording says "
                            "exactly %s — pinning to the wording",
                            clusters[0]["count"], hint)
             clusters[0]["count"] = int(hint)
-    return steps
+        return steps
+    out: list[dict[str, Any]] = []
+    for step in steps:
+        if step.get("action") == "click" and int(step.get("count", 1)) > 1:
+            logger.info("compile: dissolving a %sx repeat on one target — the slice "
+                        "wording declares no cadence, so the extra clicks are retries "
+                        "(a toggle re-clicked twice would undo itself)",
+                        step.get("count"))
+            wait_s = float(step.get("repeat_wait_s", 0.0))
+            step = {k: v for k, v in step.items()
+                    if k not in ("count", "repeat_wait_s")}
+            out.append(step)
+            if wait_s > 0:
+                out.append({"action": "wait", "seconds": min(wait_s, 3.0)})
+            continue
+        out.append(step)
+    return out
 
 
 # The app's react-select "+ Create \"<name>\"" option. Its label embeds the (per-replay

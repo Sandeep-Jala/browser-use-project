@@ -1005,17 +1005,57 @@ async def test_consumer_with_structured_source_commits_bindings_then_replays(
     assert result2.subtasks[1]["skip_reason"] is None
 
 
-async def test_consumer_commit_refused_when_a_typed_value_has_no_provenance(
-        stores, monkeypatch):
-    """The reformat hole stays closed: a consumer recording carrying a typed value that
-    is neither prompt-sourced nor bindable (e.g. a re-formatted date the substring guard
-    cannot see) must NOT commit — a baked literal would write the authoring run's data
-    into every later run's records (the DR021/DR022 wrong-record class)."""
+async def test_consumer_commit_drops_a_typed_value_that_has_no_provenance(
+        stores, monkeypatch, capsys):
+    """A typed value that is neither prompt-sourced nor bindable is DROPPED from the
+    recording, and the rest of the segment commits (user-approved 2026-08-24, replacing
+    the blanket refusal).
+
+    Baking such a literal stays forbidden — that is the DR021/DR022 wrong-record class,
+    and it is unrecoverable: the authoring run's value keeps saving fine, so the replay
+    never fails and archive_if_failing never retires it. Dropping the step is the
+    self-correcting alternative. An optional field simply stays empty (the Add Employee
+    County case: fakenamegenerator supplies no county, so the agent invents one and that
+    one value refused the whole commit on every run). A field that turns out to be
+    REQUIRED makes the save fail, and two consecutive failures archive the entry so the
+    next run authors a clean replacement."""
     ctx = ss.normalize_context("http://app/section")
     consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
     monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
         {"action": "fill", "selectors": ["css=#name"], "value": "Kerris McKay"},
-        {"action": "fill", "selectors": ["css=#dob"], "value": "25/10/1971"},
+        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
+        {"action": "click", "selectors": ['text="Save"']},
+    ]))
+
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
+             extracted={"generated_name": "Kerris McKay"}),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
+                                   spec=BOUND_SPEC)
+
+    assert result.is_successful is True
+    entry = ss.load_manifest()[consumer_sid]
+    assert entry["bindings"] == {"bound_1": {"kind": "extract",
+                                             "label": "generated_name"}}
+    # The invented county is gone; the bindable value survives as its token.
+    tmpl = json.loads(ss.template_path(consumer_sid).read_text())
+    values = [st.get("value") for st in tmpl["steps"] if st.get("action") == "fill"]
+    assert values == ["{{bound_1}}"]
+    assert "Merseyside" not in json.dumps(tmpl)
+    assert "dropped unattributable typed value(s) Merseyside" in capsys.readouterr().out
+
+
+async def test_consumer_commit_still_refused_when_nothing_binds(stores, monkeypatch):
+    """Dropping the unattributable values must not turn a segment with NO runtime
+    provenance at all into a cacheable one: with nothing left to bind, a consumer
+    recording keeps the pre-bindings behaviour and authors fresh every run."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
         {"action": "click", "selectors": ['text="Save"']},
     ]))
 

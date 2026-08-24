@@ -350,7 +350,12 @@ FROZEN_TIDS = {
     # the skeleton-loading Pay Forecast page; still kind=action, no repeat cue). The
     # reword orphans the old seg-3 sid a4f26f734d041598 (library entry unreferenced;
     # the next run authors seg 3 fresh under its new sid).
-    "payroll_food_limited_e2e_rti": "bd91fc77296c45e4",
+    # Re-frozen 2026-08-24 (bd91fc77296c45e4 -> 050d2647bf273450): the task is its first
+    # SIX slices — 8393188 had uncommented the RTI half (19 slices) and the user then
+    # re-commented it, this time also parking the Data Request + Send Email slices, and
+    # reworded inside the commented block (Apr-26, "next 6 employees"). Decompositions
+    # cached under any earlier id are orphaned; the next run authors the task fresh.
+    "payroll_food_limited_e2e_rti": "050d2647bf273450",
     # Added 2026-08-11 (user-dictated): Detailed payroll-review data request for the
     # first 12 employees (May-26) + no-reply send, a Pay Elements bonus-row edit
     # open-and-close, Verify All on the new request, then a Jun-26 payrun pass of
@@ -359,7 +364,20 @@ FROZEN_TIDS = {
     # unchanged, 10-then-7 is one continuous 17-employee pass, FPS file is the
     # shared New_Employees_List_-_WI_LTD.csv. The Send-Email and popup-guard slices
     # reuse the e2e's proven wording verbatim.
-    "payroll_detailed_review_fps": "09d712c0d271b609",
+    # Re-frozen 2026-08-24 (09d712c0d271b609 -> cd56d32ebde27ea3): grown to 13 slices —
+    # the Verify-All slice was split into the Get OTP / external-tab OTP / per-employee
+    # payment-expense-deduction / Verify all sequence, plus the weekend-notification
+    # resend, "Bonus" capitalised to match the Pay Elements row, and the first-10 slice
+    # picked up a double space. Split into part1-4 below.
+    "payroll_detailed_review_fps": "cd56d32ebde27ea3",
+    # The four independently runnable parts of payroll_detailed_review_fps (2026-08-24,
+    # user-requested). Parts 2-4 open with a business-selection slice the full task does
+    # not have, so their prompts — and ids — are their own; part1 is the full task's first
+    # three slices verbatim. See test_detailed_review_fps_parts_partition_the_full_task.
+    "payroll_detailed_review_fps_part1": "a86117b9ade1097c",
+    "payroll_detailed_review_fps_part2": "53d4737a3c493f6b",
+    "payroll_detailed_review_fps_part3": "20bbee5816f20709",
+    "payroll_detailed_review_fps_part4": "887ef76ffdfef2ae",
 }
 
 
@@ -528,14 +546,16 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert joined == spec.prompt          # verbatim partition, no reword drift
 
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
-    # 2026-08-12: the task is its first half (RTI slices commented out pending
-    # re-enable); the fakenamegenerator aux flow is the user's chosen shape, and every
-    # slice is a recordable action — the forecast-load slice was flattened ("wait
-    # until the pay rows have loaded", no repeat cue) and the Net-to-Gross slice lost
-    # its refresh-first recovery after the 45-step seg-4 spiral.
-    assert len(subs) == 8                 # Tier 1 won; no fallback blob
+    # 2026-08-24: the task is its first SIX slices — the RTI half went live in 8393188 and
+    # the user re-commented it, parking the Data Request + Send Email slices with it (that
+    # flow now lives in payroll_detailed_review_fps and its parts). The fakenamegenerator
+    # aux flow is the user's chosen shape, and every slice is a recordable action: the
+    # forecast-load slice was flattened ("wait until the pay rows have loaded", no repeat
+    # cue) and the Net-to-Gross slice lost its refresh-first recovery after the 45-step
+    # seg-4 spiral.
+    assert len(subs) == 6                 # Tier 1 won; no fallback blob
     assert not any(getattr(s, "fallback", False) for s in subs)
-    assert [s.kind for s in subs] == ["action"] * 8
+    assert [s.kind for s in subs] == ["action"] * 6
     assert subs[1].tab_url and "fakenamegenerator" in subs[1].tab_url   # aux producer
     # The producer-override keeps the noting slice OUT of the consumer net; the two
     # slices that USE the noted identity stay consumers (bindings-only replay).
@@ -543,6 +563,59 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert decompose.consumes_noted_data(subs[2].template_prompt)
     assert decompose.consumes_noted_data(subs[3].template_prompt)
     assert "download" in subs[5].template_prompt.lower()              # download subtask
+
+
+# --------------------- payroll_detailed_review_fps, split into parts ---------------------
+# 2026-08-24 (user-requested): the 13-slice task also exists as four independently runnable
+# parts. The full task stays the end-to-end vehicle, so shared slice wording now lives in
+# two places and drifts only on purpose — same arrangement as the e2e halves above.
+FPS_PART_SLICE_COUNTS = {
+    "payroll_detailed_review_fps_part1": 3,   # request + send email (full task's 1-3)
+    "payroll_detailed_review_fps_part2": 5,   # opener + bonus/OTP/portal edits (4-7)
+    "payroll_detailed_review_fps_part3": 2,   # opener + Verify all (8)
+    "payroll_detailed_review_fps_part4": 6,   # opener + payrun pass + FPS (9-13)
+}
+FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business name "
+                   "FOOD LIMITED")
+
+
+def test_detailed_review_fps_parts_partition_the_full_task():
+    """Each part re-states the business selection so it runs on its own; every other slice
+    is a byte-exact copy of the full task's. Parts 2-4 add that opener as a new first
+    slice (the full task's own opener also names Data Request, which only part1 wants), so
+    dropping it from those three must rebuild the full task's slice list exactly."""
+    tasks = load_tasks()
+    full = [" ".join(d.prompt.split()) for d in tasks["payroll_detailed_review_fps"].subtasks]
+
+    rebuilt = []
+    for i, key in enumerate(FPS_PART_SLICE_COUNTS):
+        spec = tasks[key]
+        slices = [" ".join(d.prompt.split()) for d in spec.subtasks]
+        assert len(slices) == FPS_PART_SLICE_COUNTS[key], key
+        assert slices[0].startswith(FPS_PART_OPENER), key   # or it cannot run alone
+        assert spec.tags == ("payroll",), key
+        # prompt is derived from the slices — one edit surface, no parallel copy
+        assert spec.prompt == " ".join(slices), key
+        rebuilt += slices if i == 0 else slices[1:]
+
+    assert rebuilt == full
+
+
+@pytest.mark.parametrize("key", list(FPS_PART_SLICE_COUNTS))
+async def test_detailed_review_fps_parts_survive_validation(key, tmp_path, monkeypatch):
+    """Every part must pass Tier 1 on its own and never degrade to the whole-prompt
+    fallback blob — the guarantee that makes the parts separately runnable."""
+    from automation.pipeline import decompose
+
+    monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path / "library")
+    monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "library" / "manifest.json")
+    monkeypatch.setattr(ss, "DECOMPOSITIONS_DIR", tmp_path / "decompositions")
+    spec = load_tasks()[key]
+
+    subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
+    assert len(subs) == FPS_PART_SLICE_COUNTS[key]
+    assert not any(getattr(s, "fallback", False) for s in subs)
+    assert [s.kind for s in subs] == ["action"] * FPS_PART_SLICE_COUNTS[key]
 
 
 def test_prompt_derived_from_declared_subtasks(tmp_path):
