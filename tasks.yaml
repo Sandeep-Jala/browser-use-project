@@ -767,126 +767,71 @@ payroll_food_limited_e2e_rti:
         take the value, reopen it with the same pencil icon and enter it again.
     - prompt: >-
         Then click Download and select PDF, then click Download again and select Excel.
-    # - prompt: >-
-    #     Then go to Data Request, click Add Request, click Payroll Review, and click
-    #     Standard. Scroll down inside the employee list itself, not the page (only a
-    #     window of rows is rendered at once), until the noted employee's name comes into
-    #     view, tick the checkbox on that employee's row, and click Save.
-    # - prompt: >-
-    #     In the Send Email section that opens, open the From dropdown and select the no-reply
-    #     option, then click Send; if the Send Email section has not closed after clicking Send, click Send again.
-    #     If the email was not sent, it is saved as Drafted; click the email button next to
-    #     the Drafted status to reopen the Send Email section,open the From dropdown and select the no-reply option, then click Send.
-    # - prompt: >-
-    #     Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
-    #     click the blue Sent badge in its Status column to open the Payroll Status dialog; in
-    #     that dialog set Status to Submitted, type well done in the Notes field, and click
-    #     Save.
-    # - prompt: >-
-    #     Then click the ref. no. link on that same top row to open the Payroll Review panel,
-    #     tick the Select Employee checkbox at the top of that panel so that the Verify button
-    #     becomes enabled, and click Verify. The task is complete after clicking Verify.
-    #   # # Pure click sequence that classifies judge only because the button is named
-    #   # # "Verify" — declared action so it records/replays like any other slice.
-    #   # kind: action
-    # - prompt: >-
-    #     then go to Payroll & RTI, in the combobox select Monthly and the combobox next to it
-    #     select Apr-26, and click Save & Next.
-    # - prompt: >-
-    #     If a popup appears at any point after clicking Save & Next, tick 'Don't show this
-    #     again', click Process, and continue.
-    #   # The popup only appears sometimes: the probe decides its presence deterministically,
-    #   # so the FALSE branch is a zero-LLM no-op and the TRUE branch records/replays.
-    #   probe: {text_visible: "Don't show this again"}
-    # - prompt: >-
-    #     Click Save & Next for the next 6 employees: exactly 6 clicks, waiting for the next
-    #     employee to fully load after each click.
-    # - prompt: >-
-    #     With the 7th employee of the pay run now shown, click Add Expenses or Benefits, set
-    #     Type to 'Assets transferred', set the period from April 2026 and set period to May
-    #     2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
-    #     expense exactly once: the dialog simply closes on Save with no confirmation
-    #     message, and the grid then lists the expense at its net value 100.00 (the 200 cost
-    #     minus the 100 contribution), which is a successful add; do not click Add Expenses
-    #     or Benefits again;
-    # - prompt: >-
-    #     then click the + next to the Additions or Deductions section to open the Add Addition
-    #     or Deduction dialog, set Type to 'Additions', set Amount to 500, set Period to May 26,
-    #     set Name to bonus, and click Save. Add this bonus exactly once too: this Save also
-    #     closes silently with no confirmation message; do not reopen the dialog or add it
-    #     again.
-    # - prompt: >-
-    #     Then click Save & Next for the next 5 employees in the same way: exactly 5 more
-    #     clicks, waiting for the next employee to fully load after each click.
-    # - prompt: >-
-    #     Then select bulk upload FPS which is a button next to Save & Next. The checkbox in
-    #     the grid header row, left of 'Employees', selects or unselects all employees at
-    #     once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click upload FPS on the bottom , select the document New_Employees_List_-_WI_LTD.csv, and
-    #     click Submit. if it shows an error, click cancel.
-    # - prompt: >-
-    #     Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
-    #     May-26, and click Save & Next exactly 3 times.
-    # - prompt: >-
-    #     Finally, go to Clients, go to Practice Settings, click Edit, select alphabetic order A
-    #     to Z, and click Save. The task is complete after that final Save; take no further
-    #     actions.
-
-payroll_detailed_review_fps:
-  tags: [payroll]
-  subtasks:
     - prompt: >-
-        Go to the Payroll module, search for and select the business name FOOD LIMITED, then
-        go to the Data Request section.
-    - prompt: >-
-        Click + Request, click Payroll Review, click Detailed, change the date combobox to
-        May-26, select the first 12 employees in the list, and click Save.
+        Then go to Data Request, click Add Request, click Payroll Review, and click
+        Standard. Scroll down inside the employee list itself, not the page (only a
+        window of rows is rendered at once), until the noted employee's name comes into
+        view, tick the checkbox on that employee's row, and click Save.
     - prompt: >-
         In the Send Email section that opens, open the From dropdown and select the no-reply
-        option, then click Send; if the Send Email section has not closed after clicking
-        Send, click Save again. If the email was not sent, it is saved as Drafted; click the
-        email button next to the Drafted status to reopen the Send Email section, then click
-        Send. if you see a notification of "Why not wish them a great weekend 🙂", click send again.
+        option, then click Send; if the Send Email section has not closed after clicking Send, click Send again.
+        If the email was not sent, it is saved as Drafted; click the email button next to
+        the Drafted status to reopen the Send Email section,open the From dropdown and select the no-reply option, then click Send.
     - prompt: >-
-        Go to Settings, go to Pay Elements, and click the edit option on the row whose
-        element name is Bonus; when the edit dialog opens, close it without changing
-        anything.
+        Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
+        click the blue Sent badge in its Status column to open the Payroll Status dialog; in
+        that dialog set Status to Submitted, type well done in the Notes field, and click
+        Save.
     - prompt: >-
-        Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
-        ref. no. link to open the Payroll Review panel, and click Get OTP, click on the number to copy it click the cross icon to close the dialog.
+        Then click the ref. no. link on that same top row to open the Payroll Review panel,
+        tick the Select Employee checkbox at the top of that panel so that the Verify button
+        becomes enabled, and click Verify. The task is complete after clicking Verify.
+      # # Pure click sequence that classifies judge only because the button is named
+      # # "Verify" — declared action so it records/replays like any other slice.
+      # kind: action
     - prompt: >-
-        Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, enter the OTP got it from the previous step and click proceed Securely. 
-    - prompt: >-
-        Now click the + button next to payment, enter 4000 in the amount field, click Save. CLick + next to the Add Expenses or benefits, select type Payment on behalf. period to Jun-26, 
-        enter the amount 200 and click Save. click the + next tot he Addition or Deductions, select type Deduction, period to Jun-26, Select Name Salary sacrifice, Description Salary sacrifice for childminder, 
-        Amount 1000, enter click Save. Click Next for rest of the employees. Close this tab.
-    - prompt: >-
-        Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
-        ref. no. link to open the Payroll Review panel, click Verify all.
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Jun-26 through the combobox in the
-        nav bar.
+        then go to Payroll & RTI, in the combobox select Monthly and the combobox next to it
+        select Apr-26, and click Save & Next.
     - prompt: >-
         If a popup appears at any point after clicking Save & Next, tick 'Don't show this
         again', click Process, and continue.
+      # The popup only appears sometimes: the probe decides its presence deterministically,
+      # so the FALSE branch is a zero-LLM no-op and the TRUE branch records/replays.
+      probe: {text_visible: "Don't show this again"}
     - prompt: >-
-        Click Save & Next for the first 10 employees: exactly 10 clicks,  waiting for the
-        next employee to fully load after each click.
+        Click Save & Next for the next 6 employees: exactly 6 clicks, waiting for the next
+        employee to fully load after each click.
     - prompt: >-
-        Then click Save & Next for the next 7 employees in the same way: exactly 7 more
+        With the 7th employee of the pay run now shown, click Add Expenses or Benefits, set
+        Type to 'Assets transferred', set the period from April 2026 and set period to May
+        2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
+        expense exactly once: the dialog simply closes on Save with no confirmation
+        message, and the grid then lists the expense at its net value 100.00 (the 200 cost
+        minus the 100 contribution), which is a successful add; do not click Add Expenses
+        or Benefits again;
+    - prompt: >-
+        then click the + next to the Additions or Deductions section to open the Add Addition
+        or Deduction dialog, set Type to 'Additions', set Amount to 500, set Period to May 26,
+        set Name to bonus, and click Save. Add this bonus exactly once too: this Save also
+        closes silently with no confirmation message; do not reopen the dialog or add it
+        again.
+    - prompt: >-
+        Then click Save & Next for the next 5 employees in the same way: exactly 5 more
         clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select bulk upload FPS which is a button next to Save & Next. The checkbox in
+        the grid header row, left of 'Employees', selects or unselects all employees at
+        once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click upload FPS on the bottom , select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. if it shows an error, click cancel.
+    - prompt: >-
+        Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
+        May-26, and click Save & Next exactly 3 times.
+    - prompt: >-
+        Finally, go to Clients, go to Practice Settings, click Edit, select alphabetic order A
+        to Z, and click Save. The task is complete after that final Save; take no further
+        actions.
 
-# payroll_detailed_review_fps, split into four independently runnable parts
-# (2026-08-24, user-requested). Each part re-states the business selection so it can
-# be run on its own; every other slice is a byte-exact copy of the full task's, so a
-# reword has to be applied to each copy deliberately. Self-contained is not
-# stateless: part2 and part3 act on 'the top row (S.No. 1, the newest request)', so a
-# request must already exist from a part1 run, and part4 ends in an FPS submission,
-# which needs FOOD LIMITED reset or the modal silently refuses.
 
-# part1: request for the first 12 employees of May-26 + the email send.
 payroll_detailed_review_fps_part1:
   tags: [payroll]
   subtasks:
@@ -894,51 +839,43 @@ payroll_detailed_review_fps_part1:
         Go to the Payroll module, search for and select the business name FOOD LIMITED.
     - prompt: >-
         Now Go to Data Request Section. Click + Request, click Payroll Review, click Detailed, change the date combobox to
-        May-26, select the first 12 employees in the list, and click Save.
+        May-26, select only the first 12 employees in the list, and click Save.
     - prompt: >-
-        In the Send Email section that opens, open the From dropdown and select the no-reply
+        In the Send Email section that opens, click on the From dropdown and select the no-reply
         option, then click Send; if the Send Email section has not closed after clicking
         Send, click Save again. If the email was not sent, it is saved as Drafted; click the
         email button next to the Drafted status to reopen the Send Email section, then click
         Send. if you see a notification of "Why not wish them a great weekend 🙂", click send again.
-
-# part2: Bonus pay-element open-and-close, then the OTP portal edits for every employee.
-payroll_detailed_review_fps_part2:
-  tags: [payroll]
-  subtasks:
-    - prompt: >-
-        Go to the Payroll module, search for and select the business name FOOD LIMITED.
     - prompt: >-
         Go to Settings, go to Pay Elements, and click the edit option on the row whose
         element name is Bonus; when the edit dialog opens, close it without changing
         anything.
     - prompt: >-
         Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
-        ref. no. to open the Payroll Review panel, and click Get OTP, note and remember the OTP, click the cross icon to close the dialog.
+        ref. no. to open the Payroll Review panel, and click Get OTP, copy the 6 digit number (OTP), close the review panel.
+        Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, paste the OTP from the previous step into the first code box and click proceed Securely. 
     - prompt: >-
-        Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, enter the OTP got it from the previous step and click proceed Securely. 
+        click the + button next to payment, enter 4002 in the amount field, click Save. 
     - prompt: >-
-        Now click the + button next to payment, enter 4000 in the amount field, click Save. CLick + next to the Add Expenses or benefits, select type Payment on behalf. period to Jun-26, 
-        enter the amount 200 and click Save. click the + next tot he Addition or Deductions, select type Deduction, period to Jun-26, Select Name Salary sacrifice, Description Salary sacrifice for childminder, 
-        Amount 1000, enter click Save. Click Next for rest of the employees. Close this tab.
-
-# part3: Verify all on the newest request.
-payroll_detailed_review_fps_part3:
-  tags: [payroll]
-  subtasks:
+        CLick + next to the Add Expenses or benefits, select type Payment on behalf. period to Jun-26,
+        enter the amount 200 and click Save. 
     - prompt: >-
-        Go to the Payroll module, search for and select the business name FOOD LIMITED.
+        click the + next tot he Addition or Deductions, select type Deduction, period to Jun-26, Select Name Salary sacrifice, Description Salary sacrifice for childminder,
+        Amount 1000, enter click Save. 
     - prompt: >-
-        Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
-        ref. no. link to open the Payroll Review panel, click Verify all.
-      # Pure click sequence that classifies judge only because the button is named
-      # "Verify all" — declared action so it records/replays like any other slice. The
-      # full task's copy of this slice is still judge; declaring it there would change
-      # that task's behaviour, so it is left alone.
+        Then click Next for all of the remaining employees, waiting for the
+        next employee to fully load after each click and doing nothing else on any of them.
+        Then click submit, and then close this tab.
+    - prompt: >-
+        Now go to Data Request, click on the staus of the top ref. no., Select the Status Submitted and Add a note, Well done and Save. and click on the top ref. no. link to open the Payroll Review panel, click the employee checkbox to select all the employee and then click Verify all.
+      # Pure click sequence that classifies judge ONLY because the button is named "Verify
+      # all" (measured: node_kind is judge here, action with that clause removed). Judge
+      # nodes never cache, so it re-authored every run at ~95-295k tokens. Declared action
+      # so it records/replays like any other slice — the same fix the retired part3 used.
       kind: action
 
 # part4: the Jun-26 payrun pass (10 + 7) and the FPS submission.
-payroll_detailed_review_fps_part4:
+payroll_detailed_review_fps_part2:
   tags: [payroll]
   subtasks:
     - prompt: >-

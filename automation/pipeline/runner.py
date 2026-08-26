@@ -623,21 +623,12 @@ class Runner:
         except (ValueError, OSError):
             logger.debug("could not install SIGINT handler (not main thread?); HITL disabled")
 
-        # Wire the agent's verify_save_registered tool to the SAME ground truth the end-of-run
-        # gate uses (_first_create_write over the live network log), so the agent can check
-        # mid-run whether its Save actually reached the server and fix validation errors.
-        # `request_offset` windows the probe to THIS segment's traffic.
+        # Live network bridge: verify_save_registered and the click receipts both read the
+        # write requests fired (with the server's body verdict) from here — the ground truth
+        # that was sitting unshown in the collector while the agent re-submitted an
+        # already-accepted FPS. It replaced a marker-gated first-create-write probe, which
+        # no task without a declared marker ever got and which saturated after one save.
         network_collector = next((c for c in collectors if c.name == "network"), None)
-        if success_marker and network_collector is not None:
-            agent_tools.set_save_probe(
-                lambda: _first_create_write(
-                    (network_collector.results().get("requests", []) or [])[request_offset:],
-                    success_marker,
-                )
-            )
-        # Live network bridge: click receipts report the write requests they fired (with
-        # the server's body verdict) — the ground truth that was sitting unshown in the
-        # collector while the agent re-submitted an already-accepted FPS.
         if network_collector is not None:
             agent_tools.set_live_network(network_collector)
 
@@ -649,7 +640,6 @@ class Runner:
                 logger.info("⏸ interrupted — partial segment history saved to %s", saved)
             raise
         finally:
-            agent_tools.clear_save_probe()
             agent_tools.clear_live_network()
             if hitl_active:
                 try:
@@ -662,8 +652,10 @@ class Runner:
             try:
                 record_path.parent.mkdir(parents=True, exist_ok=True)
                 agent.save_history(str(record_path))
-                # save_history drops ActionResult.metadata (find_by_text's clicked-element
-                # record); put it back so those clicks compile into the golden script.
+                # save_history drops ActionResult.metadata — the ONLY channel carrying
+                # find_by_text's and click's element record, extract_data/copy_text's
+                # captured value, and paste_text's delivered value. Put it back, or those
+                # steps compile to nothing at all.
                 restore_result_metadata(history, record_path)
                 logger.info("recorded action trace -> %s", record_path)
             except Exception as exc:  # noqa: BLE001

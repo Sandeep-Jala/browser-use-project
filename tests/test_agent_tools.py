@@ -569,6 +569,66 @@ async def test_click_inside_dialog_reports_dialog_closed(monkeypatch):
     assert "VERIFY the record" in res.extracted_content
 
 
+async def test_click_stamps_the_element_it_acted_on(monkeypatch):
+    """Run 20260825_090938: browser-use fills state.interacted_element from the snapshot it
+    takes AFTER the action, so the external-link click that opened the OTP tab recorded
+    [null, null, null] and compile dropped the one load-bearing click of that segment
+    without a word. The override stamps the PRE-click element instead."""
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "_captured_element",
+                        lambda node, _label: {"node_name": "a", "ax_name": "Open review"})
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Open review")}))
+
+    assert res.metadata["interacted_element"] == {"node_name": "a", "ax_name": "Open review"}
+
+
+def test_the_click_stamp_never_clobbers_the_write_outcome(monkeypatch):
+    """Both stamps ride the same metadata dict, and the click override applies them in
+    sequence; a merge that replaced the dict wholesale would cost the gate its structured
+    write verdict (or the compiler its element)."""
+    monkeypatch.setattr(agent_tools, "_captured_element",
+                        lambda node, _label: {"node_name": "button"})
+    stamped = agent_tools._stamp_interacted({"row_label": "Harris Duncan"}, object())
+    merged = agent_tools._with_write_outcome(stamped, {"fired": True, "accepted": True})
+
+    assert merged["interacted_element"] == {"node_name": "button"}
+    assert merged["write_outcome"] == {"fired": True, "accepted": True}
+    assert merged["row_label"] == "Harris Duncan"
+
+
+def test_the_stamp_is_a_no_op_without_an_element(monkeypatch):
+    # None-in-None-out: an unstamped result stays byte-identical, so nothing about the
+    # existing receipts changes for clicks browser-use already captured.
+    monkeypatch.setattr(agent_tools, "_captured_element", lambda node, _label: None)
+    assert agent_tools._stamp_interacted(None, None) is None
+    assert agent_tools._stamp_interacted(None, object()) is None
+
+
+async def test_a_click_that_already_names_its_element_keeps_that_one(monkeypatch):
+    """find_by_text has already named the exact node it clicked — an existing stamp wins."""
+    from types import SimpleNamespace
+    from browser_use.agent.views import ActionResult
+
+    async def stamped_click(params=None, browser_session=None):
+        return ActionResult(extracted_content='Clicked button "Save"',
+                            metadata={"interacted_element": {"node_name": "input"}})
+
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "_captured_element",
+                        lambda node, _label: {"node_name": "WRONG"})
+    res = await agent_tools._click_with_dialog_outcome(
+        stamped_click, SimpleNamespace(index=4),
+        _FakeBrowserSession({4: _FakeDomNode("Save")}))
+
+    assert res.metadata["interacted_element"] == {"node_name": "input"}
+
+
 async def test_click_inside_dialog_reports_still_open(monkeypatch):
     from types import SimpleNamespace
 
@@ -1254,3 +1314,110 @@ async def test_combobox_select_dead_source_receipt_prescribes_reload_and_wait(mo
     assert "WAIT for the page to finish loading" in res.error
     assert "WITHOUT a full browser reload" not in res.error
     assert "wait a moment" not in res.error
+
+
+# --------------------- find_by_text: wrapper duplicates and refusals ---------------------
+# Run 20260824_155123 seg 2 (the OTP segment). The app renders "Get OTP" as a
+# cursor:pointer <div> holding a same-text child — captured live in the recording's
+# interacted_element: the clicked control's xpath is
+# .../form/div[1]/div/div and the OTP number that replaces it is .../form/div[1]/div/div/span.
+# find_by_text('Get OTP', click_first=true) therefore saw 2 candidates on EVERY attempt
+# and refused; the OTP was never fetched. Two defects, both guarded below.
+
+
+class _NestedDomNode(_FakeDomNode):
+    """A snapshot node that knows its parent — the shape _collapse_nested_duplicates
+    walks. _FakeDomNode hardcodes one backend id, so these carry distinct ones."""
+
+    def __init__(self, text, attributes=None, backend_node_id=0, parent_node=None,
+                 tag_name="div"):
+        super().__init__(text, attributes)
+        self.backend_node_id = backend_node_id
+        self.parent_node = parent_node
+        self.node_name = tag_name.upper()
+        self.tag_name = tag_name
+
+
+def _get_otp_pair():
+    """The live pair: an outer cursor:pointer <div> and its same-text inner <div>."""
+    outer = _NestedDomNode("Get OTP", attributes={"style": "cursor: pointer"},
+                           backend_node_id=19426)
+    inner = _NestedDomNode("Get OTP", backend_node_id=19427, parent_node=outer)
+    return outer, inner
+
+
+async def test_find_by_text_clicks_through_same_text_wrapper(monkeypatch):
+    """A control wrapped in a same-text div is ONE candidate, not an ambiguity."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    outer, inner = _get_otp_pair()
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Get OTP", click_first=True),
+                   browser_session=_FakeClickSession({19426: outer, 19427: inner},
+                                                     result=None))
+
+    assert res.error is None
+    assert "clicked the single match" in res.extracted_content
+    # the DEEPEST node: a click there bubbles to every ancestor's handler, the reverse
+    # does not hold.
+    assert "index=19427" in res.extracted_content
+
+
+def test_collapse_keeps_siblings_and_differently_labelled_ancestors():
+    """The collapse must only ever eat WRAPPERS. Two separate controls with the same
+    text stay two candidates, and a container holding the control plus other text
+    (a grid row) is labelled differently and is left alone."""
+    from automation.pipeline.agent_tools import _collapse_nested_duplicates
+
+    row = _NestedDomNode("1 Get OTP FOOD LIMITED", backend_node_id=100)
+    button = _NestedDomNode("Get OTP", backend_node_id=101, parent_node=row)
+    other = _NestedDomNode("Get OTP", backend_node_id=102)
+    matches = [(1, row, "1 Get OTP FOOD LIMITED"), (2, button, "Get OTP"),
+               (3, other, "Get OTP")]
+
+    kept = _collapse_nested_duplicates(matches)
+
+    assert [idx for idx, _n, _l in kept] == [1, 2, 3]
+
+
+def test_collapse_survives_nodes_without_a_parent_chain():
+    """Snapshot nodes that expose no parent_node (0-size/off-screen captures) must pass
+    straight through rather than crash the lookup."""
+    from automation.pipeline.agent_tools import _collapse_nested_duplicates
+
+    a, b = _FakeDomNode("Get OTP"), _FakeDomNode("Get OTP")
+    matches = [(1, a, "Get OTP"), (2, b, "Get OTP")]
+
+    assert _collapse_nested_duplicates(matches) == matches
+
+
+async def test_find_by_text_ambiguous_click_first_refuses_on_the_error_channel():
+    """click_first that clicked NOTHING is a REFUSAL: it must ride the error channel so
+    multi_act drops the step's remaining queued actions. On the success channel it did
+    not — run 20260824_155123 seg 2 batched this refusal with a click(index) picked from
+    the PREVIOUS snapshot, the stale click fired onto the panel's nameless close button,
+    and the Payroll Review panel was lost (twice in one run)."""
+    fn, pm = _registered_action("find_by_text")
+    left = _NestedDomNode("Save draft", backend_node_id=1)
+    right = _NestedDomNode("Save and send", backend_node_id=2)
+    res = await fn(params=pm(text="Save", click_first=True),
+                   browser_session=_FakeBrowserSession({4: left, 9: right}))
+
+    assert res.extracted_content is None
+    assert "NOTHING WAS CLICKED" in res.error
+    assert "index=4" in res.error and "index=9" in res.error   # candidates still listed
+    assert res.metadata == {"no_click": True}
+
+
+async def test_find_by_text_listing_without_click_first_stays_a_result():
+    """A plain listing clicked nothing because it was never asked to — that is not a
+    failed action, and erroring it would break every batch that legitimately looks
+    before it clicks."""
+    fn, pm = _registered_action("find_by_text")
+    left = _NestedDomNode("Save draft", backend_node_id=1)
+    right = _NestedDomNode("Save and send", backend_node_id=2)
+    res = await fn(params=pm(text="Save", click_first=False),
+                   browser_session=_FakeBrowserSession({4: left, 9: right}))
+
+    assert res.error is None
+    assert "2 match(es)" in res.extracted_content
+    assert "click(index) NOW" in res.extracted_content

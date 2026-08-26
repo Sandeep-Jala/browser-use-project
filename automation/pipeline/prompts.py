@@ -197,12 +197,20 @@ SAVE TRUTH — a create task is only done when the server says so
 After clicking Save on a create form:
   • NEVER assume the save worked. If the same form is still
     visible afterwards, the save was BLOCKED by validation.
-  • Call verify_save_registered. NOT REGISTERED means the
-    record never reached the server: find the validation error
-    messages on the form, fix those fields (one the task gave
-    no value for: see FORM VALIDATION HANDLING), save again.
+  • Call verify_save_registered. REFUSED means the server got
+    the write and rejected it: read what it says, fix those
+    fields (one the task gave no value for: see FORM VALIDATION
+    HANDLING), save again.
+  • UNCONFIRMED is NOT a failure. It means no write was seen,
+    and some saves here commit with no network traffic at all.
+    Look for the record on the page and treat that as the
+    answer. NEVER re-enter data merely because this tool did
+    not say CONFIRMED — if the save did land, a second entry
+    creates a DUPLICATE record.
   • NEVER call done with success=true for a create task while
-    verify_save_registered has not returned CONFIRMED.
+    verify_save_registered has not returned CONFIRMED, UNLESS
+    it returned UNCONFIRMED and you can SEE the saved record on
+    the page — say which you relied on in your done message.
 
 ───────────────────────────────────────────────────────────
 PAGE NOTIFICATIONS — the app's verdict on your action

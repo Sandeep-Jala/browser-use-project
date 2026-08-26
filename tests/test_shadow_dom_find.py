@@ -7,7 +7,10 @@ RAW_TEXT_FIND_JS walked document.body's light tree only, so every label lookup i
 the modal failed and the agent fell back to guessing anonymous combobox indexes (May-26
 landed in Period FROM). Both finders now walk the composed tree through OPEN shadow
 roots; closed roots stay invisible by construction."""
+import asyncio
 import json
+
+from playwright.async_api import async_playwright
 
 from automation.pipeline import script_compile as sc
 
@@ -218,3 +221,278 @@ async def test_resolve_with_scroll_resets_top_first_and_after_failure(monkeypatc
         await sc._resolve_with_scroll(object(), {"selectors": ["xpath=/x"]}, 1000)
     assert calls and calls[0] == "top"            # the hunt STARTS at the top
     assert calls[-1] == "top"                     # a failed hunt does not strand
+
+
+# ------------------- shadow-hosted elements are never anchored by xpath -------------------
+# Run 20260825_115047: the Add Payments amount field lives in an OPEN shadow root, and its
+# committed anchor was an absolute xpath — which Playwright's document-scoped xpath engine
+# can never resolve across a shadow boundary. The entry failed every replay with
+# "no unique candidate matched: xpath=… -> no match" and could not have done otherwise.
+
+_SHADOW_INPUT_PAGE = """
+    <div id="root"><div id="host"></div></div>
+    <script>
+      const sr = document.getElementById('host').attachShadow({mode: 'open'});
+      sr.innerHTML =
+        '<div><div><input type="text" inputmode="decimal" class="form-control"'
+        + ' placeholder="" style="width:150px"></div></div>';
+    </script>
+"""
+
+
+async def _counts(page, selectors):
+    out = {}
+    for sel in selectors:
+        try:
+            out[sel] = await page.locator(sel).count()
+        except Exception:  # noqa: BLE001 - an invalid engine counts as no match
+            out[sel] = "error"
+    return out
+
+
+def test_xpath_cannot_cross_a_shadow_boundary_but_css_can():
+    """The measurement the whole anchor rule rests on. If Playwright ever changes this,
+    this test tells us before a library entry silently stops replaying."""
+    async def go():
+        async with async_playwright() as pw:
+            browser = await _launch(pw)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_SHADOW_INPUT_PAGE)
+                return await _counts(page, [
+                    "xpath=/html/body/div/div/div/div/input",
+                    'xpath=//input[@inputmode="decimal"]',
+                    'css=[inputmode="decimal"]',
+                    "css=.form-control",
+                ])
+            finally:
+                await browser.close()
+
+    counts = asyncio.run(go())
+    assert counts["xpath=/html/body/div/div/div/div/input"] == 0
+    assert counts['xpath=//input[@inputmode="decimal"]'] == 0
+    assert counts['css=[inputmode="decimal"]'] == 1
+    assert counts["css=.form-control"] == 1
+
+
+def test_the_compiled_css_anchor_resolves_where_the_xpath_could_not():
+    """End to end: the selector compile now emits for that element actually finds it."""
+    element = {"node_name": "INPUT", "x_path": "html/body/div/div/div/div/input",
+               "attributes": {"type": "text", "inputmode": "decimal",
+                              "class": "form-control form-control-sm", "placeholder": ""}}
+    assert sc._selectors(element)[0].startswith("xpath=")          # light-DOM policy
+    shadow_sels = sc._selectors(element, shadow_contained=True)
+    assert all(not s.startswith("xpath=") for s in shadow_sels)
+    assert shadow_sels == ['css=[inputmode="decimal"]']
+
+    async def go():
+        async with async_playwright() as pw:
+            browser = await _launch(pw)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_SHADOW_INPUT_PAGE)
+                loc, sel, _healed = await sc._resolve(
+                    page, {"selectors": shadow_sels}, 3000, require_editable=True)
+                await loc.fill("4000")
+                return sel, await loc.input_value()
+            finally:
+                await browser.close()
+
+    sel, value = asyncio.run(go())
+    assert sel == 'css=[inputmode="decimal"]' and value == "4000"
+
+
+# --------- label-scoped anchors for shadow controls with no identity of their own ---------
+# The expense/deduction panels' <select>s carry nothing but class and style, and xpath
+# cannot reach them at all. The label beside them is their whole identity — and css reaches
+# through the boundary to use it. Measured: two segments cost 320k tokens a run without
+# this (run 20260825_132238).
+
+_LABELLED_PANEL_PAGE = """
+    <div id="root">
+      <div class="r"><label>Amount</label><input type="text" value="light-dom"></div>
+      <div id="host"></div>
+    </div>
+    <script>
+      const sr = document.getElementById('host').attachShadow({mode: 'open'});
+      sr.innerHTML =
+        '<div class="p">'
+      + '<div class="r"><label>Type</label><select class="fs"><option>Deduction</option></select></div>'
+      + '<div class="r"><label>Period to</label><select class="fs"><option>Jun-26</option></select></div>'
+      + '<div class="r"><label>Name</label><select class="fs"><option>Salary sacrifice</option></select></div>'
+      + '</div>';
+    </script>
+"""
+
+
+def test_a_bare_has_text_scope_is_ambiguous_but_the_child_constrained_one_is_not():
+    """Why _label_scoped_css looks the way it does. `:has-text()` matches every ANCESTOR
+    holding the text, so the obvious form selects the whole panel's controls."""
+    async def go():
+        async with async_playwright() as pw:
+            browser = await _launch(pw)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_LABELLED_PANEL_PAGE)
+                return await _counts(page, [
+                    "css=select.fs",
+                    'css=div:has-text("Period to") select',            # the naive form
+                    sc._label_scoped_css("select", "Period to"),       # what we emit
+                ])
+            finally:
+                await browser.close()
+
+    counts = asyncio.run(go())
+    assert counts["css=select.fs"] == 3                       # class alone: no good
+    assert counts['css=div:has-text("Period to") select'] == 3  # ancestors match too
+    assert counts[sc._label_scoped_css("select", "Period to")] == 1
+
+
+def test_the_label_scoped_anchor_picks_the_right_control_through_the_boundary():
+    async def go():
+        async with async_playwright() as pw:
+            browser = await _launch(pw)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_LABELLED_PANEL_PAGE)
+                out = {}
+                for label in ("Type", "Period to", "Name"):
+                    step = {"selectors": [sc._label_scoped_css("select", label)]}
+                    loc, _sel, _healed = await sc._resolve(page, step, 3000)
+                    out[label] = await loc.input_value()
+                return out
+            finally:
+                await browser.close()
+
+    assert asyncio.run(go()) == {"Type": "Deduction", "Period to": "Jun-26",
+                                 "Name": "Salary sacrifice"}
+
+
+def test_a_label_that_repeats_outside_the_shadow_root_stays_ambiguous():
+    """Honest limit: "Amount" also names a light-DOM field on this page, so the label
+    anchor is not unique and _resolve falls through to the next candidate rather than
+    picking one. That is why a real attribute is still ranked ahead of it."""
+    async def go():
+        async with async_playwright() as pw:
+            browser = await _launch(pw)
+            try:
+                page = await browser.new_page()
+                await page.set_content(_LABELLED_PANEL_PAGE)
+                return await _counts(page, [sc._label_scoped_css("input", "Amount")])
+            finally:
+                await browser.close()
+
+    assert list(asyncio.run(go()).values()) == [1]  # only the light-DOM one has an input row
+
+
+# ---------------- the label rung, measured against the LIVE markup ----------------
+# _label_scoped_css is the last anchor a control with no attribute identity has. Its
+# previous shape required the control's DIRECT parent to hold the label text, and on
+# 2026-08-25 that shape was measured against the real Add Employee form: 0 matches for
+# EVERY field on it. Two library entries were committed with it as their only anchor and
+# failed every replay ("no unique candidate matched: css=*:has(> input):has-text(\"NI
+# number\") > input -> no match", runs 20260825_142300 / _144015 / _145430).
+#
+# The markup below is captured VERBATIM from the running app (the NI number field group
+# and the Student loan toggle), so this test cannot encode a belief about the markup the
+# way a hand-written fixture can. Only the two react-select chevron <path d> blobs are
+# elided - noise, not structure.
+
+_LIVE_NI_GROUP = """<div class="ms-Stack css-1246"><div class="ms-StackItem css-489"><label class="ms-Label labelStyle-1247">NI number<div class="ms-TooltipHost root-1248" role="none"><i data-icon-name="info" aria-hidden="true" class="clsIcon-1249"></i><div hidden="" id="tooltip1574" style="position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0px; border: 0px; overflow: hidden; white-space: nowrap;">National insurance numbers (NINo) should appear in the following combination of letters and numbers - two letters, six numbers, one letter. For example: AB 123456 C</div></div></label><div class="ms-TextField inputItem-1250"><div class="ms-TextField-wrapper"><div class="ms-TextField-fieldGroup fieldGroup-1134"><input type="text" id="TextField1575" class="ms-TextField-field field-1228" maxlength="9" aria-invalid="false" value=""></div></div></div></div><div class="ms-StackItem css-489"><label class="ms-Label labelStyle-1247">NI Category<div class="ms-TooltipHost root-1251" role="none"><i data-icon-name="info" aria-hidden="true" class="clsIcon-1249"></i><div hidden="" id="tooltip1580" style="position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0px; border: 0px; overflow: hidden; white-space: nowrap;"></div></div></label><div class="ms-Stack css-761"><div class="rs-container container-701"><span id="react-select-17-live-region" class="rs-a11y-text a11yText-699"></span><span class="rs-a11y-text a11yText-699" aria-live="polite" aria-atomic="false" aria-relevant="additions text"></span><div class="rs-control control-702"><div class="rs-value-container valueContainer-727"><div class="rs-placeholder placeholder-725" id="react-select-17-placeholder">Select</div><div class="rs-input-container inputContainer-709" data-value=""><input class="rs-input input-708" autocapitalize="none" autocomplete="off" autocorrect="off" id="react-select-17-input" spellcheck="false" tabindex="0" type="text" aria-autocomplete="list" aria-expanded="false" aria-haspopup="true" role="combobox" aria-describedby="react-select-17-placeholder" value="" style="color: inherit; background: 0px center; opacity: 1; width: 100%; grid-area: 1 / 2; font: inherit; min-width: 2px; border: 0px; margin: 0px; outline: 0px; padding: 0px;"></div></div><div class="rs-indicators-container indicatorsContainer-707"><span class="rs-indicator-separator indicatorSeparator-706"></span><div class="dropdown-indicator rs-dropdown-indicator dropdownIndicator-703" aria-hidden="true"><svg height="20" width="20" viewBox="0 0 20 20" aria-hidden="true" focusable="false" style="display: inline-block; fill: currentcolor; line-height: 1; stroke: currentcolor; stroke-width: 0;"><path></path></svg></div></div></div></div></div></div><div class="ms-StackItem css-489"><label class="ms-Label labelStyle-1247">Payment Mode</label><div class="ms-Stack css-838"><div class="rs-container container-701"><span id="react-select-18-live-region" class="rs-a11y-text a11yText-699"></span><span class="rs-a11y-text a11yText-699" aria-live="polite" aria-atomic="false" aria-relevant="additions text"></span><div class="rs-control control-702"><div class="rs-value-container valueContainer-727 value-container--has-value"><div class="rs-single-value singleValue-726">Other</div><div class="rs-input-container inputContainer-709" data-value=""><input class="rs-input input-708" autocapitalize="none" autocomplete="off" autocorrect="off" id="react-select-18-input" spellcheck="false" tabindex="0" type="text" aria-autocomplete="list" aria-expanded="false" aria-haspopup="true" role="combobox" value="" style="color: inherit; background: 0px center; opacity: 1; width: 100%; grid-area: 1 / 2; font: inherit; min-width: 2px; border: 0px; margin: 0px; outline: 0px; padding: 0px;"></div></div><div class="rs-indicators-container indicatorsContainer-707"><span class="rs-indicator-separator indicatorSeparator-706"></span><div class="dropdown-indicator rs-dropdown-indicator dropdownIndicator-703" aria-hidden="true"><svg height="20" width="20" viewBox="0 0 20 20" aria-hidden="true" focusable="false" style="display: inline-block; fill: currentcolor; line-height: 1; stroke: currentcolor; stroke-width: 0;"><path></path></svg></div></div></div></div></div></div></div>"""
+
+_LIVE_TOGGLE = """<span class="value-1071"><div class="ms-Stack css-1288"><div class="ms-Toggle is-enabled clsToggle-1283"><label class="ms-Label ms-Toggle-label label-1286" for="Toggle1638" id="Toggle1638-label">Student loan</label><div class="ms-Toggle-innerContainer container-1285"><button class="ms-Toggle-background pill-1270" aria-checked="false" aria-labelledby="Toggle1638-label" data-is-focusable="true" data-ktp-target="true" id="Toggle1638" role="switch" type="button"><span class="ms-Toggle-thumb thumb-1271"></span></button></div></div></div></span>"""
+
+
+async def _fixture_page(pw, markup):
+    browser = await _launch(pw)
+    page = await browser.new_page()
+    await page.set_content(f'<div id="form">{markup}</div>')
+    return browser, page
+
+
+def test_the_old_label_shape_found_nothing_on_the_live_markup():
+    """The regression itself, pinned: four levels of Fluent nesting sit between the
+    element carrying the label and the input, so a `> input` child constraint can never
+    match. If this ever starts matching, the shape below is no longer needed."""
+    async def go():
+        async with async_playwright() as pw:
+            browser, page = await _fixture_page(pw, _LIVE_NI_GROUP)
+            try:
+                return await page.locator(
+                    'css=*:has(> input):has-text("NI number") > input').count()
+            finally:
+                await browser.close()
+
+    assert asyncio.run(go()) == 0
+
+
+def test_the_label_rung_resolves_the_control_its_label_names():
+    """Every field in the captured group, located by nothing but the text beside it."""
+    async def go():
+        async with async_playwright() as pw:
+            browser, page = await _fixture_page(pw, _LIVE_NI_GROUP)
+            try:
+                out = {}
+                for label, tag in [("NI number", "input"), ("NI Category", "input"),
+                                   ("Payment Mode", "input")]:
+                    loc = page.locator(sc._label_scoped_css(tag, label))
+                    count = await loc.count()
+                    out[label] = (count,
+                                  await loc.first.get_attribute("id") if count == 1
+                                  else None)
+                return out
+            finally:
+                await browser.close()
+
+    out = asyncio.run(go())
+    assert out["NI number"] == (1, "TextField1575")        # the attribute-less field
+    assert out["NI Category"] == (1, "react-select-17-input")
+    assert out["Payment Mode"] == (1, "react-select-18-input")
+
+
+def test_the_label_rung_reaches_a_toggle_button_too():
+    async def go():
+        async with async_playwright() as pw:
+            browser, page = await _fixture_page(pw, _LIVE_TOGGLE)
+            try:
+                loc = page.locator(sc._label_scoped_css("button", "Student loan"))
+                return await loc.count(), await loc.first.get_attribute("id")
+            finally:
+                await browser.close()
+
+    assert asyncio.run(go()) == (1, "Toggle1638")
+
+
+def test_a_compiled_attributeless_fill_replays_through_the_label_rung():
+    """End to end on the live markup: what compile emits for an attribute-less input,
+    minus its recorded xpath (the shape that broke), still resolves and fills."""
+    element = {"node_name": "INPUT", "x_path": "html/body/div/div/div/div/input",
+               "attributes": {"type": "text", "id": "TextField1575", "maxlength": "9",
+                              "class": "ms-TextField-field field-1228"}}
+    sels = sc._selectors(element, label="NI number")
+    assert sels[0].startswith("xpath=")                     # positional anchor still leads
+    assert sels[-1] == sc._label_scoped_css("input", "NI number")
+
+    async def go():
+        async with async_playwright() as pw:
+            browser, page = await _fixture_page(pw, _LIVE_NI_GROUP)
+            try:
+                loc, sel, _healed = await sc._resolve(
+                    page, {"selectors": sels[1:]}, 3000, require_editable=True)
+                await loc.fill("AB124557C")
+                return sel, await loc.input_value()
+            finally:
+                await browser.close()
+
+    sel, value = asyncio.run(go())
+    assert value == "AB124557C"
+    assert ":text-is" in sel
+
+
+def test_an_element_with_a_real_attribute_gets_no_label_rung():
+    """The rung is offered ONLY where the attribute ladder came back empty - a real
+    attribute beats a label every time."""
+    named = {"node_name": "INPUT", "x_path": "html/body/div/input",
+             "attributes": {"placeholder": "First Name", "type": "text"}}
+    assert sc._selectors(named, label="First name") == [
+        "xpath=/html/body/div/input", 'css=[placeholder="First Name"]']

@@ -99,11 +99,31 @@ _LEADING_JUDGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The VERIFICATION subset of _JUDGE_RE: verbs whose product is a COMPARISON the agent
+# performs, which is the one thing a recording can never replay. _JUDGE_RE's remaining
+# branches (note/remember/capture) say something weaker — carry this value forward — and
+# a compiled extract step does exactly that, live, every replay.
+_VERIFIES_RE = re.compile(
+    r"\b(verify|verifies|confirm|ensure|validate|compare)\b"
+    r"|\bcheck (that|whether|if|it)\b"
+    r"|\bmake sure\b"
+    r"|\bsee (if|whether|that)\b",
+    re.IGNORECASE,
+)
+
 
 def node_kind(template_prompt: str, marker: str | None,
               declared: str | None = None, tab_url: str | None = None) -> str:
-    """Resolve a subtask's node kind: "action" (replayable), "judge" (cognitive), or
-    "loop" (repeat-until: acts like an action, but always live and never cached).
+    """Resolve a subtask's node kind: "action" (replayable), "judge" (cognitive, always
+    live), or "loop" (repeat-until).
+
+    Loops are CACHED as of 2026-08-25 (user decision). What a loop's entry stores is the
+    iteration count its authoring agent stopped at; the user's position is that a
+    recording replays in the setting it was made in, so that count holds. Kind still
+    matters for loops — they keep the extended step budget when they author, they compile
+    with adjacent same-target clicks counted as ITERATIONS rather than dropped as retries
+    (script_compile._push_step), and they stay out of SEMANTIC ROUTING, where a count
+    borrowed from another wording's recording would carry no such guarantee.
 
     An explicit declaration (spec/cache) wins; a marker-owning subtask is ALWAYS action —
     its network gate is machine ground truth, so caching it is safe regardless of wording;
@@ -113,9 +133,8 @@ def node_kind(template_prompt: str, marker: str | None,
     otherwise verification wording makes it a judge node — unless iteration cues say the
     verification is folded INTO a repeated action ("Save & Next ... check that ... until X
     is shown"): that is a loop node. A loop must ACT (observation framing made the agent
-    declare the loop done after one iteration), yet can never be cached: the iteration
-    count is live page state, so a replayed loop would walk a fixed number of steps and
-    land anywhere. Loop wording needs no judge phrase, though: an imperative rewrite
+    declare the loop done after one iteration). Loop wording needs no judge phrase, though:
+    an imperative rewrite
     ("keep repeating ... until X is shown") carries none, and routing it through the
     judge gate demoted it to a cacheable action whose frozen Save & Next replay saved
     the stop-target employee (2026-08-05) — so a repetition cue PLUS a stop cue is a
@@ -128,9 +147,26 @@ def node_kind(template_prompt: str, marker: str | None,
     if marker or tab_url:
         return "action"
     if _JUDGE_RE.search(template_prompt):
+        produces = (produces_noted_data(template_prompt)
+                    and not _VERIFIES_RE.search(template_prompt))
+        # The leading-judge guard holds a slice at judge when the head directive IS the
+        # verification ("Check that entries do not repeat across pages"). A leading
+        # PRODUCER is not that: "note the employee shown, click Save & Next, and keep
+        # repeating until ..." heads an ACTION that iterates, so its loop cues still win.
         if _LOOP_CUE_RE.search(template_prompt) \
-                and not _LEADING_JUDGE_RE.match(template_prompt):
+                and (produces or not _LEADING_JUDGE_RE.match(template_prompt)):
             return "loop"
+        # PRODUCER wording is not verification. "note and remember the OTP" tells the step
+        # to CAPTURE a value later steps consume, and its replay is not hollow for exactly
+        # the reason the tab_url branch above is an action: the compiled extract step
+        # re-reads the live DOM every run, so the observation stays fresh with no LLM.
+        # That carve-out was only ever this rule scoped to a foreign origin, and scoping it
+        # that way made the SAME wording cacheable on fakenamegenerator and uncacheable
+        # in-app — run 20260824_165824 paid 176s and 140k tokens for an OTP observation a
+        # replayed extract would have re-read for free. A slice that also VERIFIES stays a
+        # judge: a comparison is the thing a recording cannot make.
+        if produces:
+            return "action"
         return "judge"
     if _LOOP_REPEAT_RE.search(template_prompt) \
             and _LOOP_STOP_RE.search(template_prompt) \
@@ -190,11 +226,31 @@ def downloads_file(template_prompt: str) -> bool:
 
 # The noting INSTRUCTION itself ("note and remember exactly these details") — the
 # producer side of the noted-data flow.
+#
+# `copy` joined the verb list on 2026-08-25, when the copy_text tool made copying a real
+# CAPTURE (it stamps the extract channel, so the value lands in run_values like any other
+# noted fact). Before that, "click Get OTP, copy the 6 digit number (OTP)" scored
+# produces_noted_data = False: the commit guard that refuses to cache a producer whose
+# recording carries no capture step never ran, so a run that copied nothing would cache a
+# producer that notes nothing and leave every consumer's binding unresolvable. Measured
+# across the whole registry, this widening flips exactly that one slice and no consumer.
 _PRODUCES_NOTED_RE = re.compile(
-    r"\b(?:note|remember|capture|write)\s+(?:and\s+\w+\s+)?(?:down\s+)?(?:exactly\s+)?"
+    r"\b(?:note|remember|capture|write|copy)\s+(?:and\s+\w+\s+)?(?:down\s+)?(?:exactly\s+)?"
     r"(?:the|these|those|all|it)\b",
     re.IGNORECASE,
 )
+
+
+def produces_noted_data(template_prompt: str) -> bool:
+    """True when the subtask's wording is the NOTING instruction — it captures a value
+    for later subtasks to consume.
+
+    Two callers, one meaning: node_kind treats such a slice as an ACTION (its replay is a
+    live extract, not a hollow assertion), and the commit guard in hybrid refuses to cache
+    one whose recording carries no extract step — a producer that noted only in prose
+    would replay silently, leaving its consumers to replay stale values instead.
+    """
+    return bool(_PRODUCES_NOTED_RE.search(template_prompt))
 
 # The UNAMBIGUOUS consumer signals of _NOTED_DATA_RE — everything except the
 # usage-word branch's ambiguous participles (generated/recorded/saved/copied), which
@@ -265,8 +321,9 @@ class Subtask:
     # The tab closes when the subtask ends; the main app page is never navigated.
     tab_url: str | None = None
     # "action" (replayable from the library) | "judge" (cognitive: always LLM, never
-    # cached) | "loop" (repeat-until: action framing, always LLM, never cached — see
-    # node_kind). Assigned by _build_subtasks after markers are settled.
+    # cached) | "loop" (repeat-until: action framing; cached since 2026-08-25, storing the
+    # authoring run's iteration count — see node_kind). Assigned by _build_subtasks after
+    # markers are settled.
     kind: str = "action"
     # True only for the whole-prompt fallback blob: the entire task as one subtask.
     # Downstream it degrades gating/framing to neutral (steps gate, no download block,
@@ -312,6 +369,18 @@ def _implied_tab_url(template_prompt: str) -> str | None:
         if sstore.is_absolute_http_url(url):
             return url
     return None
+
+
+def announces_new_tab(template_prompt: str) -> bool:
+    """True when the wording says a new tab will open — WITHOUT naming its address.
+
+    The URL-free half of the aux test: the task promises the tab, the APP supplies the
+    address (an in-app external-link button carrying a per-request signed URL). Such a
+    tab gets no `tab_url`, so it is not a helper tab the framework opened, and
+    close_extra_tabs used to sweep it as a misclick popup the moment its segment
+    returned — see HybridSession.adopt_announced_tab.
+    """
+    return bool(_NEW_TAB_RE.search(template_prompt))
 
 
 def _build_subtasks(raw: list[dict[str, Any]], marker: str | None,

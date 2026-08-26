@@ -417,3 +417,158 @@ async def test_toggle_click_that_fires_write_keeps_receipt(monkeypatch):
     msg = res.extracted_content
     assert "POST" in msg and "200" in msg
     assert (res.metadata or {}).get("write_outcome", {}).get("accepted") is True
+
+
+# ---------------- verify_save_registered: did MY last action write? ----------------
+# Run 20260824_165824 seg 4 left Aayan Dickson with two or three £4,000 payments. The tool
+# could not have prevented it: no slice of that task declares a marker, so runner.py only
+# installs _SAVE_PROBE `if success_marker`, and the tool answered "not available for this
+# run; verify via the UI instead" — which is how the agent ended up reading search_page,
+# mistaking the row it had just created for a pre-existing one ("from existing entry; did
+# not add new payment"), and re-entering. Even when installed the probe returned the
+# SEGMENT's first create-write, so save #1 vouched for save #3 forever.
+
+
+class _WindowedLiveNetwork:
+    """writes_since that actually honours t0 — the fake above ignores it, which is fine
+    for receipts but would hide the windowing regression this section exists to catch."""
+
+    def __init__(self, writes):
+        self._writes = writes
+
+    def writes_since(self, t0):
+        return [w for w in self._writes if w["started"] >= t0]
+
+
+def _at(started, **kw):
+    w = _write_snapshot(**kw)
+    w["started"] = started
+    return w
+
+
+async def test_accepted_write_since_the_last_action_is_confirmed(monkeypatch):
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([_at(10.0)]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 5.0)
+
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("CONFIRMED")
+    assert "do NOT repeat it" in msg
+
+
+async def test_a_write_from_before_the_last_action_does_not_confirm(monkeypatch):
+    """THE duplicate regression: employee 1's save must not vouch for employee 3's. The old
+    probe returned the segment's first create-write and so always said CONFIRMED here."""
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([_at(1.0)]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 5.0)   # the save came later
+
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("UNCONFIRMED")
+
+
+async def test_no_write_is_unconfirmed_and_never_orders_a_resave(monkeypatch):
+    """A client-staged save fires nothing. Saying "the Save did NOT go through — save
+    again" here is a duplicate-add instruction, so the message must refuse to say it."""
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 5.0)
+    monkeypatch.setattr(agent_tools, "_VERIFY_SNIFF_S", 0.05)   # don't wait in tests
+
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("UNCONFIRMED")
+    assert "not proof of failure" in msg.lower()
+    assert "DUPLICATE" in msg
+    assert "save again" not in msg.lower()
+    assert "did not go through" not in msg.lower()
+
+
+async def test_a_refused_write_is_named_as_refused(monkeypatch):
+    """2xx whose body is a refusal (the FPS "already submitted" case). Distinct from
+    UNCONFIRMED: something DID reach the server, so the fix is to read its verdict."""
+    body = json.dumps({"status": False, "message": "FPS already submitted for this period"})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK",
+                        _WindowedLiveNetwork([_at(10.0, body=body)]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 5.0)
+
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("REFUSED")
+    # The server's OWN words must reach the agent, or "fix what it names" is unactionable.
+    assert "FPS already submitted for this period" in msg
+    assert "DID reach the server" in msg
+
+
+async def test_a_refusal_body_that_lands_during_the_poll_is_not_confirmed(monkeypatch):
+    """The verifier must wait for the response BODY, not just for the request to settle.
+    `_write_verdict` reads record["body"], so a settled 2xx whose body has not arrived yet
+    looks ACCEPTED to `_writes_accepted` — and this app's refusals are 2xx-with-a-body
+    ("already submitted"). An earlier hand-rolled copy of the polling here skipped that
+    phase and answered CONFIRMED on exactly that shape.
+
+    The fake mutates the record IN PLACE, which is what NetworkCollector.writes_since
+    documents ("`record` is the LIVE aggregation dict ... callers re-poll rather than
+    copy") — the poll loop re-reads the same dict instead of re-fetching."""
+    import asyncio
+
+    monkeypatch.setattr(agent_tools, "_WRITE_SETTLE_S", 0.2)
+    monkeypatch.setattr(agent_tools, "_BODY_POLL_S", 0.5)
+    now = time.monotonic()
+    w = _at(now)                                  # settled 2xx, JSON type, body not in yet
+    assert "body" not in w["record"]
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([w]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", now - 0.01)
+
+    body = json.dumps({"status": False, "message": "already submitted"})
+    asyncio.get_running_loop().call_later(
+        0.15, lambda: w["record"].__setitem__("body", body))
+
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("REFUSED"), msg
+    assert "already submitted" in msg
+
+
+async def test_a_body_that_never_lands_does_not_stall_past_the_deadline(monkeypatch):
+    """The body wait is bounded: a 2xx whose JSON body never arrives still answers, on the
+    evidence available, rather than hanging the agent's step."""
+    monkeypatch.setattr(agent_tools, "_WRITE_SETTLE_S", 0.1)
+    monkeypatch.setattr(agent_tools, "_BODY_POLL_S", 0.2)
+    now = time.monotonic()
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([_at(now)]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", now - 0.01)
+
+    started = time.monotonic()
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("CONFIRMED")            # no refusal evidence to act on
+    assert time.monotonic() - started < 2.0       # bounded, not the 6s sniff window
+
+
+async def test_probe_failure_degrades_to_unconfirmed(monkeypatch):
+    class _Boom:
+        def writes_since(self, t0):
+            raise RuntimeError("collector gone")
+
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _Boom())
+    msg = await agent_tools._verify_last_action_write()
+    assert msg.startswith("UNCONFIRMED")     # never raises into the run
+
+
+async def test_tool_answers_from_the_live_collector_without_any_marker(monkeypatch):
+    """Cause 1, asserted end to end: a task that declares no marker used to get no save
+    probe at all and be told "not available for this run; verify via the UI instead" — which
+    is how the agent ended up eyeballing search_page and re-entering a saved payment. The
+    live collector is installed unconditionally, so the tool now answers regardless."""
+    from test_agent_tools import _registered_action
+
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", _WindowedLiveNetwork([_at(10.0)]))
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 5.0)
+
+    fn, _model = _registered_action("verify_save_registered")
+    res = await fn()
+    assert "CONFIRMED" in res.extracted_content
+    assert "not available for this run" not in res.extracted_content
+
+
+async def test_stamp_action_windows_the_verifier_to_the_current_action(monkeypatch):
+    """The stamp is what makes the window per-action; the click wrappers set it."""
+    monkeypatch.setattr(agent_tools, "_LAST_ACTION_T0", 0.0)
+    first = agent_tools._stamp_action()
+    second = agent_tools._stamp_action()
+    assert second >= first
+    assert agent_tools._LAST_ACTION_T0 == second

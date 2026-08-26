@@ -214,3 +214,31 @@ async def test_panels_and_modals_are_not_pinned():
 
         assert state["open"] is False           # a Panel is not a Callout
         assert state["scrollY"] == 90           # so the page still scrolls
+
+
+# ------------- one definition of the callout predicate (2026-08-26) -------------
+
+
+def test_every_callout_consumer_shares_one_predicate():
+    """Three places ask "is a dismiss-on-scroll popup open": the scroll pin (which reverts
+    and swallows the scroll), RAW_FIND_JS (which then skips its own scrollIntoView), and
+    agent_tools._CALLOUT_OPEN_JS (which refuses page-moving tools and gates the text hunt).
+    The pin is the protection; the other two are local guards that are only correct while
+    they agree with it. Three hand-copied loops do not stay in agreement, so all three
+    interpolate CALLOUT_OPEN_FN_JS — and none may grow its own copy."""
+    from automation.pipeline import agent_tools as at
+
+    needle = "querySelectorAll('.ms-Callout')"
+    for name, js in (("CALLOUT_SCROLL_PIN_JS", sc.CALLOUT_SCROLL_PIN_JS),
+                     ("RAW_FIND_JS", sc.RAW_FIND_JS),
+                     ("_CALLOUT_OPEN_JS", at._CALLOUT_OPEN_JS)):
+        assert "__CALLOUT_OPEN_FN__" not in js, f"{name} left the placeholder unfilled"
+        copies = js.count(needle)
+        assert copies == 1, (f"{name} has {copies} copies of the predicate — interpolate "
+                             "CALLOUT_OPEN_FN_JS instead of writing another loop")
+
+    # Panels and Modals must never enter it: the Add Data Request employee list is a PANEL
+    # whose rows only container scrolling reveals.
+    assert ".ms-Panel" not in sc.CALLOUT_OPEN_FN_JS
+    assert ".ms-Modal" not in sc.CALLOUT_OPEN_FN_JS
+

@@ -2,6 +2,7 @@
 metadata-less find_by_text click must not vanish, save_history's metadata drop must be
 repaired, and a zero-step script must never be committed."""
 import json
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -1715,3 +1716,250 @@ def test_undeclared_same_target_repeat_dissolves_to_one_click():
     indexed = [{"action": "click_indexed", "selector_template": 'css=[id$="-{n}"]',
                 "start": 0, "count": 3}]
     assert sc._apply_repeat_hint(indexed, None) == indexed
+
+
+# ---------------- shadow containment vs. shadow HOSTING (2026-08-25) ----------------
+# An xpath into a shadow root can never resolve (see tests/test_shadow_dom_find.py for the
+# measurement), so compile must know when an element is inside one. browser-use's listing
+# is the only record — but the `|SHADOW(open)|` prefix marks a node that IS a shadow HOST
+# (`is_shadow_host = any(child is a DOCUMENT_FRAGMENT)`, serializer.py:513), and every
+# native <input>/<select> hosts its own USER-AGENT shadow root. Reading the prefix as
+# containment marked every input on the app as unreachable-by-xpath and broke two library
+# entries outright. Containment is an `Open Shadow` line ABOVE the element, at a smaller
+# indent, with the shadow tree nested below it (serializer.py:1069).
+
+_SHADOW_SM = """Interactive elements:
+[Start of page]
+\t[81]<button />
+\t|SHADOW(open)|[300]<my-widget />
+\t\tOpen Shadow
+\t\t\tAmount
+\t\t\t*[363]<input type=text inputmode=decimal value=\u00a30.00 />
+\t\tShadow End
+\tAmount
+\t|SHADOW(open)|*[370]<input type=text inputmode=decimal value=\u00a30.00 />
+\t*[371]<button />
+\t\tSave
+[End of page]"""
+
+
+def test_containment_is_read_from_the_ancestors_not_the_elements_own_marker():
+    from automation.pipeline.script_compile import _sm_in_shadow
+
+    assert _sm_in_shadow(_SHADOW_SM, 363) is True    # nested under `Open Shadow`
+    assert _sm_in_shadow(_SHADOW_SM, 300) is False   # the HOST is not inside its own root
+    assert _sm_in_shadow(_SHADOW_SM, 370) is False   # a native input hosting a UA root
+    assert _sm_in_shadow(_SHADOW_SM, 371) is False   # ...and its sibling after Shadow End
+    assert _sm_in_shadow(_SHADOW_SM, 99999) is False
+    assert _sm_in_shadow("", 363) is False
+
+
+def test_no_element_in_the_real_library_is_treated_as_shadow_contained():
+    """Fixture from live recordings rather than a hand-written belief about the markup —
+    but DERIVED, never hardcoded: these files are rewritten every time a segment
+    re-authors, so pinning an element index makes the test rot on the user's next run.
+
+    Two facts, and the gap between them is the whole bug: the `|SHADOW(open)|` prefix
+    fires on inputs all over this app, and NOT ONE of them is actually inside a shadow
+    root (no recording contains an `Open Shadow` line at all)."""
+    from automation.pipeline.script_compile import _sm_in_shadow
+
+    marked = contained = seen = 0
+    for rec_path in sorted(pathlib.Path("library").glob("*.recording.json")):
+        for item in json.loads(rec_path.read_text()).get("history", []):
+            sm = item.get("state_message") or ""
+            for action in (item.get("model_output") or {}).get("action") or []:
+                params = next(iter((action or {}).values()), None)
+                idx = params.get("index") if isinstance(params, dict) else None
+                if idx is None or f"[{idx}]<" not in sm:
+                    continue
+                seen += 1
+                line = next(ln for ln in sm.splitlines() if f"[{idx}]<" in ln)
+                marked += "|SHADOW(" in line
+                contained += _sm_in_shadow(sm, idx)
+    if not seen:
+        pytest.skip("no recordings in library/ to read")
+    assert marked, "expected the host marker to appear — it is what misled compile"
+    assert contained == 0, f"{contained} of {seen} recorded elements read as shadow-contained"
+
+
+def test_a_shadow_contained_fill_drops_the_dead_xpath(tmp_path):
+    field = {"node_name": "INPUT", "x_path": "html/body/div/div/input",
+             "attributes": {"type": "text", "inputmode": "decimal", "placeholder": ""}}
+    item = _item({"input": {"index": 363, "text": "4000", "clear": True}},
+                 element=field, state_message=_SHADOW_SM)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    fills = [s for s in steps if s["action"] == "fill"]
+    assert fills, steps
+    sels = fills[0]["selectors"]
+    assert sels[0] == 'css=[inputmode="decimal"]'        # a real attribute leads
+    assert all(not s.startswith("xpath=") for s in sels)  # the dead anchor is gone
+
+
+def test_a_native_input_hosting_a_ua_shadow_root_keeps_its_xpath(tmp_path):
+    """The regression: index 370 carries the same `|SHADOW(open)|` prefix as the widget
+    above it, but it is a plain input in the light DOM and its recorded xpath is its
+    strongest anchor. Stripping it left the app's attribute-less fields — the NI number
+    box, the Net-to-Gross popup's Net amount box — with no anchor that resolves."""
+    field = {"node_name": "INPUT", "x_path": "html/body/div/div/input",
+             "attributes": {"type": "text", "inputmode": "decimal"}}
+    item = _item({"input": {"index": 370, "text": "4000", "clear": True}},
+                 element=field, state_message=_SHADOW_SM)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    assert steps[0]["selectors"][0] == "xpath=/html/body/div/div/input"
+
+
+_SHADOW_SM_NO_LABEL = """Interactive elements:
+[Start of page]
+\t|SHADOW(open)|[300]<my-widget />
+\t\tOpen Shadow
+\t\t\t*[363]<select />
+\t\tShadow End
+[End of page]"""
+
+
+def test_a_shadow_element_with_neither_attribute_nor_label_is_unanchorable(tmp_path):
+    # Nothing can locate it — no attribute to match, no label beside it to scope to, and
+    # xpath cannot cross the boundary. Say so: _author_segment refuses the commit and the
+    # segment authors live rather than caching a step that fails every replay.
+    nameless = {"node_name": "SELECT", "x_path": "html/body/div/div/select",
+                "attributes": {"class": "form-select form-select-sm"}}
+    item = _item({"select_dropdown": {"index": 363, "text": "Payment on behalf"}},
+                 element=nameless, state_message=_SHADOW_SM_NO_LABEL)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    assert [s["action"] for s in steps] == ["unanchorable"]
+    assert "shadow root" in steps[0]["why"]
+
+
+def test_inputmode_is_a_distinguishing_attribute():
+    from automation.pipeline.script_compile import _selectors_from_parts
+
+    assert _selectors_from_parts("input", {"inputmode": "decimal"}, "") == \
+        ['css=[inputmode="decimal"]']
+    # An element with nothing at all still yields nothing — the widening is narrow.
+    assert _selectors_from_parts("button", {"type": "button"}, "") == []
+
+
+# ---------------- the label rung is gated on MISSING ATTRIBUTES ----------------
+# It used to be gated on `in_shadow`, which was both wrong (it fired on every native
+# input) and beside the point: what makes a label the only way to find a control is that
+# no attribute names it. tests/test_shadow_dom_find.py measures the selector itself
+# against the live markup; these pin WHEN compile offers it.
+
+
+def test_an_attributeless_control_gets_the_label_rung_after_its_xpath(tmp_path):
+    listing = """Interactive elements:
+[Start of page]
+\tPeriod to
+\t*[737]<select />
+[End of page]"""
+    nameless = {"node_name": "SELECT", "x_path": "html/body/div/div/select",
+                "attributes": {"class": "form-select form-select-sm"}}
+    item = _item({"select_dropdown": {"index": 737, "text": "Jun-26"}},
+                 element=nameless, state_message=listing)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    assert [s["action"] for s in steps] == ["select"]
+    assert steps[0]["selectors"] == [
+        "xpath=/html/body/div/div/select",
+        sc._label_scoped_css("select", "Period to")]
+
+
+def test_the_label_rung_refuses_a_label_that_is_the_pages_data(tmp_path):
+    """Run 20260825_163029: widening the rung from shadow-contained to attribute-less
+    first offered it to Pay Forecast table cells, whose neighbouring line is the row's
+    AMOUNT — `*:text-is("\u00a32446.44")` goes stale the moment the pay changes, and can
+    match a different row showing the same figure."""
+    listing = """Interactive elements:
+[Start of page]
+\t\u00a32446.44
+\t*[812]<td />
+[End of page]"""
+    cell = {"node_name": "TD", "x_path": "html/body/table/tbody/tr[11]/td[15]",
+            "attributes": {}}
+    item = _item({"click": {"index": 812}}, element=cell, state_message=listing)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    assert steps[0]["selectors"] == ["xpath=/html/body/table/tbody/tr[11]/td[15]"]
+
+
+def test_the_label_rung_refuses_a_neighbours_label(tmp_path):
+    """An element that already HAS a name is not named by a different line above it: the
+    Calculate button sat under "Calculate for remaining periods", which names another
+    control. An element whose own name is itself data (the popup's "\u00a3" box) reads as
+    nameless and keeps its rung — that is the case the rung exists for."""
+    from automation.pipeline.script_compile import _label_names
+
+    assert _label_names("Student loan", "Student loan") is True     # agrees
+    assert _label_names("Calculate for remaining periods", "Calculate") is False
+    assert _label_names("Net amount", "\u00a3") is True             # a nameless box
+    assert _label_names("Net amount", "") is True
+    assert _label_names("\u00a32446.44", "") is False               # data, not a name
+    assert _label_names("", "") is False
+    assert _label_names(None, "") is False
+
+
+def test_a_control_with_an_attribute_gets_no_label_rung(tmp_path):
+    listing = """Interactive elements:
+[Start of page]
+\tPeriod to
+\t*[737]<select name=periodTo />
+[End of page]"""
+    named = {"node_name": "SELECT", "x_path": "html/body/div/div/select",
+             "attributes": {"name": "periodTo"}}
+    item = _item({"select_dropdown": {"index": 737, "text": "Jun-26"}},
+                 element=named, state_message=listing)
+    steps = compile_recording(_write(tmp_path, [item]), emit_start_goto=False)
+
+    assert steps[0]["selectors"] == ["xpath=/html/body/div/div/select",
+                                     'css=[name="periodTo"]']
+
+
+def test_the_label_reader_ignores_elements_edges_and_icon_glyphs():
+    from automation.pipeline.script_compile import _sm_preceding_label
+
+    # A Fluent icon is a literal Private-Use-Area text node and names nothing.
+    glyph = "Interactive elements:\n\t\ue70f\n\t|SHADOW(open)|*[9]<select />"
+    assert _sm_preceding_label(glyph, 9) is None
+    # An element line above is not a label either.
+    elem = "Interactive elements:\n\t[8]<button />\n\t|SHADOW(open)|*[9]<select />"
+    assert _sm_preceding_label(elem, 9) is None
+    # ...and a paragraph is not a label.
+    long = "Interactive elements:\n\t" + "x" * 60 + "\n\t|SHADOW(open)|*[9]<select />"
+    assert _sm_preceding_label(long, 9) is None
+    assert _sm_preceding_label("Interactive elements:\n\tName\n\t*[9]<select />", 9) == "Name"
+
+
+def test_a_loop_recording_counts_adjacent_clicks_as_iterations(tmp_path):
+    """Loops cache as of 2026-08-25, and what they cache is the iteration COUNT. But
+    _push_step drops back-to-back clicks on one target as slow-app retries, so an eleven
+    employee walk that the agent ran without pausing would have compiled to a SINGLE click
+    and the cached entry would stop after one. On a loop recording, adjacency is iteration."""
+    nxt = {"node_name": "BUTTON", "attributes": {"id": "next"}, "ax_name": "Next"}
+    history = [_item({"click": {"index": 7}}, element=nxt) for _ in range(11)]
+
+    as_action = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s.get("count", 1) for s in as_action] == [1]     # retries collapse
+
+    as_loop = compile_recording(_write(tmp_path, history), emit_start_goto=False, loop=True)
+    assert len(as_loop) == 1
+    assert as_loop[0]["count"] == 11                          # ...iterations accumulate
+
+
+def test_a_loops_wait_separated_clicks_count_the_same_either_way(tmp_path):
+    """The pre-existing cadence rule is untouched: clicks separated by a recorded wait
+    already accumulated, loop or not."""
+    nxt = {"node_name": "BUTTON", "attributes": {"id": "next"}, "ax_name": "Next"}
+    history = []
+    for _ in range(3):
+        history.append(_item({"click": {"index": 7}}, element=nxt))
+        history.append(_item({"wait": {"seconds": 1}}))
+
+    for loop in (False, True):
+        steps = compile_recording(_write(tmp_path, history), emit_start_goto=False,
+                                  loop=loop)
+        clicks = [s for s in steps if s["action"] == "click"]
+        assert clicks[0]["count"] == 3, (loop, steps)

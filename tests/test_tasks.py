@@ -369,13 +369,61 @@ FROZEN_TIDS = {
     # payment-expense-deduction / Verify all sequence, plus the weekend-notification
     # resend, "Bonus" capitalised to match the Pay Elements row, and the first-10 slice
     # picked up a double space. Split into part1-4 below.
-    "payroll_detailed_review_fps": "cd56d32ebde27ea3",
+    # Re-frozen again 2026-08-24 PM (cd56d32ebde27ea3 -> 10f7611a6d663bd9): the
+    # per-employee portal slice was rewritten from "Click Next for rest of the employees"
+    # into explicit iteration ("for each ... repeat ... until"). Run 20260824_165824 shows
+    # why: the old wording is not a loop signature, so the slice resolved to a plain
+    # action, the agent read it as ONE Next click, and it closed the tab on employee 2's
+    # freshly loaded (empty) form. Kept byte-identical in the full task and part2.
+    # Re-frozen 2026-08-25 (10f7611a6d663bd9 -> 8174b98b5f2bd4b7): TWO edits. The OTP
+    # producer slice said "click on the number to copy it", which contains no noting verb
+    # — decompose._PRODUCES_NOTED_RE matches note|remember|capture|write, never copy — so
+    # produces_noted_data returned False, the capture-required commit gate never fired,
+    # and a run that took the line literally would leave no `otp` in run_values for the
+    # consumer to bind to. It says "note and remember the OTP" again. The consumer slice
+    # carries the paste reword below (both copies edited byte-identically).
+    "payroll_detailed_review_fps": "8174b98b5f2bd4b7",
     # The four independently runnable parts of payroll_detailed_review_fps (2026-08-24,
     # user-requested). Parts 2-4 open with a business-selection slice the full task does
     # not have, so their prompts — and ids — are their own; part1 is the full task's first
     # three slices verbatim. See test_detailed_review_fps_parts_partition_the_full_task.
-    "payroll_detailed_review_fps_part1": "a86117b9ade1097c",
-    "payroll_detailed_review_fps_part2": "53d4737a3c493f6b",
+    # part1/part2 re-frozen 2026-08-24 PM: part1's Data-Request slice and part2's OTP
+    # slice were reworded while running the parts live, and part2 also carries the
+    # portal-loop rewrite above.
+    "payroll_detailed_review_fps_part1": "8be15ae6a6323200",
+    # Re-frozen 2026-08-25 (a04ea4bbd9a0051b -> f3e746bf3633d102): the final slice
+    # dropped "until every employee in that list has been done" for "one click each,
+    # and do nothing else on any of them". "Done" implied a body and the agent acted on
+    # it — run of 2026-08-24 repeated the PAYMENT for Aarmaan Aman, Aaron Wilson, Aayan
+    # Dickson, Aden Graham. The slice steps through the list and nothing more (user,
+    # 2026-08-25: "i just want it to click next and nothing else").
+    # Re-frozen again 2026-08-25 PM (f3e746bf3633d102 -> 90ca6486695115e1): the OTP
+    # consumer slice said "enter the OTP got it from the previous step". "Enter" is the
+    # verb for the `input` tool, so the agent typed the six-box code as six 1-character
+    # fills — and the whole code then appeared in NO step value, leaving the provenance
+    # binder nothing to bind (hybrid refusal #5) and the segment re-authoring at ~107k
+    # tokens every run. It now says "paste the OTP from the previous step into the first
+    # code box", which paste_text delivers in one action as one bindable value. The
+    # producer slice is deliberately untouched: it is the cached, replaying entry
+    # 58896a82b8f2d4b7, and copy_text (index-addressed) could not reach an OTP whose
+    # capture lands on a bare <form> anyway.
+    # Re-frozen a third time 2026-08-25 PM (90ca6486695115e1 -> b4bb372f1bb700eb): the producer
+    # slice moved to "copy the 6 digit number (OTP)" while running the new tools live.
+    # That reword cost the cached producer 58896a82b8f2d4b7 its sid (each producer reword
+    # re-authors at ~140k tokens), and it needed decompose._PRODUCES_NOTED_RE to learn the
+    # `copy` verb or the capture-required commit guard would stay switched off for it.
+    # Re-frozen 2026-08-25 evening (b4bb372f1bb700eb -> d1f40a8bf70f3b53): the last slice
+    # was a LOOP ("keep clicking Next ... until the last employee"), and loop nodes are
+    # never cached — hybrid skips their replay and refuses their commit — so it ran live
+    # every run at 13 steps / 280s. Reworded to a fixed count the same way the RTI employee
+    # passes were on 2026-08-11: "exactly 11 clicks" keeps node_kind=action and feeds
+    # repeat_hint_from_wording, so it compiles to one repeat_click. 11 = the request's 12
+    # employees minus the one already open.
+    # Re-frozen again the same evening (d1f40a8bf70f3b53 -> 5e882a1cb7ace619): the user
+    # added a Submit click to the tail of the final slice ("Then click submit, and then
+    # close this tab"). Re-checked, not assumed: it stays kind=action and
+    # repeat_hint_from_wording still reads 11.
+    "payroll_detailed_review_fps_part2": "5e882a1cb7ace619",
     "payroll_detailed_review_fps_part3": "20bbee5816f20709",
     "payroll_detailed_review_fps_part4": "887ef76ffdfef2ae",
 }
@@ -571,34 +619,52 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
 # two places and drifts only on purpose — same arrangement as the e2e halves above.
 FPS_PART_SLICE_COUNTS = {
     "payroll_detailed_review_fps_part1": 3,   # request + send email (full task's 1-3)
-    "payroll_detailed_review_fps_part2": 5,   # opener + bonus/OTP/portal edits (4-7)
+    # The body is split four ways (payment / expense / deduction / step-through) rather
+    # than the full task's single portal slice — the user's choice, 2026-08-25.
+    "payroll_detailed_review_fps_part2": 8,   # opener + bonus + OTP + portal + body x3 + Next
     "payroll_detailed_review_fps_part3": 2,   # opener + Verify all (8)
     "payroll_detailed_review_fps_part4": 6,   # opener + payrun pass + FPS (9-13)
 }
 FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business name "
                    "FOOD LIMITED")
+# Node kinds the parts resolve to. part2's portal slice is a loop — three dialogs per
+# employee across a 12-employee list, so it must act live and can never be cached (a
+# replayed loop walks a fixed number of steps and lands anywhere). Its OTP slice is an
+# ACTION despite "note and remember": producer wording is not verification, and a replayed
+# extract re-reads the live OTP. All wording-driven; see decompose.node_kind.
+FPS_PART_SLICE_KINDS = {
+    "payroll_detailed_review_fps_part1": ["action"] * 3,
+    # All ACTION since 2026-08-25: the final Next-through-employees slice was a loop, and
+    # loop nodes are never cached (hybrid skips the replay and refuses the commit), so it
+    # ran live every run. Reworded to "exactly 11 clicks" — the same fixed-count move the
+    # RTI employee passes took on 2026-08-11 — which keeps it an action and lets it cache.
+    # If this flips back to "loop", a reword reintroduced a repeat + stop cue.
+    "payroll_detailed_review_fps_part2": ["action"] * 8,
+    "payroll_detailed_review_fps_part3": ["action"] * 2,
+    "payroll_detailed_review_fps_part4": ["action"] * 6,
+}
 
 
-def test_detailed_review_fps_parts_partition_the_full_task():
-    """Each part re-states the business selection so it runs on its own; every other slice
-    is a byte-exact copy of the full task's. Parts 2-4 add that opener as a new first
-    slice (the full task's own opener also names Data Request, which only part1 wants), so
-    dropping it from those three must rebuild the full task's slice list exactly."""
+def test_detailed_review_fps_parts_are_independently_runnable():
+    """Each part re-states the business selection so it runs on its own, and its prompt is
+    derived from its own slices (one edit surface, no parallel copy).
+
+    This test used to additionally assert the parts rebuild the full task's slice list
+    byte-for-byte. That premise is dead as of 2026-08-25 and deliberately so: part2 splits
+    the portal body into payment / expense / deduction slices where the full task has one,
+    and its final slice now says step through the remaining employees doing NOTHING else,
+    while the full task's still says "repeat all of the above for them". The two copies have
+    diverged in INTENT, which is the accepted cost of keeping both (see the tasks.yaml
+    comment above the parts). Restoring the rebuild assertion would mean reverting a
+    deliberate wording choice, so guard what is still true instead."""
     tasks = load_tasks()
-    full = [" ".join(d.prompt.split()) for d in tasks["payroll_detailed_review_fps"].subtasks]
-
-    rebuilt = []
-    for i, key in enumerate(FPS_PART_SLICE_COUNTS):
+    for key in FPS_PART_SLICE_COUNTS:
         spec = tasks[key]
         slices = [" ".join(d.prompt.split()) for d in spec.subtasks]
         assert len(slices) == FPS_PART_SLICE_COUNTS[key], key
         assert slices[0].startswith(FPS_PART_OPENER), key   # or it cannot run alone
         assert spec.tags == ("payroll",), key
-        # prompt is derived from the slices — one edit surface, no parallel copy
         assert spec.prompt == " ".join(slices), key
-        rebuilt += slices if i == 0 else slices[1:]
-
-    assert rebuilt == full
 
 
 @pytest.mark.parametrize("key", list(FPS_PART_SLICE_COUNTS))
@@ -615,7 +681,7 @@ async def test_detailed_review_fps_parts_survive_validation(key, tmp_path, monke
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
     assert len(subs) == FPS_PART_SLICE_COUNTS[key]
     assert not any(getattr(s, "fallback", False) for s in subs)
-    assert [s.kind for s in subs] == ["action"] * FPS_PART_SLICE_COUNTS[key]
+    assert [s.kind for s in subs] == FPS_PART_SLICE_KINDS[key]
 
 
 def test_prompt_derived_from_declared_subtasks(tmp_path):

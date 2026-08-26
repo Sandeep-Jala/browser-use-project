@@ -59,8 +59,10 @@ from automation.pipeline import subtask_store as sstore
 from automation.pipeline.checks import (business_writes, evaluate_checks,
                                         receipt_rollup, save_cue,
                                         window_write_rollup)
-from automation.pipeline.decompose import (Subtask, consumes_noted_data, downloads_file,
-                                           get_decomposition, is_conditional_guard)
+from automation.pipeline.decompose import (Subtask, announces_new_tab,
+                                           consumes_noted_data, downloads_file,
+                                           get_decomposition, is_conditional_guard,
+                                           produces_noted_data)
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
 from automation.pipeline.script_compile import (CALLOUT_SCROLL_PIN_JS, REVEAL_CSS_JS,
@@ -140,7 +142,26 @@ class Gate:
     marker: str | None = None       # kind == "marker": create-write URL fragment
     postcondition: dict[str, Any] | None = None   # {"url_contains": ...} | {"visible": ...}
     end_context: str | None = None  # recorded end context (normalized URL) to compare
+    end_title: str | None = None    # recorded end document title, demote-only (see
+                                    # _recording_end_title); rides on any base kind
     checks: tuple = ()              # declared verify checks (tuple of checks.Check)
+
+
+# The normalized forms of "no location": normalize_context("about:blank") == "blank" and
+# normalize_context("") == "/". Never valid as a postcondition — see _base_gate's heal.
+_DEGENERATE_CONTEXTS = ("blank", "/", "")
+
+
+def _is_degenerate_url(url: Any) -> bool:
+    """True when `url` names no location at all — a blank tab or an unreadable/closed page.
+
+    One predicate, two callers: _pick_main_page has always skipped these when choosing the
+    page to pin, and the commit site must skip them when recording an end context.
+    normalize_context turns "about:blank" into "blank" and "" into "/", and that second one
+    is indistinguishable from a legitimate app root — which is why this is judged on the
+    RAW url, before normalization flattens the difference.
+    """
+    return str(url or "").strip() in ("", "about:blank")
 
 
 def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
@@ -152,6 +173,14 @@ def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Ga
 
 
 def _base_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
+    gate = _base_gate_kind(sub, entry, context)
+    # Rides on WHATEVER kind resolved — the title is evidence about the end state, not a
+    # kind of its own, and evaluate_gate applies it demote-only (same shape as `checks`).
+    gate.end_title = (entry or {}).get("end_title") or None
+    return gate
+
+
+def _base_gate_kind(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
     """Resolve the base gate for a subtask: its marker (the save-owning segment) wins;
     else a declared postcondition; else the DOWNLOAD gate when the wording says the
     segment downloads/exports a file (its truth is "a file arrived", not the page state —
@@ -172,6 +201,18 @@ def _base_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate
     if downloads_file(sub.template_prompt):
         return Gate(kind="download")
     end_context = (entry or {}).get("end_context")
+    if end_context in _DEGENERATE_CONTEXTS:
+        # Heal on read. An entry committed before the close-its-own-page guard can carry
+        # the normalized form of "no location" ("blank" from about:blank, "/" from a closed
+        # page) as its postcondition, which is unsatisfiable except by coincidence — see
+        # library/7320039db9ba7e26 and run 20260826_130102. The guard at the commit site
+        # stops NEW ones; this stops the existing ones gating.
+        #
+        # Note for _evaluate_base_gate below: "blank" is also why the normalizer it picks
+        # from the string's shape went wrong. "blank" has no leading "/", so the AUX
+        # normalizer ran and `reached` came back host-qualified, unable to match a
+        # main-style context — a second, independent reason that gate could never pass.
+        end_context = None
     if end_context and end_context != context:
         return Gate(kind="postcondition", end_context=end_context)
     return Gate(kind="steps")
@@ -227,7 +268,15 @@ _MARKER_EXTRA_STEPS = 10
 # successful fully-live pass needed 35 steps), and the flat budget starves it the same way
 # it starved the save-verify loop. Sized so the observed worst pass fits with headroom for
 # mid-loop dialogs and error branches; a short loop never uses the extra steps.
-_LOOP_EXTRA_STEPS = 35
+#
+# Raised 35 -> 120 (2026-08-24) for loops whose ITERATION is itself multi-step. The old
+# size assumed one click per pass; the portal data-request loop opens three dialogs per
+# employee and run 20260824_165824 measured 10 agent steps for a single employee (one
+# misclick recovery included) against a 12-employee list — 120 steps of work under a
+# 60-step ceiling. This is a CEILING, not a target: a loop that converges early still
+# stops early, and the only cost of the headroom is how far a genuinely runaway loop gets
+# before the wall (~21k tokens/step in that run).
+_LOOP_EXTRA_STEPS = 120
 
 
 # Extra agent steps for the whole-prompt FALLBACK blob: one segment must cover the entire
@@ -301,6 +350,32 @@ async def evaluate_gate(
     if rollup is not None and not rollup[0]:
         detail["rollup"] = rollup[1]
         ok = False
+    if gate.end_title and page is not None:
+        # Demote-only, like the roll-up and the declared checks below. A segment whose
+        # recording CHANGED the document title must change it the same way on replay —
+        # the only readable difference between an accepted and a refused in-page
+        # submission (see _recording_end_title). Fails OPEN on an unreadable title: an
+        # additive gate must never become a new false-fail source.
+        reached: str | None = None
+
+        async def _title_ok() -> bool:
+            nonlocal reached
+            try:
+                reached = " ".join(str(await page.title() or "").split())
+            except Exception as exc:  # noqa: BLE001 - unreadable title proves nothing
+                logger.debug("end_title read failed: %s", exc)
+                reached = None
+                return True
+            return reached == gate.end_title
+        matched = await _settled(_title_ok, steps_ok)
+        if reached is not None:
+            # Recorded on the PASS too — same convention as detail["checks"], which appears
+            # whenever checks are declared. A gate carrying a pin is not a bare gate, and
+            # without this there is no artifact evidence the check ever ran: a silently
+            # inert gate would look exactly like a passing one.
+            detail["end_title"] = {"expected": gate.end_title, "reached": reached,
+                                   "ok": matched}
+            ok = ok and matched
     wr_ok, wr_reasons = window_write_rollup(requests_window)
     if not wr_ok:
         detail["write_rollup"] = wr_reasons
@@ -327,6 +402,11 @@ def _check_failure_reason(detail: dict[str, Any]) -> str | None:
             if r.get("evidence"):
                 why = f"{why} [{r['evidence']}]"
             return f'deterministic check failed: {r["kind"]} "{r["arg"]}" — {why}'
+    title = detail.get("end_title") or {}
+    if title and not title.get("ok"):
+        return (f'the page never reached its recorded end state: expected the title '
+                f'"{title.get("expected")}", found "{title.get("reached")}" — the '
+                f"segment's actions did not take effect")
     wrollup = detail.get("write_rollup") or []
     if wrollup:
         return str(wrollup[0])
@@ -530,13 +610,25 @@ def _write_progress(hs: "HybridSession", *, task: str, tid: str, subtasks: list[
 # ------------------------------- the shared session -------------------------------
 
 
+def _page_url(page: Any) -> str:
+    """A page's URL for a log line, never raising on a page that just went away."""
+    try:
+        return str(page.url)
+    except Exception:  # noqa: BLE001 - a closed/detached page still deserves a name
+        return "<unreadable>"
+
+
 class HybridSession:
     """One task's live execution surface: a single BrowserSession (agent driver), a single
     Playwright CDP connection (replay driver + telemetry), and the collectors — all opened
     once and torn down only in finalize(). Both drivers point at the same Chromium. The
     shared page state is explicit: the MAIN page is pinned at open() and never navigated
-    away by aux work; an optional AUX page (helper tab, `tab_url` subtasks) exists only
-    while its subtask runs and is what current_page() returns while it is alive."""
+    away by aux work; an optional AUX page is what current_page() returns while it is
+    alive. The AUX slot holds either a helper tab the framework opened for a `tab_url`
+    subtask (closed at that subtask's end) or a tab the app opened because a subtask said
+    it would (adopt_announced_tab) — the latter outlives its opener on purpose, since the
+    subtasks that follow are the ones that need it, and it goes away when the task closes
+    it or the run ends."""
 
     def __init__(self, runner: Runner) -> None:
         self.runner = runner
@@ -622,7 +714,7 @@ class HybridSession:
         pages = [p for ctx in self.pw_browser.contexts for p in ctx.pages]
         if not pages:
             return None
-        real = [p for p in pages if p.url != "about:blank"]
+        real = [p for p in pages if not _is_degenerate_url(p.url)]
         return real[0] if real else pages[0]
 
     def current_page(self) -> Page | None:
@@ -648,8 +740,29 @@ class HybridSession:
         return self._main_page
 
     async def current_url(self) -> str:
+        """The current page's URL, or "" when there is no readable page. Guarded here so
+        callers do not each re-implement the closed-page check."""
         page = self.current_page()
-        return page.url if page is not None else ""
+        if page is None:
+            return ""
+        try:
+            return "" if page.is_closed() else page.url
+        except Exception as exc:  # noqa: BLE001 - an unreadable page is not a crash
+            logger.debug("current_url read failed: %s", exc)
+            return ""
+
+    async def current_title(self) -> str:
+        """The current page's document title, or "" when there is no readable page. The
+        live twin of current_url() — and the ONLY trustworthy source for an end title,
+        since a recorded one lags the SPA's async title update (see _pin_end_title)."""
+        page = self.current_page()
+        if page is None:
+            return ""
+        try:
+            return "" if page.is_closed() else (await page.title() or "")
+        except Exception as exc:  # noqa: BLE001 - an unreadable title is not a crash
+            logger.debug("current_title read failed: %s", exc)
+            return ""
 
     async def probe_condition(self, check: Any) -> bool:
         """One declared probe check against the live page — the deterministic stand-in
@@ -688,6 +801,26 @@ class HybridSession:
         except Exception as exc:  # noqa: BLE001 - focus alignment is best-effort
             logger.debug("could not read page target id: %s", exc)
             return None
+
+    async def _focused_page(self, candidates: list[Page]) -> Page | None:
+        """The candidate browser-use's AGENT FOCUS points at, or None when unidentifiable.
+
+        This is the page the segment finished on, stated by the driver that did the work
+        rather than inferred by counting tabs. browser-use auto-focuses any newly opened
+        tab, so focus at OPEN time proves nothing — but focus at segment END is the result
+        of every switch and click the agent made, which is exactly the fact the consumers
+        want."""
+        try:
+            target = self.session.get_focused_target() if self.session is not None else None
+            target_id = getattr(target, "target_id", None)
+            if not target_id:
+                return None
+            for page in candidates:
+                if await self._page_target_id(page) == target_id:
+                    return page
+        except Exception as exc:  # noqa: BLE001 - falls back to the count rule below
+            logger.debug("could not resolve the agent's focused page: %s", exc)
+        return None
 
     async def _focus_browser_use(self, page: Page | None) -> None:
         """Point browser-use's agent focus at `page` (best-effort, never raises).
@@ -780,6 +913,69 @@ class HybridSession:
             except Exception as exc:  # noqa: BLE001 - best-effort hygiene
                 logger.debug("close_aux_tab bring_to_front: %s", exc)
             await self._focus_browser_use(main)
+
+    async def adopt_announced_tab(self, sub: Subtask) -> None:
+        """Register a tab the SUBTASK SAID would open as the aux page, so the tab
+        invariant spares it and the next subtask runs inside it.
+
+        Run 20260824_163152 died here: subtask 3 clicked the app's external-link button,
+        did the whole OTP handshake in the tab it opened, and reported "Proceed Securely
+        submitted successfully in the new tab" — then close_extra_tabs swept that tab as a
+        misclick popup on the way out of the segment, and subtask 4 (the edits that have
+        to happen INSIDE the portal) had nowhere to run. The tab carries a per-request
+        signed URL, so the wording cannot name it and `tab_url` is never set.
+
+        The wording gate is what separates this from a genuine misclick: browser-use
+        focuses ANY newly opened tab, so a tab appearing proves nothing, while "the task
+        said this would happen" does.
+
+        WHICH tab, though, is answered by the agent's own focus at segment end (see
+        _focused_page) — not by counting. Counting failed the case it was written for: in
+        run 20260825_105115 a replay's force-retry opened the SAME portal tab twice, so
+        two extras existed, `len(extras) != 1` adopted nothing, the sweep took both, and
+        the postcondition gate then measured the app tab and failed a segment whose work
+        had actually succeeded. Two tabs to the same destination are not ambiguous, and
+        the agent had explicitly switched into the one it finished in. The count rule
+        survives only as the fallback for when focus cannot be resolved.
+        """
+        try:
+            if self._aux_page is not None and not self._aux_page.is_closed():
+                return  # a declared helper tab owns the slot; never displace it
+            if not announces_new_tab(sub.template_prompt):
+                return
+            main = self._main_page
+            if main is None or main.is_closed():
+                # No live pin to measure "extra" against, and current_page() is about to
+                # re-pin a survivor as MAIN — adopting that same page as AUX would give
+                # one tab both roles.
+                return
+            extras = [p for ctx in self.pw_browser.contexts for p in ctx.pages
+                      if p is not main and not p.is_closed()]
+            if not extras:
+                return
+            chosen = await self._focused_page(extras)
+            if chosen is None and len(extras) != 1:
+                if extras:
+                    # NAME them: "left 2 extra tabs open" alone cost a network-log
+                    # forensics pass to explain (run 20260825_105115, where a replay's
+                    # force-retry had opened the SAME tab twice), and the gate that fails
+                    # afterwards reports only the page it settled on.
+                    logger.info("subtask announced a new tab, left %d extra tabs open, and "
+                                "the agent's focus resolved to none of them — adopting none "
+                                "(a misclick is indistinguishable here): %s", len(extras),
+                                "; ".join(_page_url(pg) for pg in extras))
+                return
+            self._aux_page = chosen or extras[0]
+            # Same reason open_aux_tab focuses: the two drivers track tabs independently,
+            # and browser-use's RecordingWatchdog streams frames from ONE CDP session — an
+            # unaligned focus acts on, screenshots, and records the wrong tab.
+            await self._focus_browser_use(self._aux_page)
+            logger.info("adopted the tab this subtask announced, by %s (%s) — it survives "
+                        "into the next subtask",
+                        "the agent's focus" if chosen is not None else "elimination",
+                        _page_url(self._aux_page))
+        except Exception as exc:  # noqa: BLE001 - adoption is best-effort hygiene
+            logger.debug("adopt_announced_tab: %s", exc)
 
     def downloads_watermark(self) -> int:
         """Count of files the session has downloaded so far — segments window from here."""
@@ -900,7 +1096,12 @@ class HybridSession:
         dl_mark = self.downloads_watermark()
         page = self.current_page()
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
-                      context=context, mode="replay")
+                      context=context, mode="replay",
+                      # Report the node kind a REPLAY ran under too. It defaulted to
+                      # "action" here, which was invisible while only actions could
+                      # replay; now that loops cache, progress.json would have called
+                      # every replayed loop an action.
+                      kind=getattr(sub, "kind", "action"))
         if page is None:
             seg.error = "no open page to replay against"
             return seg
@@ -925,6 +1126,12 @@ class HybridSession:
         except Exception as exc:  # noqa: BLE001 - best-effort; replay proceeds anyway
             logger.debug("callout scroll pin injection skipped: %s", exc)
         outcome = await skills.execute(skill, page)
+        # Replay never sweeps tabs, so an announced tab already survives here — but
+        # unadopted it is nobody's page, and current_page() would hand the gate below (and
+        # the next subtask) the APP tab instead. Today no announced-tab subtask can reach
+        # this path (the OTP slice consumes noted data, and its prose-only code refuses the
+        # commit), which is exactly why the trap is worth closing before it can open.
+        await self.adopt_announced_tab(sub)
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         seg.replay = outcome
@@ -991,6 +1198,18 @@ class HybridSession:
             seg.duration_seconds = (datetime.now() - started).total_seconds()
             return seg
         finally:
+            # Order matters, and it is what makes every downstream measurement correct.
+            # Adoption resolves the page the agent FINISHED on and installs it as the aux
+            # page; the sweep then spares it, and current_page() hands that same page to
+            # all four page-dependent consumers — the end_context / url_contains / visible
+            # postconditions, the declared verify: checks, and the end_context committed to
+            # the library. Run 20260825_105115 seg 3 is what this ordering is for: the OTP
+            # handshake succeeded in the portal tab, adoption declined it (two extras, both
+            # the same tab opened twice by a replay's force-retry), the sweep took it, and
+            # the gate measured the app tab instead. Adoption asking the agent's focus is
+            # the fix; a fallback measurement bolted onto the gate was not, because the
+            # committed end_context read further out would still have been wrong.
+            await self.adopt_announced_tab(sub)
             await self.close_extra_tabs()
         history = out["history"]
         seg.steps_executed = history.number_of_steps()
@@ -1117,7 +1336,11 @@ def _step_value_candidates(steps: list[dict[str, Any]]) -> list[tuple[str, str]]
     out: list[tuple[str, str]] = []
     for step in steps:
         action = step.get("action")
-        if action in ("fill", "select"):
+        if action in ("fill", "select", "paste"):
+            # `paste` is a fill with a different delivery mechanism (agent_tools.paste_text
+            # for a value the page splits across several inputs), so its value is judged
+            # for provenance exactly like a typed one — that is what makes a pasted OTP
+            # bindable where six 1-character fills were not.
             out.append((str(step.get("value") or ""), "typed"))
         elif action == "type":
             out.append((str(step.get("text") or ""), "typed"))
@@ -1145,6 +1368,11 @@ def _unattributed_typed_values(steps: list[dict[str, Any]], prompt: str,
     for value, kind in _step_value_candidates(steps):
         value = value.strip()
         if kind != "typed" or len(value) < 3:
+            continue
+        if _NOTED_TOKEN.search(value):
+            # Already self-bound (_bind_self_noted): this step reads the live value an
+            # earlier step of the same recording captured, so it has the best provenance
+            # there is — it never types anything the run did not just observe.
             continue
         if value in flagged or value in out or _names_value(prompt, value):
             continue
@@ -1174,7 +1402,7 @@ def _drop_unattributable_fills(steps: list[dict[str, Any]], loose: list[str]
     for step in steps:
         key = "text" if step.get("action") == "type" else "value"
         value = str(step.get(key) or "").strip()
-        if step.get("action") in ("fill", "select", "type") and value in unwanted:
+        if step.get("action") in ("fill", "select", "type", "paste") and value in unwanted:
             dropped.append(value)
             continue
         kept.append(step)
@@ -1474,15 +1702,91 @@ def _bind_runtime_values(
         bindings[name] = spec
         replacements.append((value, "{{%s}}" % name))
 
-    def _sub_whole(text: str, literal: str, token: str) -> str:
-        # Boundary-safe: an occurrence flanked by alphanumerics is PART of some other
-        # value, not this literal — the house number '35' must never rewrite the
-        # unrelated Gross Pay '3500' into '{{bound_N}}00' (run 20260817_115232 replayed
-        # Gross Pay as 6300 exactly that way). Lambda replacement keeps the token
-        # immune to re.sub escape interpretation.
-        return re.sub(r"(?<![A-Za-z0-9])" + re.escape(literal) + r"(?![A-Za-z0-9])",
-                      lambda _m: token, text)
+    return tokenize_steps(steps, replacements), params, bindings
 
+
+def _sub_whole(text: str, literal: str, token: str) -> str:
+    # Boundary-safe: an occurrence flanked by alphanumerics is PART of some other
+    # value, not this literal — the house number '35' must never rewrite the
+    # unrelated Gross Pay '3500' into '{{bound_N}}00' (run 20260817_115232 replayed
+    # Gross Pay as 6300 exactly that way). Lambda replacement keeps the token
+    # immune to re.sub escape interpretation.
+    return re.sub(r"(?<![A-Za-z0-9])" + re.escape(literal) + r"(?![A-Za-z0-9])",
+                  lambda _m: token, text)
+
+
+# The SELF-scoped twin of a runtime binding (2026-08-26). _bind_runtime_values binds only
+# to values EARLIER segments produced, because a binding is resolved when the entry LOADS
+# and a segment's own extracts happen after that. A slice that both notes a value and uses
+# it — "click Get OTP, copy the 6 digit number ... paste it into the code box" — therefore
+# got no binding at all and codegen baked the authoring run's literal: run 20260826_095932
+# captured a fresh 776106 and pasted the dead 587923, and the segment still passed because
+# the URL is the same either side of the OTP wall.
+#
+# {{noted:<label>}} is the token that resolves at STEP-EXECUTION time instead: whichever
+# tier runs the step reads the label out of the live extract ledger the copy step just
+# filled (SkillApi.noted / script_compile.resolve_noted). It is not a param and not a
+# binding — there is nothing for the load path to resolve, so a self-noted entry replays
+# at zero tokens instead of authoring fresh every run.
+_NOTED_TOKEN = re.compile(r"\{\{noted:([A-Za-z0-9_]+)\}\}")
+
+
+def _bind_self_noted(steps: list[dict[str, Any]], extracted: dict[str, str],
+                     ) -> tuple[list[dict[str, Any]], list[str]]:
+    """Rewrite each typed value that equals a value THIS recording extracted at an EARLIER
+    step into {{noted:<label>}}. Returns (steps, labels bound).
+
+    VALUES only, never selectors: an element's identity must not become a runtime value.
+    ORDER matters — a label whose producing step comes after the consumer could not have
+    filled the ledger yet, so that value stays a literal and the ordinary provenance guards
+    judge it. Matching is case-insensitive (the app echoes 'BUTT GREEN' for 'Butt Green')
+    and boundary-safe via _sub_whole (the house-number lesson, run 20260817_115232)."""
+    # label -> index of the first step that produces it.
+    produced_at: dict[str, int] = {}
+    for i, step in enumerate(steps):
+        label = str(step.get("label") or "")
+        if step.get("action") in ("extract", "copy") and label:
+            produced_at.setdefault(label, i)
+    if not produced_at:
+        return steps, []
+    out: list[dict[str, Any]] = []
+    bound: list[str] = []
+    for i, step in enumerate(steps):
+        key = {"fill": "value", "paste": "value", "select": "value",
+               "type": "text"}.get(str(step.get("action")))
+        raw = str(step.get(key) or "") if key else ""
+        if not raw.strip():
+            out.append(step)
+            continue
+        new = raw
+        for label, at in produced_at.items():
+            src = str((extracted or {}).get(label) or "").strip()
+            if not src or at >= i:
+                continue
+            rewritten = _sub_whole_ci(new, src, "{{noted:%s}}" % label)
+            if rewritten != new:
+                new = rewritten
+                if label not in bound:
+                    bound.append(label)
+        if new == raw:
+            out.append(step)
+        else:
+            out.append({**step, key: new})
+    return out, bound
+
+
+def _sub_whole_ci(text: str, literal: str, token: str) -> str:
+    """_sub_whole, case-insensitively — the app renders a noted value in its own casing."""
+    return re.sub(r"(?<![A-Za-z0-9])" + re.escape(literal) + r"(?![A-Za-z0-9])",
+                  lambda _m: token, text, flags=re.IGNORECASE)
+
+
+def tokenize_steps(steps: list[dict[str, Any]],
+                   replacements: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    """Rewrite each (literal -> {{token}}) pair through a step list's values and
+    selectors. Split out of _bind_runtime_values so a recompiled recording can be
+    re-tokenized against an entry's EXISTING params — the same rewrite, never a
+    second implementation of it."""
     rewritten: list[dict[str, Any]] = []
     for step in steps:
         new_step = dict(step)
@@ -1499,7 +1803,72 @@ def _bind_runtime_values(
                 sels.append(sel)
             new_step["selectors"] = sels
         rewritten.append(new_step)
-    return rewritten, params, bindings
+    return rewritten
+
+
+def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | None:
+    """The document title to pin as this segment's end state, or None to pin nothing.
+
+    Why a title at all: a segment whose only effect is IN-PAGE has nothing else to prove it
+    worked. The OTP slice pasted a dead code, clicked Proceed Securely and PASSED — the
+    paste landed, the button was there, and the URL is identical either side of the wall
+    (run 20260826_095932). Three other channels were measured dead first: the response body
+    is never captured on acceptance (the page navigates and tears down before it can be
+    read — the ONLY body ever captured came from the rejected run), console/401 is identical
+    in both, and the recording's own url and tab count are byte-identical across the
+    deciding step. The title is not: the wall sets no <title> so it shows the raw URL, while
+    the accepted view shows "Acting Office - Live Test".
+
+    BOTH titles must be read LIVE — never from the recording. browser-use captures an item's
+    state before that item's actions, and this SPA updates document.title asynchronously, so
+    a recorded title can be a whole page stale: subtask 0's final `done` item records url
+    ".../rti/payrun" next to title "Dashboard - …". Pinning that false-failed a correct
+    segment on the first live run after it shipped.
+
+    Pinned conservatively — this is an ADDITIVE gate, and a false-fail here is worse than
+    the blind spot it closes:
+      - only when the title CHANGED across the segment (an unchanged title proves nothing);
+      - only when it has no digits, so a record ref or id can never be baked in. That rule
+        also makes the learn-on-replay path safe: the OTP wall's title is a raw URL full of
+        digits, so a false pass can never teach the gate the wrong title;
+      - never for a segment that closed its own page — its surviving title is the same coin
+        flip as its surviving url (see _recording_closed_its_page).
+    """
+    start = " ".join(str(start_title or "").split())
+    end = " ".join(str(end_title or "").split())
+    if not start or not end or start == end:
+        return None
+    if any(ch.isdigit() for ch in end):
+        return None
+    if record_path is not None and _recording_closed_its_page(record_path):
+        return None
+    return end
+
+
+def _recording_closed_its_page(path: Any) -> bool:
+    """Did the authoring history end with FEWER tabs than it had — i.e. did the segment
+    close the page it was working in?
+
+    The mirror of script_compile._stamp_opens_tab, which reads the same `state.tabs`
+    growth to spot a tab OPENING. Used at the commit site: a segment whose last
+    instruction closes its own page ("… click submit, and then close this tab") has no end
+    location, so whatever current_url() reports afterwards is an accident of which target
+    survived. Deciding that from the RECORDING rather than from the surviving URL is the
+    whole point — run 20260826_124837 survived on about:blank and run 130102 on the app's
+    own datarequests tab, and both are accidents of the same segment. A guard that only
+    rejected degenerate-LOOKING urls would have committed 130102's ordinary
+    '/paye/clients/*/datarequests' and failed every blank-survivor run after it.
+
+    Fails OPEN (unreadable -> False): guessing "closed" would silently drop a legitimate
+    postcondition gate, which is the more dangerous mistake.
+    """
+    try:
+        history = json.loads(Path(path).read_text()).get("history") or []
+    except Exception:  # noqa: BLE001 - never fail the commit path over a diagnosis
+        return False
+    counts = [len((item.get("state") or {}).get("tabs") or []) for item in history]
+    counts = [c for c in counts if c]          # items that recorded no tab list say nothing
+    return len(counts) >= 2 and counts[-1] < max(counts)
 
 
 def _recording_had_page_actions(path: Any) -> bool:
@@ -1562,7 +1931,8 @@ async def _author_segment(
     dirty: bool = False, prior_failure: str | None = None,
     findings: list[str] | None = None, commit: bool = True,
     run_values: dict[str, str] | None = None,
-    start_url: str | None = None, dynamic: bool = False,
+    start_url: str | None = None, start_title: str | None = None,
+    dynamic: bool = False,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
 
@@ -1633,6 +2003,7 @@ async def _author_segment(
     try:
         steps = save_steps(sstore.recording_path(sid), sstore.steps_path(sid),
                            max_steps=truncate_at, emit_start_goto=False,
+                           loop=getattr(sub, "kind", "action") == "loop",
                            # "exactly N clicks" wording pins a lone repeat cluster's
                            # count — the recorded count can be short one collapsed retry.
                            repeat_hint=repeat_hint_from_wording(sub.instantiated_prompt))
@@ -1661,6 +2032,20 @@ async def _author_segment(
                   f"{unanchorable[0].get('why', 'a step has no anchorable element')}; "
                   f"a recording must locate elements, never search for them")
             return seg
+        # Producer commit guard — the safety the node_kind producer rule depends on. A
+        # noting slice is cacheable only because its compiled EXTRACT step re-reads the
+        # page every replay; a recording that noted the value in prose alone carries no
+        # such step, so its replay would report nothing, the run's findings would go
+        # quiet, and every downstream consumer would fall through to replaying THIS run's
+        # stale values (the consumer gate keys on `bool(findings)`). Refuse instead: the
+        # slice authors live each run, exactly as it does today.
+        if produces_noted_data(sub.template_prompt) \
+                and not any(s.get("action") in ("extract", "copy") for s in steps):
+            sstore.steps_path(sid).unlink(missing_ok=True)
+            print(f"[*] segment [{sid}]: not cached — this step NOTES a value for later "
+                  f"steps but recorded no extract_data capture, so a replay would note "
+                  f"nothing and its consumers would replay stale values")
+            return seg
         # Provenance commit guard — the general, wording-free memory rule: a segment
         # that acted with values sourced from the run's FINDINGS consumed runtime data,
         # and a cached replay would re-use this run's values forever. Since 2026-07-24
@@ -1677,6 +2062,18 @@ async def _author_segment(
         # cached (run 20260814_100546). The create-write leg below already uses this
         # corpus; the findings leg now agrees with it.
         task_wording = " \n ".join([sub.instantiated_prompt, *completed, *remaining])
+        # SELF-scoped leg, FIRST: a value this recording extracted at an earlier step and
+        # then typed becomes {{noted:label}}, resolved when the step runs. It must precede
+        # every guard below — once the literal is a token it is neither an unattributable
+        # typed value nor something the load-time binder should try to resolve, and the
+        # merged OTP slice can finally cache instead of re-authoring (or, worse, caching
+        # the authoring run's dead code as it did through run 20260826_095932).
+        steps, self_noted = _bind_self_noted(steps, seg.extracted or {})
+        if self_noted:
+            _atomic_write(sstore.steps_path(sid), json.dumps(steps, indent=2))
+            print(f"[*] segment [{sid}]: value(s) this segment noted itself "
+                  f"({', '.join(self_noted)}) bound to the live extract -> replays with "
+                  f"each run's own fresh value")
         runtime_values = _findings_sourced_values(steps, task_wording, findings)
         # Findings-independent leg: values the run's own create-writes reported are
         # runtime data even when no finding names them (the findings channel goes
@@ -1723,7 +2120,11 @@ async def _author_segment(
                           f"{', '.join(v[:32] for v in dropped[:3])} from the recording "
                           f"(neither the task nor the page supplied them) -> replays with "
                           f"those fields left as the form defaults them")
-            if not runtime_values:
+            if not runtime_values and not self_noted:
+                # self_noted counts: those values ARE bound, just at step-execution time
+                # rather than at load time. Refusing over them sent the merged OTP slice
+                # back to the agent on every run that happened to carry an earlier
+                # finding (~240k tokens, 405s — run 20260826_091931).
                 sstore.steps_path(sid).unlink(missing_ok=True)
                 print(f"[*] segment [{sid}]: consumes noted data with no bindable runtime "
                       f"value in the recording -> not cached; future runs author it with "
@@ -1745,11 +2146,40 @@ async def _author_segment(
             print(f"[*] segment [{sid}]: runtime value(s) bound to this run's data -> "
                   f"replayable ({summary})")
         # An aux segment's pages are foreign origins, so its end context is host-qualified
-        # like its start context (current_url still reads the aux page here — the loop
-        # closes the helper tab only after the segment commits).
+        # like its start context. A DECLARED helper tab is still live here (the loop closes
+        # it only after the segment commits), but an ANNOUNCED tab that adopt_announced_tab
+        # declined has already been swept by agent_segment, so current_url() would read the
+        # app tab that survived. Committing THAT as end_context is worse than a failed
+        # segment: _gate_for turns a stored end_context into the next run's postcondition
+        # gate, so one such commit bakes a wrong gate into every future run of this subtask.
+        # Prefer the URL captured before the sweep, for the same reason the gate does.
         normalize = (sstore.normalize_aux_context if getattr(sub, "tab_url", None)
                      else sstore.normalize_context)
-        end_context = normalize(await hs.current_url())
+        raw_end_url = await hs.current_url()
+        # A segment that closed the page it worked in has NO end location, so there is
+        # nothing honest to pin. Two limbs, and the first is the load-bearing one:
+        #
+        #   1. the RECORDING says the tab count shrank. This is a fact about what the
+        #      segment did, not an observation of what happened to survive — and the
+        #      survivor is a coin flip: subtask 8 of run 20260826_124837 ended on
+        #      about:blank, run 130102 on the app's own datarequests tab. Judging by the
+        #      url's shape alone would have committed 130102's perfectly ordinary
+        #      '/paye/clients/*/datarequests' and then failed every blank-survivor run —
+        #      the same bug with the values swapped.
+        #   2. the surviving url names no location anyway (blank / unreadable / closed),
+        #      which also covers a page that died for an unrelated reason.
+        #
+        # Either way commit end_context=None explicitly rather than omitting the key:
+        # update_manifest merges, so None is what CLEARS a value an earlier poisoned
+        # commit left behind. _base_gate then falls through to Gate(kind="steps") — which
+        # is exactly what run 123706 did, and it passed.
+        if _is_degenerate_url(raw_end_url) \
+                or _recording_closed_its_page(sstore.recording_path(sid)):
+            end_context = None
+            print(f"[*] segment [{sid}]: ends by closing its own page -> no end context "
+                  f"pinned (judged on clean execution instead)")
+        else:
+            end_context = normalize(raw_end_url)
         if bound is not None:
             # A bound entry's template is written deterministically (params = the
             # authoring literals, bindings = their runtime sources); the LLM
@@ -1766,8 +2196,14 @@ async def _author_segment(
         manifest_fields: dict[str, Any] = dict(
             params=params or dict(sub.values or {}),
             context=context, end_context=end_context,
+            end_title=_pin_end_title(start_title, await hs.current_title(),
+                                     sstore.recording_path(sid)),
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
+        if self_noted:
+            # Self-describing, and the flag the stale-recording net reads: an entry that
+            # re-reads its own noted values types nothing from the authoring run.
+            manifest_fields["self_noted"] = self_noted
         if start_url:
             # The raw page the authoring run started from — informational (identity-fork
             # log lines point here); never navigated to automatically.
@@ -1846,6 +2282,7 @@ async def run_hybrid_task(
             # would split the identical helper procedure into one entry per hosting task.
             aux_url = getattr(sub, "tab_url", None)
             raw_start_url = aux_url or await hs.current_url()
+            raw_start_title = await hs.current_title()
             context = (sstore.normalize_aux_context(aux_url) if aux_url
                        else sstore.normalize_context(raw_start_url))
             sid = sstore.subtask_id(sub.template_prompt, context)
@@ -1904,10 +2341,13 @@ async def run_hybrid_task(
             seg: Segment | None = None
             skip_reason: str | None = None   # why this subtask did not replay
 
-            if is_dynamic and (entry or {}).get("bindings"):
+            if is_dynamic and ((entry or {}).get("bindings")
+                               or (entry or {}).get("self_noted")):
                 # The entry was committed WITH runtime bindings: its dynamic values
                 # re-resolve from THIS run's own data at load time, so the consumer-
-                # wording net stands down and the zero-LLM replay proceeds.
+                # wording net stands down and the zero-LLM replay proceeds. `self_noted`
+                # is the step-time twin — the entry re-reads a value its OWN earlier step
+                # captured this run, which is fresher still.
                 is_dynamic = False
 
             if is_dynamic and sstore.has_script(sid):
@@ -1957,16 +2397,23 @@ async def run_hybrid_task(
                                   "check": f'{probe.kind} "{probe.arg}"'},
                             skip_reason="probe_absent")
 
-                # Judge, loop, and conditional-guard nodes never touch the library in
-                # EITHER direction: a replayed judge would click through with nobody
-                # looking (hollow pass), a replayed loop would walk a fixed number of
-                # iterations and land anywhere, a replayed conditional would take its
-                # branch unconditionally — and their recordings must never be committed
-                # for the same reasons. Exception: a conditional WITH a declared probe
-                # is action-like on the TRUE path — the probe above already decided the
+                # Judge and conditional-guard nodes never touch the library in EITHER
+                # direction: a replayed judge would click through with nobody looking
+                # (hollow pass) and a replayed conditional would take its branch
+                # unconditionally — and their recordings must never be committed for the
+                # same reasons. Exception: a conditional WITH a declared probe is
+                # action-like on the TRUE path — the probe above already decided the
                 # branch is raised, so its recording replays/commits safely.
+                #
+                # LOOPS DO CACHE (user decision 2026-08-25). What the library stores is
+                # the iteration COUNT the authoring agent stopped at, and the user's
+                # position is that a recording replays in the same setting it was made
+                # in, so that count holds. Overshoot is already honest — repeat_click's
+                # readiness poll raises "the page likely stopped advancing" when the
+                # control runs out early. An UNDER-run (a longer list than the recording
+                # saw) stops quietly at the cached count; no guard was built for it, by
+                # decision.
                 if seg is None and not fresh and not force_author and not is_judge \
-                        and not is_loop \
                         and (not is_conditional or probe is not None) \
                         and not is_dynamic \
                         and sstore.has_script(sid):
@@ -1981,6 +2428,26 @@ async def run_hybrid_task(
                         if seg.ok:
                             from_template = bool((entry or {}).get("params"))
                             _promote_segment_heals(sid, seg, from_template=from_template)
+                            if not (entry or {}).get("end_title"):
+                                # Learn the end-title pin the same way heals are promoted.
+                                # An entry committed before this gate existed replays
+                                # forever and would never otherwise gain one — including
+                                # library/07044b6a0dbf7988, the OTP slice this was built
+                                # for. A replay that PASSED demonstrably reached the
+                                # intended end state, so the live title is trustworthy
+                                # (and better evidence than a recorded one, which lags —
+                                # see _pin_end_title). _pin_end_title's digit rule is what
+                                # makes it safe: a false pass leaves the page on the OTP
+                                # wall, whose title is a raw URL full of digits, so the
+                                # wrong title can never be learned.
+                                learned = _pin_end_title(
+                                    raw_start_title, await hs.current_title(),
+                                    sstore.recording_path(sid))
+                                if learned:
+                                    sstore.update_manifest(sid, sub.template_prompt,
+                                                           end_title=learned)
+                                    print(f"[*] subtask {i} [{sid}]: learned end title "
+                                          f"{learned!r} from this passing replay")
                             sstore.bump_meta(sid, uses=1)
                         else:
                             sstore.bump_meta(sid, fail_count=1)
@@ -2038,7 +2505,8 @@ async def run_hybrid_task(
                                 hs, sub, author_sid, context, gate, completed=completed,
                                 remaining=remaining, dirty=dirty, prior_failure=prior,
                                 findings=takeover_findings, run_values=run_values,
-                                start_url=raw_start_url, dynamic=is_consumer)
+                                start_url=raw_start_url,
+                                start_title=raw_start_title, dynamic=is_consumer)
                             seg.mode = "replay_failed->authored"
                             # Why the replay failed used to die with the rebound
                             # segment — stdout only, no artifact. Keep it on the record.
@@ -2064,10 +2532,6 @@ async def run_hybrid_task(
                         skip_reason = "judge"
                         print(f"[*] subtask {i} [{sid}]: judge node (verification) -> agent "
                               f"runs it live, never cached")
-                    elif is_loop:
-                        skip_reason = "loop"
-                        print(f"[*] subtask {i} [{sid}]: loop node (repeat-until) -> agent "
-                              f"runs it live with an extended step budget, never cached")
                     elif is_conditional and probe is None:
                         skip_reason = "conditional"
                         print(f"[*] subtask {i} [{sid}]: conditional branch guard -> agent "
@@ -2102,12 +2566,13 @@ async def run_hybrid_task(
                                                 completed=completed, remaining=remaining,
                                                 findings=findings, run_values=run_values,
                                                 start_url=raw_start_url,
+                                start_title=raw_start_title,
                                                 dynamic=is_consumer,
                                                 # A fallback blob never commits: a whole-
                                                 # task recording replayed blind is the
                                                 # pre-hybrid behavior this mode degrades
                                                 # FROM, not a library asset.
-                                                commit=not is_judge and not is_loop
+                                                commit=not is_judge
                                                 and (not is_conditional
                                                      or probe is not None)
                                                 and not getattr(sub, "fallback", False))

@@ -69,9 +69,16 @@ from automation.pipeline.script_compile import (
     FIELD_REFIND_JS as _FIELD_REFIND_JS,
     RAW_FIND_JS as _RAW_FIND_JS,
     RAW_TEXT_FIND_JS as _RAW_TEXT_FIND_JS,
+    GROUP_CLEAR_JS as _GROUP_CLEAR_JS,
+    GROUP_VALUES_JS as _GROUP_VALUES_JS,
+    PASTE_EVENT_JS as _PASTE_EVENT_JS,
+    _PASTE_MODIFIER,
     SCROLL_CONTAINERS_JS as _SCROLL_CONTAINERS_JS,
     SCROLL_TOPS_JS as _SCROLL_TOPS_JS,
+    paste_group_empty as _paste_group_empty,
+    paste_took as _paste_took,
     normalize_block_text,
+    CALLOUT_OPEN_FN_JS as _CALLOUT_OPEN_FN_JS,
     CALLOUT_SCROLL_PIN_JS as _CALLOUT_SCROLL_PIN_JS,
     REVEAL_CSS_JS as _REVEAL_CSS_JS,
     _RS_FILTER_ID,
@@ -82,23 +89,6 @@ logger = logging.getLogger("framework.tools")
 
 # Vendored axe-core, loaded once and injected into the page on demand.
 _AXE_PATH = Path(__file__).resolve().parent.parent / "assets" / "axe.min.js"
-
-# Live ground-truth probe for verify_save_registered. The Runner sets a closure per run
-# (returning the first successful create-write record, or None) and clears it afterwards;
-# built here as a holder so this module never has to import the runner.
-_SAVE_PROBE: Any = None
-
-
-def set_save_probe(fn) -> None:
-    """Install the per-run save probe (Runner only). `fn() -> dict | None`."""
-    global _SAVE_PROBE
-    _SAVE_PROBE = fn
-
-
-def clear_save_probe() -> None:
-    global _SAVE_PROBE
-    _SAVE_PROBE = None
-
 
 # Icon-font class tokens that carry an icon's meaning (Fluent `ms-Icon--Mail`, FontAwesome
 # `fa-envelope`, generic `icon-send`). The captured group is the semantic part.
@@ -188,6 +178,54 @@ def _norm_phrase(s: str) -> str:
     comparing a clicked element's name against the query that found it (and the same
     normalization RAW_FIND_JS ranks candidates with)."""
     return " ".join(t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t)
+
+
+# How far up the parent chain a wrapper duplicate can sit. A control wrapped in its own
+# padding/anchor/label divs is a handful of hops; anything deeper is a real container
+# that happens to hold nothing but this control, and collapsing it buys nothing.
+_NEST_WALK_DEPTH = 12
+
+
+def _node_key(node: Any) -> Any:
+    """Identity for comparing a snapshot node against a parent-chain node. The DOM ids
+    are the same objects in both, so `id()` suffices; backend_node_id is preferred when
+    present because it survives a re-wrapped node."""
+    backend = getattr(node, "backend_node_id", None)
+    return backend if backend is not None else id(node)
+
+
+def _collapse_nested_duplicates(
+        matches: list[tuple[int, Any, str]]) -> list[tuple[int, Any, str]]:
+    """Drop WRAPPER duplicates: when one candidate is an ancestor of another and both
+    carry the same normalized text, they are ONE control counted twice, not a choice.
+
+    Run 20260824_155123 seg 2: the app's "Get OTP" is a <div> holding a <div> with the
+    same text, so find_by_text('Get OTP', click_first=true) saw 2 candidates every time
+    and refused to click — the OTP was never fetched. Equal LABELS is what makes the
+    collapse safe: _matching_nodes labels an ancestor with all of its descendants' text,
+    so a row/section holding the control plus anything else reads differently and is
+    left alone.
+
+    Keeps the DEEPEST node of each chain: a click there bubbles up to every ancestor's
+    handler, while a click on the wrapper can miss a handler that lives on the inner
+    control (the <li>-around-<a> case the exact-label preference below was written for).
+    """
+    by_key = {_node_key(node): label for _, node, label in matches}
+    # Every candidate that some OTHER candidate sits inside, with the same text: those
+    # are the wrappers, and the one nobody wraps is the innermost control.
+    wrappers: set[Any] = set()
+    for _idx, node, label in matches:
+        wanted = _norm_phrase(label)
+        parent = getattr(node, "parent_node", None)
+        for _ in range(_NEST_WALK_DEPTH):
+            if parent is None:
+                break
+            key = _node_key(parent)
+            if key in by_key and _norm_phrase(by_key[key]) == wanted:
+                wrappers.add(key)
+            parent = getattr(parent, "parent_node", None)
+    kept = [m for m in matches if _node_key(m[1]) not in wrappers]
+    return kept or matches
 
 
 def _matching_nodes(state: Any, tokens: list[str]) -> list[tuple[int, Any, str]]:
@@ -543,6 +581,69 @@ async def _field_value(handle) -> str | None:
     return "" if value is None else str(value)
 
 
+# What copy_text last captured. paste_text with no `text` delivers this — the pair the
+# agent reaches for when a value shown on one page must be entered on another.
+_CLIPBOARD: dict[str, str] = {"value": "", "label": ""}
+
+async def _paste_reading(handle) -> dict[str, Any] | None:
+    """The target's own value plus its input GROUP's values, or None when unreadable.
+    See script_compile.GROUP_VALUES_JS for why the group matters."""
+    try:
+        return await _call_on_field(
+            handle, "function(){ return (%s)(this); }" % _GROUP_VALUES_JS)
+    except Exception as exc:  # noqa: BLE001 - an unreadable widget is not a failed paste
+        logger.debug("paste read-back failed: %s", exc)
+        return None
+
+
+async def _clear_paste_group(handle) -> None:
+    """Empty the target and its input group between rungs. A rung that lands PART of the
+    value poisons the next one: measured in chromium, Chrome's own paste command puts a
+    truncated "5" into a maxlength=1 box and distributes nothing, after which typing
+    appends to a full box. See script_compile.GROUP_CLEAR_JS for why a plain
+    `node.value = ''` will not do."""
+    try:
+        await _call_on_field(handle, "function(){ return (%s)(this); }" % _GROUP_CLEAR_JS)
+    except Exception as exc:  # noqa: BLE001 - the read-back still judges what happened
+        logger.debug("paste group clear failed: %s", exc)
+
+
+async def _clipboard_write(browser_session, text: str) -> bool:
+    """Put `text` on the real clipboard (best-effort). browser-use's profile already grants
+    clipboardReadWrite; the write still rejects when the document is not focused, which is
+    why every caller treats False as a degraded-but-fine outcome."""
+    try:
+        return bool(await _eval_js(
+            browser_session,
+            "navigator.clipboard.writeText(%s).then(function(){return true;},"
+            "function(){return false;})" % json.dumps(text),
+            await_promise=True))
+    except Exception as exc:  # noqa: BLE001 - clipboard is a convenience, never a gate
+        logger.debug("clipboard write failed: %s", exc)
+        return False
+
+
+async def _native_paste(handle) -> bool:
+    """Rung 2: ask Chrome to execute its own paste editing command, which produces a
+    genuine isTrusted paste event from the real clipboard — for widgets that ignore the
+    synthetic one. Requires the element to hold focus (rung 1 focused it)."""
+    cdp_session, _object_id = handle
+    try:
+        for event_type in ("keyDown", "keyUp"):
+            params: dict[str, Any] = {
+                "type": event_type, "key": "v", "code": "KeyV",
+                "windowsVirtualKeyCode": 86, "modifiers": _PASTE_MODIFIER,
+            }
+            if event_type == "keyDown":
+                params["commands"] = ["paste"]
+            await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
+                params=params, session_id=cdp_session.session_id)
+        return True
+    except Exception as exc:  # noqa: BLE001 - fall through to the keystroke rung
+        logger.debug("native paste command failed: %s", exc)
+        return False
+
+
 async def _field_connected(handle) -> bool | None:
     """Whether the element is still attached to a live document. False for a node an
     earlier action re-rendered away: its CDP object id keeps resolving, so fills and
@@ -578,18 +679,19 @@ async def _in_layer_popup(handle) -> bool:
 # the Add Data Request side PANEL owns the employee list whose rows only container
 # scrolling reveals (runs 20260814_105247 / 20260817_110501 / 20260817_133135), so a
 # guard that counted panels would kill the hunt those runs exist to protect.
-_CALLOUT_OPEN_JS = r"""
+#
+# The predicate itself comes from script_compile.CALLOUT_OPEN_FN_JS, shared with the scroll
+# pin (the protection) and RAW_FIND_JS (which skips its own scrollIntoView). This probe
+# drives the ADVICE half — refusing page-moving tools and gating the text hunt, so the agent
+# is told a scroll is pointless instead of silently getting a no-op. Advice and protection
+# only stay consistent while they ask the same question, and three hand-copied loops did not.
+_CALLOUT_OPEN_JS = """
 (function () {
   try {
-    var els = document.querySelectorAll('.ms-Callout'), n = 0;
-    for (var i = 0; i < els.length; i++) {
-      var r = els[i].getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) n++;
-    }
-    return { open: n };
+    return { open: (__CALLOUT_OPEN_FN__)() ? 1 : 0 };
   } catch (e) { return { error: String(e) }; }
 })()
-"""
+""".replace("__CALLOUT_OPEN_FN__", _CALLOUT_OPEN_FN_JS)
 
 
 async def _callout_open(browser_session) -> bool:
@@ -1250,7 +1352,18 @@ _DIALOG_SETTLE_S = 0.8
 _LIVE_NETWORK: Any = None
 _SEGMENT_T0: float = 0.0  # monotonic segment start (stamped with the collector)
 _FAIL_BOUNCED = False     # fail_and_stop's contradiction bounce fired this segment
+# Monotonic start of the most recent ACTING verb, so verify_save_registered can answer
+# "did MY last action write?" instead of "did anything write this segment?". The old
+# probe returned the segment's FIRST create-write, which saturates: across a 12-employee
+# list, employee 1's save vouched for save #3 forever (run 20260824_165824 seg 4 —
+# Aayan Dickson ended with two or three payments).
+_LAST_ACTION_T0: float = 0.0
 _WRITE_SNIFF_S = 1.0     # window (from click dispatch) for a triggered write to START
+# The verifier can wait longer than a click receipt: it is called deliberately, once, by an
+# agent that is ALREADY unsure, so a slow POST is worth waiting for — whereas widening
+# _WRITE_SNIFF_S would tax every click in every run. This is what keeps a real-but-late
+# write from reading as "no write" and inviting a duplicate re-entry.
+_VERIFY_SNIFF_S = 6.0
 _WRITE_SETTLE_S = 8.0    # cap on waiting for started writes to finish (matches the
                          # end-of-run in-flight-save poll)
 _BODY_POLL_S = 1.0       # extra grace for the async body capture after settle
@@ -1259,11 +1372,30 @@ _BODY_POLL_S = 1.0       # extra grace for the async body capture after settle
 def set_live_network(collector: Any) -> None:
     """Register the run's live NetworkCollector for click receipts (runner-owned).
     Marks the segment start, which windows the fail_and_stop contradiction bounce and
-    re-arms it (once per segment)."""
-    global _LIVE_NETWORK, _SEGMENT_T0, _FAIL_BOUNCED
+    re-arms it (once per segment), and clears the copy buffer.
+
+    The clipboard is segment-scoped for the same reason the rest of this state is: a
+    `paste_text(index)` with no `text` falls back to whatever `copy_text` last captured,
+    so a value left over from an EARLIER subtask would be pasted silently instead of the
+    step failing honestly. An OTP is the case that matters — it is captured in one slice,
+    consumed in the next, and is stale by the one after."""
+    global _LIVE_NETWORK, _SEGMENT_T0, _FAIL_BOUNCED, _LAST_ACTION_T0
     _LIVE_NETWORK = collector
     _SEGMENT_T0 = time.monotonic()
+    _LAST_ACTION_T0 = _SEGMENT_T0    # no action yet: the whole segment is the window
     _FAIL_BOUNCED = False
+    _CLIPBOARD.update(value="", label="")
+
+
+def _stamp_action() -> float:
+    """Mark now as the start of the current acting verb and return it.
+
+    Every acting verb already needed this timestamp for its own network receipt; recording
+    it module-side too is what lets verify_save_registered scope its answer to THIS action
+    rather than to the whole segment."""
+    global _LAST_ACTION_T0
+    _LAST_ACTION_T0 = time.monotonic()
+    return _LAST_ACTION_T0
 
 
 def clear_live_network() -> None:
@@ -1442,6 +1574,79 @@ def _writes_accepted(writes: list[dict[str, Any]]) -> bool:
     return good
 
 
+async def _verify_last_action_write() -> str:
+    """CONFIRMED / REFUSED / UNCONFIRMED for the writes fired since the last acting verb.
+
+    Three verdicts, not two, because the two-verdict vocabulary is what made a
+    client-staged save indistinguishable from a failed one: "NOT REGISTERED — save again"
+    on a save that had actually committed is a duplicate-add instruction. Run
+    20260824_165824 seg 4 spent three Saves on Aayan Dickson that way.
+
+    Shares `_await_writes` with the click receipt, differing only in the START window
+    (_VERIFY_SNIFF_S, far longer than a receipt can afford). The shared helper is what
+    guarantees the response BODY has landed before `_writes_accepted` rules: an earlier
+    hand-rolled copy of the polling here skipped that phase, and a 2xx whose body says
+    "already submitted" then read as CONFIRMED — the one verdict this tool must never get
+    wrong, since the agent calls it precisely when it is unsure."""
+    t0 = _LAST_ACTION_T0
+    try:
+        writes = await _await_writes(_LIVE_NETWORK, t0, _VERIFY_SNIFF_S)
+        if not writes:
+            return ("UNCONFIRMED: no write request fired since your last action. This is NOT "
+                    "proof of failure — some saves in this app commit without any network "
+                    "traffic. Look for the record on the page (the new row, the updated "
+                    "total) and treat THAT as the answer. Do NOT re-enter the data just "
+                    "because this tool did not say CONFIRMED: if the save did land, a second "
+                    "entry creates a DUPLICATE record.")
+        if _writes_accepted(writes):
+            return (f"CONFIRMED: the server accepted your last action's write "
+                    f"({'; '.join(_format_write(w) for w in writes[:2])}). It is saved — do "
+                    f"NOT repeat it.")
+        # Fired but not accepted: name what the server actually said, so a retry fixes the
+        # cause instead of resubmitting the same body.
+        detail = "; ".join(_format_write(w) for w in writes[:2])
+        return (f"REFUSED: your last action DID reach the server and it did not accept the "
+                f"write ({detail}). Read that verdict, fix what it names (validation errors "
+                f"on the form, a duplicate the server already holds), and only then save "
+                f"again. If it says the record already exists, it is SAVED — do not retry.")
+    except Exception as exc:  # noqa: BLE001 - a verifier must never crash the run
+        logger.debug("last-action write verification failed: %s", exc)
+        return ("UNCONFIRMED: the write probe failed, so this tool cannot tell you anything "
+                "either way. Verify the record on the page; do not re-enter data blindly.")
+
+
+async def _await_writes(collector: Any, t0: float, sniff_s: float) -> list[dict[str, Any]]:
+    """The write records fired since `t0`, waited out in three phases: for one to START
+    (`sniff_s`), for the started ones to SETTLE (_WRITE_SETTLE_S), and for their JSON
+    BODIES to land (_BODY_POLL_S).
+
+    All three phases matter to the verdict, and the third is the easy one to forget:
+    `_write_verdict` reads `record["body"]`, so without the body wait `_writes_accepted`
+    calls a settled 2xx whose body is a REFUSAL accepted — the "FPS already submitted"
+    shape. Every deadline is measured from `t0`, not from entry: a caller reached after an
+    agent-step boundary has already spent that budget in real time, and re-spending it is
+    pure dead wall clock.
+    """
+    writes = collector.writes_since(t0)
+    while not writes and time.monotonic() - t0 < sniff_s:
+        await asyncio.sleep(0.15)
+        writes = collector.writes_since(t0)
+    if not writes:
+        return []
+    while any(not w["settled"] for w in writes) \
+            and time.monotonic() - t0 < _WRITE_SETTLE_S:
+        await asyncio.sleep(0.2)
+        writes = collector.writes_since(t0)
+    body_deadline = t0 + _WRITE_SETTLE_S + _BODY_POLL_S
+    while time.monotonic() < body_deadline and any(
+            w["settled"] and "body" not in w["record"]
+            and "json" in str((w["record"].get("response_headers") or {})
+                              .get("content-type", "")).lower()
+            for w in writes):
+        await asyncio.sleep(0.1)
+    return writes
+
+
 async def _network_outcome(collector: Any, t0: float,
                            expect_write: bool) -> tuple[str, bool, bool]:
     """(receipt suffix, fired, accepted) for the write requests a click fired — suffix
@@ -1449,10 +1654,7 @@ async def _network_outcome(collector: Any, t0: float,
     settle and their bodies to land — the condition the agent used to approximate with
     blind sleeps. `accepted` is _writes_accepted over the settled records."""
     try:
-        writes = collector.writes_since(t0)
-        while not writes and time.monotonic() - t0 < _WRITE_SNIFF_S:
-            await asyncio.sleep(0.15)
-            writes = collector.writes_since(t0)
+        writes = await _await_writes(collector, t0, _WRITE_SNIFF_S)
         if not writes:
             # Observation, not verdict: dialog saves can legitimately fire no request
             # (client-staged, websocket, beacon — run 20260810_092500's expense dialog),
@@ -1462,17 +1664,6 @@ async def _network_outcome(collector: Any, t0: float,
                      "failure: if this was a save/submit, check the page for the "
                      "change and only redo it if it is genuinely absent."
                      if expect_write else ""), False, False)
-        while any(not w["settled"] for w in writes) \
-                and time.monotonic() - t0 < _WRITE_SETTLE_S:
-            await asyncio.sleep(0.2)
-            writes = collector.writes_since(t0)
-        body_deadline = time.monotonic() + _BODY_POLL_S
-        while time.monotonic() < body_deadline and any(
-                w["settled"] and "body" not in w["record"]
-                and "json" in str((w["record"].get("response_headers") or {})
-                                  .get("content-type", "")).lower()
-                for w in writes):
-            await asyncio.sleep(0.1)
         parts = [_format_write(w) for w in writes[:3]]
         more = f" (+{len(writes) - 3} more write requests)" if len(writes) > 3 else ""
         text = " — this click fired " + "; ".join(parts) + more + "."
@@ -1584,6 +1775,20 @@ def _with_write_outcome(meta: dict[str, Any] | None,
     if outcome is None:
         return meta
     return {**(meta or {}), "write_outcome": outcome}
+
+
+def _stamp_interacted(meta: dict[str, Any] | None, node: Any) -> dict[str, Any] | None:
+    """Record the element a click acted on in the result metadata, WITHOUT replacing
+    siblings — the compiler reads metadata["interacted_element"] when browser-use's own
+    post-action snapshot carries none. An existing stamp always wins (find_by_text has
+    already named the exact node it clicked), and a capture failure is a no-op: None-in
+    stays None-out so unstamped results are byte-identical."""
+    if node is None or (isinstance(meta, dict) and meta.get("interacted_element")):
+        return meta
+    captured = _captured_element(node, "")
+    if not captured:
+        return meta
+    return {**(meta or {}), "interacted_element": captured}
 
 
 async def _click_outcome_suffix(browser_session, t0: float,
@@ -1715,7 +1920,7 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
     if node is not None and _is_anonymous_toggle(node):
         row_label = await _row_context_label(browser_session, node)
     pre = await _dialog_state(browser_session, node) if node is not None else None
-    t0 = time.monotonic()
+    t0 = _stamp_action()
     res = await builtin_click(params=params, browser_session=browser_session)
     if res is None or getattr(res, "error", None) \
             or not getattr(res, "extracted_content", None):
@@ -1725,13 +1930,24 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
         # In FRONT of the network/dialog outcome: the row identity is what the agent
         # must check against the employee it MEANT to tick.
         suffix = f' — in row "{row_label}"' + suffix
-    if not suffix and outcome is None:
+    meta = getattr(res, "metadata", None)
+    # Stamp WHAT we clicked. browser-use fills state.interacted_element from the snapshot
+    # it takes AFTER the action, which is empty when the click switched tabs: the
+    # external-link click that opens the OTP tab recorded [null, null, null], and
+    # compile's `elif name == "click" and element:` then dropped the one load-bearing
+    # click of that segment without a word (run 20260825_090938). `node` is the PRE-click
+    # element, so the stamp always names what we actually acted on. Same shape (and same
+    # reason) as find_by_text's stamp.
+    merged = _stamp_interacted(meta, node)
+    merged = _with_write_outcome(merged, outcome)
+    if not suffix and merged is meta:
         return res
-    update: dict[str, Any] = {"extracted_content": res.extracted_content + suffix}
-    if getattr(res, "long_term_memory", None):
-        update["long_term_memory"] = res.long_term_memory + suffix
-    merged = _with_write_outcome(getattr(res, "metadata", None), outcome)
-    if merged is not None:
+    update: dict[str, Any] = {}
+    if suffix:
+        update["extracted_content"] = res.extracted_content + suffix
+        if getattr(res, "long_term_memory", None):
+            update["long_term_memory"] = res.long_term_memory + suffix
+    if merged is not meta:
         # model_copy REPLACES the metadata field wholesale — merged carries the siblings.
         update["metadata"] = merged
     return res.model_copy(update=update)
@@ -1770,6 +1986,7 @@ def build_tools() -> Tools:
         param_model=InputTextAction,
     )
     async def input(params: InputTextAction, browser_session=None) -> ActionResult:
+        _stamp_action()   # verify_save_registered windows on the LAST acting verb
         node = await browser_session.get_element_by_index(params.index)
         if node is None:
             msg = (f"Element index {params.index} not available - page may have changed. "
@@ -1922,6 +2139,7 @@ def build_tools() -> Tools:
     )
     async def select_dropdown(params: SelectDropdownOptionAction,
                               browser_session=None) -> ActionResult:
+        _stamp_action()   # verify_save_registered windows on the LAST acting verb
         node = await browser_session.get_element_by_index(params.index)
         if node is None:
             msg = (f"Element index {params.index} not available - page may have changed. "
@@ -2041,6 +2259,7 @@ def build_tools() -> Tools:
     @tools.action(_builtin_send_keys.description,
                   param_model=_builtin_send_keys.param_model)
     async def send_keys(params, browser_session=None) -> ActionResult:
+        _stamp_action()   # Enter here commits forms, so this verb can fire the save
         keys = str(getattr(params, "keys", "") or "")
         if any(k.strip().lower() in _PAGE_SCROLL_KEYS
                for k in keys.replace("+", " ").split()):
@@ -2087,6 +2306,150 @@ def build_tools() -> Tools:
                    "still not on screen it is NOT in this list.")
         logger.info("📜 %s", msg)
         return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
+
+    @tools.action(
+        "Copy the element at `index` to the clipboard and remember it under `label` (short "
+        "snake_case role name, e.g. otp, reference_no). Use it when a value the page SHOWS "
+        "has to be entered somewhere else, then deliver it with paste_text — the pair "
+        "keeps the value out of your own retyping, and future replays re-read it fresh. "
+        "Read-only: clicks nothing, changes nothing."
+    )
+    async def copy_text(index: int, label: str, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        slug = re.sub(r"[^a-z0-9_]+", "_", (label or "").strip().lower()).strip("_") or "value"
+        if browser_session is None:
+            return ActionResult(error="copy_text: BrowserSession not injected")
+        node = await browser_session.get_element_by_index(index)
+        if node is None:
+            return ActionResult(error=f"copy_text: element index {index} is not available "
+                                      f"— re-read the page and use a current index.")
+        handle = await _field_handle(browser_session, node)
+        value = normalize_block_text(await _field_value(handle) or "") if handle else ""
+        if not value:
+            # No metadata on a miss, exactly as extract_data: a valueless copy must compile
+            # to NOTHING rather than to a step that fails every replay.
+            msg = (f"copy_text: element {index} has no readable text, so NOTHING was "
+                   f"copied. Point at the element that SHOWS the value.")
+            logger.info("📋 %s", msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                include_in_memory=True)
+        _CLIPBOARD.update(value=value, label=slug)
+        on_clipboard = await _clipboard_write(browser_session, value)
+        msg = f"copy_text: {slug} = '{value[:200]}'"
+        if not on_clipboard:
+            # Honest, and harmless: paste_text delivers from the remembered value, and it
+            # re-seeds the real clipboard itself when it needs the native rung.
+            msg += " (the system clipboard refused the write; paste_text still has it)"
+        logger.info("📋 %s", msg)
+        return ActionResult(
+            extracted_content=msg, long_term_memory=msg, include_in_memory=True,
+            # The extract channel: the value joins run_values/values.json exactly as an
+            # extract_data capture does, so a later segment's binding can resolve against it.
+            metadata={"extract": {"label": slug, "value": value, "query": f"index {index}",
+                                  "interacted_element": _captured_element(node, "")},
+                      "interacted_element": _captured_element(node, ""),
+                      "no_click": True},
+        )
+
+    @tools.action(
+        "Paste a whole value into the element at `index`. Use it when ONE value is split "
+        "across SEVERAL inputs — a 6-box one-time code, a PIN, date parts: click the first "
+        "box, then paste the complete value here and the widget spreads it across the "
+        "boxes. Pass `text` to paste that, or leave it empty to paste what copy_text last "
+        "captured. For an ordinary single field keep using input."
+    )
+    async def paste_text(index: int, text: str = "", browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        _stamp_action()   # verify_save_registered windows on the LAST acting verb
+        target = (text or "").strip() or _CLIPBOARD.get("value", "")
+        if not target:
+            return ActionResult(error="paste_text: nothing to paste — pass `text`, or call "
+                                      "copy_text first to capture the value.")
+        if browser_session is None:
+            return ActionResult(error="paste_text: BrowserSession not injected")
+        node = await browser_session.get_element_by_index(index)
+        if node is None:
+            return ActionResult(error=f"paste_text: element index {index} is not available "
+                                      f"— re-read the page and use a current index.")
+        if _is_dropdown_filter(node):
+            # Same trap as a typed fill: text put into a combobox filter selects NOTHING.
+            ident = await _dropdown_descriptor(browser_session, node)
+            msg = (f"REFUSED — did NOT paste '{target}': element {index} is a "
+                   f"dropdown/combobox filter{(' (' + ident + ')') if ident else ''}, and "
+                   f"filter text selects nothing. Call select_dropdown(index={index}, "
+                   f"text='{target}') instead.")
+            logger.info("⛔ %s", msg)
+            return ActionResult(error=msg, metadata={"no_fill": True})
+        handle = await _field_handle(browser_session, node)
+        if handle is None:
+            return ActionResult(error=f"paste_text: could not reach element {index} in the "
+                                      f"live DOM, so nothing was pasted.",
+                                metadata={"no_fill": True})
+        if await _field_connected(handle) is False:
+            # The node an earlier action in THIS step re-rendered away: pasting into it
+            # would read back clean while the visible widget never changed.
+            return ActionResult(error=f"paste_text: element {index} has left the page (it "
+                                      f"was re-rendered), so nothing was pasted. Re-read "
+                                      f"the page and paste into the current element.",
+                                metadata={"no_fill": True})
+        # The rung ladder, mirroring script_compile._paste_into step for step so a replay
+        # delivers the value exactly as the recording did. Each rung is judged by READING
+        # THE WIDGET BACK — never by its own return value, since a handler that CONSUMED a
+        # paste reports the same "prevented" as one that ignored it — and the group is
+        # cleared between rungs so a partial landing cannot poison the next.
+        landed, rung, shows = False, "", ""
+        try:
+            await _call_on_field(
+                handle, "function(t){ return (%s)(this, t); }" % _PASTE_EVENT_JS, [target])
+        except Exception as exc:  # noqa: BLE001 - a rung that throws is a rung that failed
+            logger.debug("synthetic paste failed: %s", exc)
+        await asyncio.sleep(0.15)
+        landed, shows = _paste_took(target, await _paste_reading(handle))
+        if landed:
+            rung = "paste event"
+        if not landed:
+            # Rung 2: real per-character key events. Ahead of the browser paste command on
+            # purpose — a widget that advances focus box-to-box as you type fills correctly
+            # with no paste handler at all, typing cannot truncate the way a paste into a
+            # maxlength=1 box does, and it needs neither a clipboard permission nor a
+            # secure origin.
+            await _clear_paste_group(handle)
+            try:
+                keys = browser_session.event_bus.dispatch(SendKeysEvent(keys=target))
+                await keys
+                await keys.event_result(raise_if_any=True, raise_if_none=False)
+            except Exception as exc:  # noqa: BLE001 - reported by the read-back below
+                logger.debug("keystroke paste failed: %s", exc)
+            await asyncio.sleep(0.15)
+            landed, shows = _paste_took(target, await _paste_reading(handle))
+            if landed:
+                rung = "keystrokes"
+        if not landed:
+            # Rung 3: Chrome's own paste command — a genuine isTrusted event from the real
+            # clipboard, for a widget that distributes on paste and rejects both of the
+            # above. Measured to fill a six-box isTrusted-only widget that neither other
+            # rung could.
+            await _clear_paste_group(handle)
+            if await _clipboard_write(browser_session, target) and await _native_paste(handle):
+                await asyncio.sleep(0.15)
+                landed, shows = _paste_took(target, await _paste_reading(handle))
+                if landed:
+                    rung = "browser paste"
+        if not landed:
+            # ERROR channel so multi_act stops: a queued Proceed/Save must never fire on a
+            # field that did not take the value.
+            msg = (f"paste_text: '{target}' did NOT land in element {index} — it now shows "
+                   f"'{shows}'. Do NOT report this field as set. Click the FIRST box of the "
+                   f"widget and paste again, or enter the value one character per box.")
+            logger.info("⛔ %s", msg)
+            return ActionResult(error=msg, metadata={"no_fill": True})
+        msg = f"Pasted '{target}' into element {index} via {rung} (the widget now shows '{shows}')"
+        logger.info("📋 %s", msg)
+        return ActionResult(
+            extracted_content=msg, long_term_memory=msg,
+            # `paste.value` is what compile records as the step's value, so the provenance
+            # binder sees the WHOLE value and can bind it to the run data it came from.
+            metadata={"paste": {"value": target, "rung": rung},
+                      "interacted_element": _captured_element(node, "")},
+        )
 
     @tools.action(
         "Find interactive elements matching `text`, searched in a FRESH page snapshot. Matches "
@@ -2279,6 +2642,12 @@ def build_tools() -> Tools:
             return ActionResult(extracted_content=msg, long_term_memory=msg,
                                 include_in_memory=True, metadata={"no_click": True})
 
+        # One control wrapped in same-text divs is not an ambiguity — collapse it first,
+        # so the exact-label preference and the single-match click below see the real
+        # candidate count (see _collapse_nested_duplicates).
+        if click_first and len(matches) > 1:
+            matches = _collapse_nested_duplicates(matches)
+
         # Exact-label preference: 'Inputs' matches both the link AND its parent <li> container;
         # when exactly one candidate's own label/aria-label/id equals the query, that is the
         # intended target — click it despite the partial matches.
@@ -2354,7 +2723,7 @@ def build_tools() -> Tools:
                     logger.info("🔎 %s", msg)
                     return ActionResult(error=msg, metadata={"no_click": True})
             pre = await _dialog_state(browser_session, node)
-            t0 = time.monotonic()
+            t0 = _stamp_action()
             try:
                 event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
                 await event
@@ -2389,10 +2758,12 @@ def build_tools() -> Tools:
         shown = matches[:25]
         lines = [_line(idx, node, label) for idx, node, label in shown]
         tail = "" if len(matches) <= 25 else f"\n...and {len(matches) - 25} more — narrow your text."
+        ambiguous = click_first and len(matches) > 1
         guidance = (
-            f"Ambiguous: {len(matches)} candidates. Do NOT call find_by_text('{query}') again — "
-            "pick the right index from the list above and click(index) NOW."
-            if click_first and len(matches) > 1
+            f"Ambiguous: {len(matches)} candidates, so NOTHING WAS CLICKED. Do NOT call "
+            f"find_by_text('{query}') again — pick the right index from the list above "
+            "and click(index) NOW."
+            if ambiguous
             else "Click your target with click(index) NOW — indexes are fresh but go stale on re-render."
         )
         content = (
@@ -2403,9 +2774,19 @@ def build_tools() -> Tools:
             f"find_by_text('{query}'): {len(matches)} match(es); "
             + "; ".join(f"index={idx} <{node.tag_name}> '{label[:40]}'" for idx, node, label in shown[:5])
         )
-        logger.info("🔎 find_by_text('%s'): %d match(es)", query, len(matches))
+        logger.info("🔎 find_by_text('%s'): %d match(es)%s", query, len(matches),
+                    " — ambiguous, nothing clicked" if ambiguous else "")
         # no_click: a candidate LISTING — the agent clicks by index next; compiling this
         # result as a find_click would bake a phantom duplicate click into the recording.
+        if ambiguous:
+            # ERROR channel: a click_first that clicked NOTHING is a refusal, and
+            # multi_act stops the step's remaining queued actions on an error. On the
+            # success channel it did not: run 20260824_155123 seg 2 batched
+            # find_by_text('Get OTP', click_first) with a follow-up click(index) picked
+            # from the PREVIOUS snapshot; the refusal left the page unchanged, the stale
+            # click fired anyway onto the panel's nameless close button, and the Payroll
+            # Review panel was lost — twice, in the same run.
+            return ActionResult(error=content, metadata={"no_click": True})
         return ActionResult(extracted_content=content, long_term_memory=memory,
                             include_in_memory=True, metadata={"no_click": True})
 
@@ -2542,31 +2923,31 @@ def build_tools() -> Tools:
         )
 
     @tools.action(
-        "Ground truth for saves: check whether the record you tried to save actually reached the "
-        "server in this run (a successful create-write request was observed on the network). Call "
-        "this after clicking the final Save on a create form. CONFIRMED means the save is real; "
-        "NOT REGISTERED means the Save did not go through — fix the form's validation errors and "
-        "save again. Read-only — changes nothing."
+        "Ground truth for saves: did YOUR LAST ACTION write to the server? Call this right "
+        "after clicking the final Save. CONFIRMED means the server accepted the write — "
+        "proceed. REFUSED means it fired and the server rejected it — fix what the message "
+        "says, then save again. UNCONFIRMED means no write was seen, which is NOT proof of "
+        "failure (some saves in this app commit without network traffic): look for the record "
+        "on the page, and do not re-enter the data just because this tool did not say "
+        "CONFIRMED. Read-only — changes nothing."
     )
     async def verify_save_registered() -> ActionResult:
-        if _SAVE_PROBE is None:
-            msg = "Save verification is not available for this run; verify via the UI instead."
-            return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
-        try:
-            write = _SAVE_PROBE()
-        except Exception as exc:  # noqa: BLE001 - a probe failure must never crash the run
-            logger.warning("verify_save_registered probe failed: %s", exc)
-            return ActionResult(error=f"verify_save_registered failed: {exc}")
-        if write:
-            url_tail = str(write.get("url", ""))[-80:]
-            msg = (f"CONFIRMED: the save reached the server "
-                   f"({write.get('method')} ...{url_tail}, agent step {write.get('step')}). Proceed.")
-        else:
-            msg = ("NOT REGISTERED: no create-write has hit the server — the Save did NOT go "
-                   "through. The form almost certainly shows validation errors (required fields, "
-                   "invalid values, missing item selection). Find the error messages on the form, "
-                   "fix those exact fields, and save again. Do NOT report success until "
-                   "this tool returns CONFIRMED.")
+        # Windowed to the LAST ACTION, from the live collector the click receipts already
+        # use. The previous implementation asked a marker-gated probe (_SAVE_PROBE) for the
+        # segment's FIRST create-write, which (a) was never installed for a task that
+        # declares no marker — it answered "not available for this run; verify via the UI
+        # instead", which is how the agent ended up eyeballing search_page and re-entering
+        # a payment it had already saved (run 20260824_165824 seg 4) — and (b) saturated
+        # once any save landed, so save #1 vouched for save #3.
+        #
+        # There is no fallback branch because there is no reachable state for one:
+        # runner.py installs the live collector under `if network_collector is not None`
+        # and the marker probe under the strictly stronger `if success_marker and
+        # network_collector is not None`, tearing both down together — so a live-collector
+        # miss means no collector at all, and nothing to verify against.
+        msg = (await _verify_last_action_write() if _LIVE_NETWORK is not None
+               else "Save verification is not available for this run; verify via the UI "
+                    "instead.")
         logger.info("🧾 %s", msg.split(".")[0])
         return ActionResult(extracted_content=msg, long_term_memory=msg, include_in_memory=True)
 

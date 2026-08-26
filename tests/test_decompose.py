@@ -345,9 +345,15 @@ def test_node_kind_heuristic():
     # Verification wording -> judge (cognitive: always LLM, never cached).
     assert decompose.node_kind("verify the CC field matches", None) == "judge"
     assert decompose.node_kind("Check that the mail is not sent", None) == "judge"
-    assert decompose.node_kind("note the currently selected option", None) == "judge"
+    # "remember that mail" is not producer wording (_PRODUCES_NOTED_RE wants a
+    # determiner it can bind a value to: "remember THE mail"), so the judge net holds it.
     assert decompose.node_kind("remember that mail", None) == "judge"
-    assert decompose.node_kind("capture the names of both users", None) == "judge"
+    # ...but bare NOTING is an action now, not a judge: nothing here is compared, and a
+    # replayed extract step re-reads the value live. See
+    # test_producer_wording_is_an_action_not_a_judge. Add any verification verb and both
+    # go back to judge (test_verification_wording_still_judges).
+    assert decompose.node_kind("note the currently selected option", None) == "action"
+    assert decompose.node_kind("capture the names of both users", None) == "action"
     assert decompose.node_kind("Confirm that the dropdown updates", None) == "judge"
     assert decompose.node_kind("make sure the panel opens", None) == "judge"
     assert decompose.node_kind("see if the icon works", None) == "judge"
@@ -451,6 +457,19 @@ def test_node_kind_loop_detection():
         "Then click Save & Next for the next 14 employees in the same way: exactly "
         "14 more clicks, waiting for the next employee to fully load after each "
         "click.", None) == "action"
+    # A MULTI-STEP iteration reads the same to the classifier as a single-click one, and
+    # the "rest of the employees" phrasing carries neither cue — run 20260824_165824 filled
+    # employee 1's three portal dialogs, clicked Next once, and closed the tab on employee
+    # 2's freshly loaded empty form, exactly as the wording said.
+    assert decompose.node_kind(
+        "click the + button next to payment, enter 4000 in the amount field, click Save. "
+        "Click Next for rest of the employees. Close this tab.", None) == "action"
+    assert decompose.node_kind(
+        "Now do this for each employee in the numbered list on the left, starting with "
+        "the one already open: click the + button next to payment, enter 4000 in the "
+        "amount field, click Save. Then click Next to load the following employee and "
+        "repeat all of the above for them, until every employee in that list has been "
+        "done. Then close this tab.", None) == "loop"
     # Marker precedence is unchanged: machine ground truth caches safely.
     assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
     assert decompose.node_kind(LOOP_ALAN, "Payroll") == "action"
@@ -717,3 +736,90 @@ async def test_spec_declared_probe_reaches_subtasks_and_cache_drops_it(library):
     assert cached and all("probe" not in d for d in cached["subtasks"])
     rebuilt = decompose._build_subtasks(cached["subtasks"], None, trust_kind=False)
     assert all(s.probe is None for s in rebuilt)
+
+
+# ------------------- producer wording is an action, not a judge -------------------
+# The asymmetry this closes: the identity slice and the OTP slice carry the SAME judge
+# phrase ("note and remember") and do the SAME job — capture a value later slices consume.
+# The identity slice classified action only because it names an absolute URL, so the
+# tab_url short-circuit fired before the judge regex was reached; the in-app OTP slice fell
+# through to judge and paid 176s / 140k tokens re-observing itself every run
+# (20260824_165824). The carve-out was always this rule, scoped to a foreign origin.
+
+_OTP_SLICE = ("Now go to Data Request, and on the top row (S.No. 1, the newest request) "
+              "click the ref. no. to open the Payroll Review panel, and click Get OTP, "
+              "note and remember the OTP, close the review panel.")
+_IDENTITY_SLICE = ("Open a new tab and go to https://www.fakenamegenerator.com/"
+                   "gen-male-gd-uk.php. From the generated identity, note and remember "
+                   "exactly these details for use in all later steps: the Name, the "
+                   "Gender (Male), the Address, and the Date of Birth.")
+
+
+def test_producer_wording_is_an_action_not_a_judge():
+    assert decompose.node_kind(_OTP_SLICE, None) == "action"
+    # Same wording, same verdict, with and without the aux-tab short-circuit.
+    assert decompose.node_kind(_IDENTITY_SLICE, None) == "action"
+    assert decompose.node_kind(
+        _IDENTITY_SLICE, None,
+        tab_url="https://www.fakenamegenerator.com/gen-male-gd-uk.php") == "action"
+    assert decompose.produces_noted_data(_OTP_SLICE)
+    assert decompose.produces_noted_data(_IDENTITY_SLICE)
+
+
+def test_copy_wording_is_a_producer_now_that_copy_text_captures():
+    """2026-08-25: the OTP producer slice was reworded to "click Get OTP, copy the 6 digit
+    number (OTP)". `copy` was not a noting verb, so produces_noted_data returned False and
+    the commit guard that refuses to cache a producer whose recording carries no capture
+    step never ran — a run that copied nothing would have cached a producer that notes
+    nothing, leaving every consumer's binding unresolvable. copy_text stamps the same
+    extract channel extract_data does, so copying IS noting."""
+    copy_slice = ("Now go to Data Request, and on the top row (S.No. 1, the newest "
+                  "request) click the ref. no. to open the Payroll Review panel, and "
+                  "click Get OTP, copy the 6 digit number (OTP), close the review panel.")
+    assert decompose.produces_noted_data(copy_slice)
+    assert decompose.node_kind(copy_slice, None) == "action"
+    # A producer is still NOT a consumer without an unambiguous consumer phrase.
+    assert not decompose.consumes_noted_data(copy_slice)
+    # ...and the widening reaches only the noting shape: an ordinary click is untouched.
+    assert not decompose.produces_noted_data("click Save and close the dialog")
+
+
+def test_the_paste_consumer_slice_still_consumes():
+    """Its counterpart: the reworded consumer must keep every classification the loop
+    reads off it — announced tab included, or close_extra_tabs sweeps the tab the next
+    subtask needs."""
+    consumer = ("Now click on the external link button next to the ref. no, A new tab "
+                "will be open click Already have an OTP, paste the OTP from the previous "
+                "step into the first code box and click proceed Securely.")
+    assert decompose.consumes_noted_data(consumer)
+    assert not decompose.produces_noted_data(consumer)
+    assert decompose.announces_new_tab(consumer)
+    assert not decompose.is_conditional_guard(consumer)
+    assert decompose.node_kind(consumer, None) == "action"
+
+
+def test_verification_wording_still_judges():
+    """The line the producer rule must not cross: a COMPARISON is what a recording cannot
+    replay, so anything that verifies stays a judge — including a slice that notes a value
+    AND checks it."""
+    assert decompose.node_kind("verify the CC field matches", None) == "judge"
+    assert decompose.node_kind(
+        "note the currently selected option and confirm it is Account Manager",
+        None) == "judge"
+    assert decompose.node_kind(
+        "capture the balance and check that it equals the invoice total", None) == "judge"
+    assert decompose.node_kind("Check that the mail is not sent", None) == "judge"
+    # ...and the registry's own verification slice, which must not have moved.
+    assert decompose.node_kind(
+        "Now go to Data Request, and on the top row (S.No. 1, the newest request) click "
+        "the ref. no. link to open the Payroll Review panel, click Verify all.",
+        None) == "judge"
+
+
+def test_producer_wording_still_loses_to_loop_and_marker():
+    """Precedence is unchanged: iteration and machine ground truth both outrank it."""
+    assert decompose.node_kind(
+        "note the employee shown, click Save & Next, and keep repeating until the last "
+        "employee is reached", None) == "loop"
+    assert decompose.node_kind(_OTP_SLICE, "Payroll") == "action"
+    assert decompose.node_kind(_OTP_SLICE, None, declared="judge") == "judge"

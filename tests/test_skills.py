@@ -323,7 +323,9 @@ async def test_run_steps_honours_count_and_click_indexed(monkeypatch):
 
     async def fake_flyout(page, steps, idx, timeout_ms):
         clicks.append(idx)
-        return "sel", None
+        # Third element: the page to CONTINUE on — unchanged for a click that opened no
+        # tab (see script_compile._click_and_follow).
+        return "sel", None, page
 
     class _Loc:
         async def click(self, timeout=None, force=False):

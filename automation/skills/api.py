@@ -25,8 +25,10 @@ from typing import Any, Awaitable, Callable
 from playwright.async_api import Page
 
 from automation.pipeline.script_compile import (_REOPEN_MS, _SETTLE_MS, _click_with_retry,
-                                                _esc, _extract_value, _fill_with_retry,
-                                                _find_click, _resolve_with_scroll,
+                                                _click_and_follow, _esc, _extract_value,
+                                                _fill_with_retry,
+                                                _find_click, _paste_with_retry,
+                                                _resolve_with_scroll,
                                                 _select_with_retry, _upload_with_retry,
                                                 _wheel_scroll, merge_extract)
 
@@ -81,6 +83,8 @@ class SkillApi:
                                 "fingerprint": anchor.get("fingerprint")}
         if anchor.get("hidden_ok"):
             step["hidden_ok"] = True
+        if anchor.get("opens_tab"):
+            step["opens_tab"] = True
         if anchor.get("query"):
             # Extract anchors keep their recorded query as the semantic re-find fallback.
             step["query"] = anchor["query"]
@@ -134,6 +138,18 @@ class SkillApi:
         A value-parameterized anchor carries expect_text: the click only lands on an
         element actually NAMED that value (wrong-business-row guard)."""
         step = self._step_for(handle, expect=True)
+        if step.get("opens_tab"):
+            # A click that spawns a tab is NOT idempotent, so it skips the ladder below
+            # entirely — every rung there re-clicks, and a second click is a second tab
+            # (run 20260825_105115). _click_and_follow fires it once, decides whether it
+            # landed by looking for the tab, and REBINDS the page so the rest of the skill
+            # runs where the recording ran.
+            sel, healed, self.page = await _click_and_follow(
+                self.page, step, self.timeout_ms)
+            self._last_click = step
+            self._record("click", handle, sel, healed)
+            await self.page.wait_for_timeout(_SETTLE_MS)
+            return
         try:
             sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
         except Exception as exc:  # noqa: BLE001 - recovery ladder before the failure is final
@@ -377,6 +393,48 @@ class SkillApi:
         merge_extract(self.extracted, str(label), value)
         self._record("extract", handle, used, healed)
         self.log[-1]["value"] = value[:200]
+        return value
+
+    async def paste(self, handle: str, value: Any) -> None:
+        """Deliver a WHOLE value to the anchored field through the paste ladder (synthetic
+        paste event -> Chrome's paste command -> keystrokes; see _paste_into). The verb for
+        a value the page splits across SEVERAL inputs: an ordinary fill would put the first
+        character in the first box and the rest nowhere. Raises if the value did not land."""
+        step = self._step_for(handle)
+        step["value"] = str(value)
+        try:
+            sel, healed = await _paste_with_retry(self.page, step, self.timeout_ms)
+        except Exception:  # noqa: BLE001 - one reflex pass before the failure is final
+            if not await self._run_interrupts():
+                raise
+            sel, healed = await _paste_with_retry(self.page, step, self.timeout_ms)
+        self._record("paste", handle, sel, healed)
+        await self.page.wait_for_timeout(_SETTLE_MS)
+
+    def noted(self, label: str) -> str:
+        """The value an EARLIER step of this same skill extracted, read live.
+
+        The compiled form of a {{noted:label}} token (codegen._value_expr): the merged OTP
+        slice copies the code and pastes it, so the paste must read what THIS run's copy
+        captured. Raises rather than returning a stale or empty value — a skill that types
+        the wrong OTP passes its gate (the URL is identical either side of the wall) and
+        the whole rest of the task then runs against a page that never opened."""
+        value = str((self.extracted or {}).get(label) or "").strip()
+        if not value:
+            raise KeyError(
+                f"noted value {label!r} is empty — the step that captures it either did "
+                f"not run or read nothing (have: {sorted(self.extracted)})")
+        return value
+
+    async def copy(self, handle: str, label: str) -> str:
+        """extract, plus the clipboard — the replay twin of the copy_text tool, so a
+        replayed paste that carries no text of its own still has the value to deliver."""
+        value = await self.extract(handle, label)
+        self.log[-1]["action"] = "copy"
+        try:
+            await self.page.evaluate("(t) => navigator.clipboard.writeText(t)", value)
+        except Exception as exc:  # noqa: BLE001 - clipboard is a convenience, never a gate
+            logger.debug("skill clipboard write failed: %s", exc)
         return value
 
     async def goto(self, url: str) -> None:

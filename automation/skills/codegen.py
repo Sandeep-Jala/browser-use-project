@@ -31,6 +31,9 @@ from automation.pipeline.script_compile import _atomic_write
 logger = logging.getLogger("framework.skills.codegen")
 
 _TOKEN = re.compile(r"\{\{([a-z0-9_]+)\}\}")
+# The self-scoped token (hybrid._bind_self_noted). Deliberately NOT matched by _TOKEN —
+# it is not a param, so the template/anchor substitution machinery must leave it alone.
+_NOTED_TOKEN = re.compile(r"\{\{noted:([A-Za-z0-9_]+)\}\}")
 # A click on a dropdown OPTION (react-select) — recognized so a preceding `type` collapses
 # into api.select_option(label), the by-value pick primitive.
 _OPTION_CLICK = re.compile(r'^role=option\[|\[id\$="-option')
@@ -43,7 +46,18 @@ def _is_option_click(step: dict[str, Any]) -> bool:
 
 def _value_expr(text: str, params: set[str]) -> str:
     """The Python expression for a (possibly tokenized) recorded value: a bare {{param}}
-    becomes the argument name, embedded tokens become an f-string, literals stay literal."""
+    becomes the argument name, embedded tokens become an f-string, literals stay literal.
+
+    A {{noted:label}} token is the SELF-scoped kind (hybrid._bind_self_noted): the value
+    was extracted by an earlier step of this same skill, so it compiles to a live read of
+    the extract ledger — api.noted(label) — never to the authoring run's literal."""
+    noted = _NOTED_TOKEN.findall(text)
+    if noted:
+        if len(noted) > 1 or text.strip() != "{{noted:%s}}" % noted[0]:
+            # A noted value spliced into a larger string has no api verb to express it;
+            # refusing here drops the entry to tier-0, where resolve_noted handles it.
+            raise ValueError(f"cannot transpile embedded noted token in {text!r}")
+        return f"api.noted({noted[0]!r})"
     tokens = [t for t in _TOKEN.findall(text) if t in params]
     if not tokens:
         return repr(text)
@@ -87,6 +101,11 @@ def _anchor(step: dict[str, Any]) -> dict[str, Any]:
         # The recorded click reached a legitimately-invisible control (hover-revealed /
         # 0-size); replay keeps the hidden-dispatch permission (script_compile).
         anchor["hidden_ok"] = True
+    if step.get("opens_tab"):
+        # The recorded click spawned a tab; replay must follow it there and must never
+        # re-click (see script_compile._click_and_follow). Lose this on the way into the
+        # anchor bundle and the tier-1 skill replays the pre-fix behaviour.
+        anchor["opens_tab"] = True
     if step.get("query"):
         # Extract steps keep their recorded query as the semantic re-find fallback.
         anchor["query"] = step["query"]
@@ -161,14 +180,19 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
         elif action == "find_click":
             expr = _value_expr(str(step.get("text", "")), param_set)
             lines.append(f"    await api.find_click({expr})")
-        elif action == "extract":
+        elif action == "paste":
+            handle = _handle_for(step, used)
+            anchors[handle] = _anchor(step)
+            expr = _value_expr(str(step.get("value", "")), param_set)
+            lines.append(f"    await api.paste({handle!r}, {expr})")
+        elif action in ("extract", "copy"):
             if not step.get("selectors"):
                 # Query-only extract: no element identity to anchor on — the entry stays
                 # tier-0, where run_steps owns the semantic re-find.
-                raise ValueError("cannot transpile query-only extract step")
+                raise ValueError(f"cannot transpile query-only {action} step")
             handle = _handle_for(step, used)
             anchors[handle] = _anchor(step)
-            lines.append(f"    await api.extract({handle!r}, "
+            lines.append(f"    await api.{action}({handle!r}, "
                          f"{str(step.get('label') or 'value')!r})")
         elif action == "upload":
             handle = _handle_for(step, used)

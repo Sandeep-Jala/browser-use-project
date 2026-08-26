@@ -13,9 +13,11 @@ and fall back to the recorded positional `x_path` only as a last resort.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -87,7 +89,8 @@ def _role_of(attrs: dict[str, Any], tag: str) -> str | None:
     return _TAG_ROLE.get(tag)
 
 
-def _selectors(element: dict[str, Any]) -> list[str]:
+def _selectors(element: dict[str, Any], *, shadow_contained: bool = False,
+               label: str | None = None) -> list[str]:
     """Ranked list of Playwright selectors for a recorded element (most → least durable).
 
     Replay tries these in order and uses the first that resolves UNIQUELY, so a fragile primary
@@ -95,22 +98,48 @@ def _selectors(element: dict[str, Any]) -> list[str]:
     run or clicking the wrong element. Order:
       0. the positional xpath — deterministic-first (2026-08-12, user choice): the
          recorded position leads, sanity-gated at resolve time against the fingerprint
-         (_resolve refuses a drifted hit and falls through to the semantic ladder)
+         (_resolve refuses a drifted hit and falls through to the semantic ladder).
+         OMITTED for an element inside an open SHADOW ROOT (`shadow_contained`): Playwright's
+         xpath engine is document-scoped and cannot cross a shadow boundary, so the
+         recorded path is not a weak anchor there but a guaranteed miss — measured, 0
+         matches for both the absolute path and `//input[@inputmode="decimal"]`, against
+         1 for the equivalent css. Its css engine pierces open roots, so the attribute
+         candidates below are the ONLY ones that can work. Containment is read from
+         browser-use's listing (_sm_in_shadow) and is RARE — do not confuse it with the
+         `|SHADOW(open)|` host marker, which every native input carries. Withholding the
+         xpath from all of them broke two library entries outright (2026-08-25).
+         Positional DRIFT is a different failure with a different remedy: the payments
+         panel's rows shift (`div[3]` -> `div[4]`), the fingerprint gate below catches
+         it, and the attribute ladder takes over (run 20260825_115047).
       1. get_by_role(role, name)  — semantic + unique, the most durable web locator
       2. a non-auto-generated id
       3. react-select option suffix ([id$="-option-0"]) — instance-counter-independent
       4. a distinguishing attribute (data-testid / name / aria-label / title / placeholder)
       5. href (links)
       6. exact accessible-name text
+      7. LAST — and only for an element with no attribute identity at all — the label
+         printed beside it in browser-use's listing (see _label_scoped_css). The app's
+         payments-panel <select>s carry nothing but class and style, and the Add Employee
+         NI box and the Net-to-Gross popup's Net amount box carry nothing but a volatile
+         Fluent id, so without this their only anchor is the positional xpath.
     """
     attrs = element.get("attributes") or {}
     tag = (element.get("node_name") or "").lower()
     ax_name = (element.get("ax_name") or "").strip()
     cands: list[str] = []
     xpath = element.get("x_path")
-    if xpath:
+    if xpath and not shadow_contained:
         cands.append("xpath=/" + xpath.lstrip("/"))
-    cands.extend(_selectors_from_parts(tag, attrs, ax_name))
+    hard = _selectors_from_parts(tag, attrs, ax_name)
+    cands.extend(hard)
+    if not hard and tag and _label_names(label, ax_name):
+        # Ranked last, and offered ONLY to an element no attribute can name: a real
+        # attribute beats a label every time. For a control whose only identity is the
+        # text beside it this is the difference between replaying and authoring live
+        # forever (see _label_scoped_css). The gate used to be `in_shadow`, which was
+        # both wrong (it fired on every native input) and beside the point — what makes
+        # the rung necessary is the missing attribute, not the shadow boundary.
+        cands.append(_label_scoped_css(tag, label))
     return cands
 
 
@@ -155,8 +184,12 @@ def _selectors_from_parts(tag: str, attrs: dict[str, Any], ax_name: str) -> list
                 cands.append(f'css=[id$="{_esc(m2.group("suffix"))}"]')
 
     # 4. Distinguishing attributes.
+    # `inputmode` earns its place beside these: it is what the element IS (like type and
+    # name), not what it SAYS, and on the payroll panels it is the only thing separating a
+    # bare amount field from its neighbours — the Add Payments amount carries
+    # inputmode=decimal, an empty placeholder and no id at all.
     for key in ("data-testid", "data-automationid", "name", "aria-label", "title",
-                "placeholder"):
+                "placeholder", "inputmode"):
         if attrs.get(key):
             cands.append(_attr_sel(key, attrs[key]))
     # 5. href for links.
@@ -221,6 +254,170 @@ def _recover_fill_target(state_message: str, recorded_index: Any) -> dict[str, s
             attrs["__tag__"] = m.group("tag").lower()
             return attrs
     return None
+
+
+# A label is short. Anything longer is a paragraph that happens to sit above a control.
+_SM_LABEL_MAX = 40
+# Fluent renders its icons as literal Private-Use-Area TEXT NODES, so they show up in the
+# listing as label-shaped lines. They name nothing.
+_PUA = re.compile(r"[\uE000-\uF8FF]")
+# The lines that open and close a shadow tree in the listing. They are STRUCTURE: they
+# say where the element sits (_sm_in_shadow), and they never name it (_sm_preceding_label
+# read "Open Shadow" as the label of the first control inside the root).
+_SM_SHADOW_OPEN = re.compile(r"^(Open|Closed) Shadow$")
+_SM_SHADOW_EDGE = re.compile(r"^(Open|Closed) Shadow$|^Shadow End$")
+# The serializer prints an <svg> as a placeholder line with its children collapsed. It is
+# a stand-in for a picture, so it names nothing — but it is plain text on a plain line and
+# was read as a label ("<svg /> <!-- SVG content collapsed -->" reached three anchors).
+_SM_SVG_LINE = re.compile(r"^<svg\b.*SVG content collapsed")
+
+
+def _sm_preceding_label(state_message: str, recorded_index: Any) -> str | None:
+    """The plain-text line immediately above element `recorded_index` in browser-use's DOM
+    listing — the label a form control sits next to:
+
+        Period to
+        |SHADOW(open)|*[1457]<select … />
+
+    This is the ONLY name some controls have. The app's expense/deduction selects carry
+    nothing but `class` and `style`; the Add Employee NI box and the Net-to-Gross popup's
+    Net amount box carry nothing but a volatile Fluent id. Their attribute ladder comes
+    back empty, so _selectors offers this as its last rung — without it their only anchor
+    is a positional xpath through a panel whose rows shift.
+    """
+    if not state_message or recorded_index is None:
+        return None
+    lines = state_message.splitlines()
+    at = next((i for i, ln in enumerate(lines) if f"[{recorded_index}]<" in ln), None)
+    if at is None:
+        return None
+    for ln in reversed(lines[max(0, at - 3):at]):
+        if not ln.startswith(("\t", " ")):
+            return None       # left the listing body (its header is flush-left)
+        if _SM_LINE.search(ln):
+            continue          # another element between us and the label: keep looking up
+        text = _PUA.sub("", ln).strip()
+        if (not text or _SM_EDGE.search(text) or _SM_SHADOW_EDGE.match(text)
+                or _SM_SVG_LINE.match(text)):
+            # A blank line, a page-edge marker, a shadow-tree boundary, or a line that was
+            # nothing but a Fluent icon glyph. None of those name the control, and walking
+            # PAST one would pick up whatever unrelated text sits further up.
+            return None
+        return text if len(text) <= _SM_LABEL_MAX else None
+    return None
+
+
+def _has_letters(text: str) -> bool:
+    return any(ch.isalpha() for ch in _PUA.sub("", text or ""))
+
+
+def _label_names(label: str | None, ax_name: str) -> bool:
+    """Is `label` — the listing line above an element — that element's NAME, or is it
+    just whatever happened to be printed above it?
+
+    Two refusals, both measured on the Pay Forecast grid (run 20260825_163029), where
+    widening the rung from shadow-contained to attribute-less first offered it to table
+    cells and toolbar buttons:
+
+    1. A label with no letters is DATA, not a name. The Net-to-Gross pencil sits beside
+       its row's amount, and the rung came out as `*:text-is("£2446.44")` — an anchor
+       that goes stale the moment the pay changes, and that can match a DIFFERENT row
+       showing the same figure. Identity, never the page's data.
+    2. If the element already HAS an accessible name, a DIFFERENT line above it is some
+       neighbour's label. The Calculate button (named "Calculate") sat under the text
+       "Calculate for remaining periods", which names another control entirely. An
+       element whose own name is itself data — the popup's "£" box — reads as nameless
+       here and keeps the rung, which is the whole point of having one."""
+    if not label or not _has_letters(label):
+        return False
+    if _has_letters(ax_name):
+        norm = (lambda t: _PUA.sub("", t or "").strip().casefold())
+        return norm(label) == norm(ax_name)
+    return True
+
+
+def _label_scoped_css(tag: str, label: str) -> str:
+    """A locator for a control whose only identity is the label printed beside it.
+
+    Start at the LABEL — the element whose text is exactly it — then climb to the nearest
+    ancestor that owns a control of this tag and take the controls inside it. That is
+    "the field group this label names", and it is independent of how deeply the framework
+    nests the control inside that group.
+
+    The previous shape, `*:has(> {tag}):has-text(label) > {tag}`, required the control's
+    DIRECT parent to hold the label text. Measured against the live Add Employee form
+    (2026-08-25), Fluent nests the input four levels below the element that carries the
+    label — `ms-StackItem > ms-TextField > ms-TextField-wrapper > ms-TextField-fieldGroup
+    > input` — and the old shape returned **0 matches for every field on the form**
+    (NI number, Employee ID, Gross Pay, Join with, both loan toggles). This shape returned
+    exactly 1, and the right element, for all six.
+
+    An ambiguous group (two controls under one label) returns >1 and _resolve falls
+    through to the next candidate — a miss, never a wrong element."""
+    return (f'css=*:text-is("{_esc(label)}") >> '
+            f'xpath=ancestor-or-self::*[.//{tag}][1]//{tag}')
+
+
+# The DOCUMENT_FRAGMENT of a shadow root is serialised as its own line, and the tree it
+# contains is indented one level below it (browser_use/dom/serializer/serializer.py:1069):
+#
+#     |SHADOW(open)|[12]<my-widget />
+#             Open Shadow
+#                     [13]<input />          <- INSIDE the shadow tree
+#             Shadow End
+#     |SHADOW(open)|[14]<input />            <- NOT inside one: a native input is merely
+#                                               the host of its own UA shadow root
+
+
+def _sm_indent(line: str) -> int:
+    return len(line) - len(line.lstrip("\t "))
+
+
+def _sm_in_shadow(state_message: str, recorded_index: Any) -> bool:
+    """Does browser-use's DOM listing put element `recorded_index` INSIDE a shadow root?
+
+    Read the ANCESTOR lines, never the element's own. The `|SHADOW(open)|` prefix on a
+    line means that node IS a shadow HOST (`is_shadow_host = any(child is a
+    DOCUMENT_FRAGMENT)`, serializer.py:513) — and every native <input>/<select> hosts its
+    own USER-AGENT shadow root, so the prefix fires on all of them. Reading it as
+    containment marked 22 of 22 inputs on this app as unreachable-by-xpath, stripped the
+    recorded xpath from every fill, and left the two attribute-less fields (the NI number
+    box, the Net-to-Gross popup's Net amount box) with no anchor that resolves at all.
+
+    Real containment shows up as an `Open Shadow` / `Closed Shadow` line ABOVE the element
+    at a smaller indent. Anything this returns True for must not be anchored by xpath
+    (see _selectors)."""
+    if not state_message or recorded_index is None:
+        return False
+    lines = state_message.splitlines()
+    needle = f"[{recorded_index}]<"
+    at = next((i for i, ln in enumerate(lines) if needle in ln), None)
+    if at is None:
+        return False
+    depth = _sm_indent(lines[at])
+    for ln in reversed(lines[:at]):
+        if not ln.strip():
+            continue
+        indent = _sm_indent(ln)
+        if indent >= depth:
+            continue          # a sibling or a cousin's subtree, not an ancestor
+        depth = indent        # the next ancestor must be shallower still
+        if _SM_SHADOW_OPEN.match(ln.strip()):
+            return True
+        if indent == 0:
+            break
+    return False
+
+
+def _stamped_element(results: list[Any], i: int) -> dict[str, Any] | None:
+    """The element an action's OWN result recorded (agent_tools stamps it), or None."""
+    if i >= len(results) or not isinstance(results[i], dict):
+        return None
+    md = results[i].get("metadata")
+    if not isinstance(md, dict):
+        return None
+    element = md.get("interacted_element")
+    return element if isinstance(element, dict) else None
 
 
 def _recovered_selectors(attrs: dict[str, str]) -> list[str]:
@@ -365,8 +562,41 @@ def _attach_fp(step: dict[str, Any], element: dict[str, Any]) -> dict[str, Any]:
     return step
 
 
-def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
+def _item_opened_tab(history: list[dict[str, Any]], item_idx: int) -> bool:
+    """True when the browser had MORE tabs open at the next history item than at this one.
+
+    state.tabs is the recorder's own tab list, captured before each item's actions run, so
+    the comparison attributes the growth to the item in between. A last item cannot be
+    compared against anything and never counts (nothing replays after it anyway)."""
+    if item_idx + 1 >= len(history):
+        return False
+    here = (history[item_idx].get("state") or {}).get("tabs") or []
+    after = (history[item_idx + 1].get("state") or {}).get("tabs") or []
+    return len(after) > len(here)
+
+
+def _stamp_opens_tab(steps: list[dict[str, Any]], since: int) -> None:
+    """Mark the LAST click emitted from one history item as the one that opened a tab.
+
+    Last, because browser-use stops an item's action queue the moment the page changes
+    ("Page changed after 'click' — skipping N remaining action(s)"), so the opener is the
+    last thing that actually ran. An item that emitted no click stamps nothing and replays
+    exactly as before."""
+    for step in reversed(steps[since:]):
+        if step.get("action") == "click":
+            step["opens_tab"] = True
+            return
+
+
+def _push_step(steps: list[dict[str, Any]], step: dict[str, Any], *,
+               count_adjacent: bool = False) -> None:
     """Append a step, distinguishing slow-app retries from intentional repeats.
+
+    `count_adjacent` inverts the adjacent-click rule for a LOOP recording: there, two
+    clicks on the same target back to back are two ITERATIONS, not the agent re-clicking
+    a control the slow app had not registered. Without it a loop that stepped through
+    eleven employees without pausing compiles to a single click, and the cached entry
+    silently stops after one.
 
     An ADJACENT click on the same target (no recorded wait between) is the agent
     retrying a click the slow app hadn't registered yet ("+ Invoice" clicked twice) —
@@ -375,10 +605,10 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
     waiting after each") — dropping those compiled the 5x/14x counter recordings to a
     single click (observed 2026-08-12). Such repeats now absorb into the first click's
     `count`, and the intervening waits become its `repeat_wait_s` floor instead of
-    bare wait steps. For a repeated fill on the same field the latest value still
-    wins (the last write is the one the form kept).
+    bare wait steps. For a repeated fill or paste on the same field the latest value
+    still wins (the last write is the one the form kept).
     """
-    if step.get("action") in ("click", "fill"):
+    if step.get("action") in ("click", "fill", "paste"):
         prev_idx = next(
             (j for j in range(len(steps) - 1, -1, -1) if steps[j].get("action") != "wait"),
             None,
@@ -389,11 +619,11 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
             and prev.get("action") == step["action"]
             and prev.get("selectors") == step.get("selectors")
         ):
-            if step["action"] == "fill":
-                steps[prev_idx] = step  # same field typed again → keep the final value
+            if step["action"] in ("fill", "paste"):
+                steps[prev_idx] = step  # same field written again → keep the final value
                 return
             waits_between = steps[prev_idx + 1:]   # only waits, by prev_idx construction
-            if not waits_between:
+            if not waits_between and not count_adjacent:
                 return  # adjacent retry → the first click already fired
             prev["count"] = int(prev.get("count", 1)) + 1
             wait_s = max((float(w.get("seconds") or 0) for w in waits_between), default=0.0)
@@ -696,13 +926,17 @@ def _reg_host(url: Any) -> str:
 
 def compile_recording(
     recording_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True,
+    emit_start_goto: bool = True, loop: bool = False,
 ) -> list[dict[str, Any]]:
     """Turn a saved agent history JSON into an ordered list of {action, ...} steps.
 
     `max_steps` keeps only the first N agent steps. Used to cut a recording at the step where
     the create-write fired (see ground_truth["write_step"]), so an agent that flailed AFTER
     the record was actually saved never gets its post-save junk into the script.
+
+    `loop=True` compiles a LOOP node's recording: repeated clicks on one target are its
+    iterations, so adjacent ones accumulate into `count` instead of being dropped as
+    slow-app retries (see _push_step).
 
     `emit_start_goto=False` skips the leading goto to the recording's start URL. Mid-flow
     subtask segments need this: on an SPA a reload destroys live form state, and the segment's
@@ -730,6 +964,16 @@ def compile_recording(
     # recording itself stays untouched — only the compiled script skips the step.
     seg_host = _reg_host((history[0].get("state") or {}).get("url") if history else "")
     for item_idx, item in enumerate(history):
+        # Did THIS item's actions open a tab? The recording knows: state.tabs is captured
+        # at each item's START, so growth between this item and the next means something
+        # here spawned one. Replay must follow the recording into that tab — a compiled
+        # skill runs every step against ONE Playwright Page and a popup is a different
+        # Page, so the OTP segment's step 2 hunted the app tab for a button that exists
+        # only in the new one (run 20260825_105115). Stamping the recorded opener here,
+        # rather than following any popup at replay time, keeps a stray ad/consent tab
+        # from hijacking a script: replay goes only where the recording went.
+        opened_tab = _item_opened_tab(history, item_idx)
+        steps_before = len(steps)
         actions = (item.get("model_output") or {}).get("action") or []
         elements = (item.get("state") or {}).get("interacted_element") or []
         # ActionResults for this step, aligned to actions (one action per step in this app).
@@ -766,6 +1010,14 @@ def compile_recording(
             # replay then clicked a Send button its own previous step had just removed
             # from the page. Same phantom-action rule as the no_click/no_fill/no_scroll
             # refusals below, for the one shape that stamps no metadata.
+            # An element inside an OPEN shadow root cannot be anchored by xpath at all
+            # (see _selectors); browser-use's DOM listing is the only record that says so.
+            in_shadow = _sm_in_shadow(item.get("state_message") or "", params.get("index"))
+            # For an element with no attribute identity, the label beside it in the
+            # listing is the only name it has. Read it for every step: _selectors offers
+            # it as a last rung exactly when the attribute ladder came back empty.
+            sm_label = _sm_preceding_label(item.get("state_message") or "",
+                                           params.get("index"))
             if "index" in params and _index_miss(results, i):
                 logger.info("compile: skipping recorded %s at step %d — its element "
                             "index was no longer available, so it never acted",
@@ -778,6 +1030,13 @@ def compile_recording(
                     "the replayable path", name, item_idx, seg_host)
                 continue
             element = elements[i] if i < len(elements) else None
+            if element is None:
+                # browser-use fills state.interacted_element from the snapshot it takes
+                # AFTER the action, so a click that switched tabs records nulls. Our
+                # click/find_by_text overrides stamp the PRE-action element in the result
+                # metadata; read it here so every indexed action gets the same recovery
+                # _recover_fill_target gives fills.
+                element = _stamped_element(results, i)
             if name == "find_by_text" and params.get("click_first"):
                 # A navigation/click made via find_by_text: recover its target element from the
                 # recorded metadata and compile it exactly like a built-in click. Without this,
@@ -832,7 +1091,8 @@ def compile_recording(
                             # 20260818). Record the provenance so _resolve verifies the
                             # way the query matched.
                             step["expect_scattered"] = True
-                        _push_step(steps, _attach_fp(step, element))
+                        _push_step(steps, _attach_fp(step, element),
+                                   count_adjacent=loop)
                     else:
                         # No anchorable identity was captured. Recording the tool's TEXT
                         # SEARCH instead is what put find_click('Net to gross') — 36
@@ -843,12 +1103,14 @@ def compile_recording(
                             "action": "unanchorable",
                             "why": f"find_by_text click on {query!r} captured no anchorable "
                                    f"element identity (no xpath, no distinguishing attribute)"})
-            elif name == "extract_data":
-                # The tool records {label, value, query, interacted_element} in its result
-                # metadata (persisted by runner.restore_result_metadata); a valueless call
-                # records NO metadata and so compiles to nothing. The recorded value is
-                # provenance only — replay re-reads the element's CURRENT text, which is
-                # the whole point of an extract step (fresh data on every run).
+            elif name in ("extract_data", "copy_text"):
+                # Both tools record {label, value, query, interacted_element} in their
+                # result metadata (persisted by runner.restore_result_metadata); a
+                # valueless call records NO metadata and so compiles to nothing. The
+                # recorded value is provenance only — replay re-reads the element's
+                # CURRENT text, which is the whole point of an extract step (fresh data on
+                # every run). copy_text compiles to `copy`: an extract that ALSO puts the
+                # value on the clipboard, so a replayed paste_text has it to deliver.
                 md = (results[i].get("metadata")
                       if i < len(results) and isinstance(results[i], dict) else None)
                 ext = md.get("extract") if isinstance(md, dict) else None
@@ -857,9 +1119,11 @@ def compile_recording(
                 ext_label = str(ext.get("label") or "value")
                 ext_query = str(ext.get("query") or params.get("text") or "").strip()
                 ext_element = ext.get("interacted_element")
-                sels = _selectors(ext_element) if ext_element else []
+                ext_action = "copy" if name == "copy_text" else "extract"
+                sels = (_selectors(ext_element, shadow_contained=in_shadow, label=sm_label)
+                        if ext_element else [])
                 if sels:
-                    step = _attach_fp({"action": "extract", "selectors": sels,
+                    step = _attach_fp({"action": ext_action, "selectors": sels,
                                        "label": ext_label}, ext_element)
                     if ext_query:
                         # Kept as the semantic fallback when every selector goes stale.
@@ -868,7 +1132,7 @@ def compile_recording(
                 elif ext_query:
                     # No stable element identity: replay re-finds the value by query with
                     # the same in-page algorithm the tool used (RAW_FIND_JS, no click).
-                    _push_step(steps, {"action": "extract", "label": ext_label,
+                    _push_step(steps, {"action": ext_action, "label": ext_label,
                                        "query": ext_query})
             elif name in ("select_dropdown", "select_dropdown_option"):
                 # A pick on a NATIVE <select> (helper/public pages — the app's react-selects
@@ -880,7 +1144,18 @@ def compile_recording(
                 option = str(params.get("text", ""))
                 if option and element and \
                         (element.get("node_name") or "").lower() == "select":
-                    sels = _selectors(element)
+                    sels = _selectors(element, shadow_contained=in_shadow, label=sm_label)
+                    if not sels and in_shadow:
+                        # Same rule as the click/fill branches: inside an open shadow root
+                        # the recorded xpath is a guaranteed miss, so a <select> with no
+                        # attribute identity has no anchor at all.
+                        _push_step(steps, {
+                            "action": "unanchorable",
+                            "why": f"pick of {option!r} on a <select> inside an open "
+                                   f"shadow root with neither a distinguishing attribute "
+                                   f"nor a label beside it (xpath cannot cross the "
+                                   f"boundary)"})
+                        continue
                     if sels:
                         _push_step(steps, _attach_fp(
                             {"action": "select", "selectors": sels, "value": option},
@@ -938,6 +1213,26 @@ def compile_recording(
                         "step dropped (replay gate will catch a wrong end state)", option)
             elif name == "navigate" and params.get("url"):
                 _push_step(steps, {"action": "goto", "url": params["url"]})
+            elif name == "paste_text":
+                # The tool reports what actually LANDED (metadata["paste"]), and a paste
+                # that took on no rung stamps no_fill instead — the phantom-action rule, so
+                # a refused paste never becomes a step. The value rides the step like a
+                # fill's, which is what lets the provenance binder rewrite it to a
+                # {{bound_N}} resolved from each run's own data.
+                md = (results[i].get("metadata")
+                      if i < len(results) and isinstance(results[i], dict) else None)
+                pasted = md.get("paste") if isinstance(md, dict) else None
+                if not isinstance(pasted, dict):
+                    continue
+                sels = _selectors(element, shadow_contained=in_shadow, label=sm_label) if element else []
+                if sels:
+                    _push_step(steps, _attach_fp(
+                        {"action": "paste", "selectors": sels,
+                         "value": str(pasted.get("value") or "")}, element))
+                else:
+                    logger.warning(
+                        "compile: dropping recorded paste at step %d — the target carries "
+                        "no element identity, so it cannot be anchored", item_idx)
             elif name == "click" and element:
                 element = _with_recovered_text(element,
                                                item.get("state_message") or "")
@@ -947,7 +1242,19 @@ def compile_recording(
                     for s in synth:
                         _push_step(steps, s)
                     continue
-                sels = _selectors(element)
+                sels = _selectors(element, shadow_contained=in_shadow, label=sm_label)
+                if not sels and in_shadow:
+                    # A shadow-hosted element with no attribute identity has NO anchor that
+                    # can ever resolve. Say so instead of committing a dead xpath: the
+                    # commit guard refuses an `unanchorable` step and the segment authors
+                    # live until the app gives the control an identity.
+                    _push_step(steps, {
+                        "action": "unanchorable",
+                        "why": f"click on a <{(element.get('node_name') or '?').lower()}> "
+                               f"inside an open shadow root with neither a "
+                               f"distinguishing attribute nor a label beside it (xpath "
+                               f"cannot cross the boundary)"})
+                    continue
                 if sels:
                     step = {"action": "click", "selectors": sels}
                     label = _ax_label(element)
@@ -955,7 +1262,18 @@ def compile_recording(
                         # Landed-click verification: the acted-on element must be NAMED
                         # what was recorded, whichever selector resolved it (see _resolve).
                         step["expect_text"] = label
-                    _push_step(steps, _attach_fp(step, element))
+                    _push_step(steps, _attach_fp(step, element),
+                               count_adjacent=loop)
+            elif name == "click":
+                # No identity from either channel, so there is nothing to anchor. Dropping
+                # is the historical behaviour and stays (making it `unanchorable` would
+                # start refusing commits that are harmless today), but it must never be
+                # SILENT again: this is how the OTP segment lost the click that opens its
+                # tab, leaving a script that began inside a tab it never opened.
+                logger.warning(
+                    "compile: dropping recorded click at step %d — no element identity was "
+                    "captured (neither the snapshot nor the tool stamp), so it cannot be "
+                    "anchored", item_idx)
             elif name == "input" and element:
                 # The auto-Enter `input` tool (agent_tools.py) presses Enter after typing
                 # into non-dropdown fields and flags it in its result metadata (put back
@@ -1004,7 +1322,15 @@ def compile_recording(
                         "fill %r recorded against non-editable <%s> and no recovery target "
                         "found; compiling container selectors (replay may descend)",
                         str(params.get("text", ""))[:40], element.get("node_name"))
-                sels = _selectors(element)
+                sels = _selectors(element, shadow_contained=in_shadow, label=sm_label)
+                if not sels and in_shadow:
+                    _push_step(steps, {
+                        "action": "unanchorable",
+                        "why": f"fill of a <{(element.get('node_name') or '?').lower()}> "
+                               f"inside an open shadow root with neither a "
+                               f"distinguishing attribute nor a label beside it (xpath "
+                               f"cannot cross the boundary)"})
+                    continue
                 if sels:
                     step = _attach_fp({"action": "fill", "selectors": sels,
                             "value": str(params.get("text", "")), "clear": params.get("clear", True)},
@@ -1082,6 +1408,8 @@ def compile_recording(
                 if isinstance(secs, (int, float)) and secs > 0:
                     _push_step(steps, {"action": "wait", "seconds": min(float(secs), 3.0)})
             # `done` is intentionally dropped — Playwright auto-waits on locators.
+        if opened_tab:
+            _stamp_opens_tab(steps, steps_before)
     return _collapse_indexed_runs(steps)
 
 
@@ -1141,14 +1469,14 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def save_steps(
     recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True, repeat_hint: int | None = None,
+    emit_start_goto: bool = True, repeat_hint: int | None = None, loop: bool = False,
 ) -> list[dict[str, Any]]:
     """Compile `recording_path` and write the step list to `steps_path` atomically.
     `repeat_hint` is the slice wording's "exactly N clicks" count (see
     repeat_hint_from_wording) — it pins a lone repeat cluster's count."""
     steps = _apply_repeat_hint(
         compile_recording(recording_path, max_steps=max_steps,
-                          emit_start_goto=emit_start_goto),
+                          emit_start_goto=emit_start_goto, loop=loop),
         repeat_hint)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
@@ -1228,6 +1556,30 @@ def _query_tokens(s: str) -> list[str]:
 # implementation at author and replay time is what makes hover-revealed/0-size controls
 # (the Reviews "View all" icon) replayable at all.
 # Placeholders: %s = JSON token list, %s = "true"/"false" for click.
+# The callout predicate, defined ONCE. A Fluent Callout dismisses itself when anything
+# outside it scrolls, and three places need to know whether one is open: the scroll pin
+# (which reverts and swallows the scroll), RAW_FIND_JS (which then skips its own
+# scrollIntoView), and agent_tools._CALLOUT_OPEN_JS (which refuses page-moving tools and
+# gates the text hunt). The pin is the protection; the other two are local guards that
+# stay correct only while they agree with it, and three hand-copied loops do not stay in
+# agreement — so they are interpolated from this fragment instead.
+#
+# `.ms-Callout` ONLY: Panels and Modals do NOT self-dismiss on scroll, and the Add Data
+# Request employee list is a PANEL whose rows only container scrolling reveals.
+# Returns the first open callout ELEMENT (the pin needs it, to tell its own scrollable
+# content from the page) or null.
+CALLOUT_OPEN_FN_JS = """function () {
+  try {
+    var els = document.querySelectorAll('.ms-Callout');
+    for (var i = 0; i < els.length; i++) {
+      var r = els[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return els[i];
+    }
+  } catch (e) {}
+  return null;
+}"""
+
+
 RAW_FIND_JS = r"""
 (function () {
   try {
@@ -1289,12 +1641,7 @@ __WALK__
         // sits. Guarding inside the shared JS keeps authoring (find_by_text) and
         // replay (find_click) byte-identical — a behaviour only one side has is a
         // step that cannot replay.
-        var calloutOpen = false, cs = document.querySelectorAll('.ms-Callout');
-        for (var ci = 0; ci < cs.length; ci++) {
-          var cr = cs[ci].getBoundingClientRect();
-          if (cr.width > 0 && cr.height > 0) { calloutOpen = true; break; }
-        }
-        if (!calloutOpen) top.el.scrollIntoView({ block: 'center' });
+        if (!(__CALLOUT_OPEN_FN__)()) top.el.scrollIntoView({ block: 'center' });
         // Full mousedown→mouseup→click sequence: React widgets (react-select options)
         // select on mousedown and ignore a bare .click().
         ['mousedown', 'mouseup', 'click'].forEach(function (t) {
@@ -1312,7 +1659,8 @@ __WALK__
                         xpath: safeXpath(top.el) } };
   } catch (e) { return { error: String(e) }; }
 })()
-""".replace("__WALK__", _COMPOSED_WALK_JS)
+""".replace("__WALK__", _COMPOSED_WALK_JS
+            ).replace("__CALLOUT_OPEN_FN__", CALLOUT_OPEN_FN_JS)
 
 # Static-TEXT finder for extract_data and the `extract` replay step. RAW_FIND_JS above
 # deliberately scans only control-like elements (it exists to CLICK things); a value shown
@@ -1715,16 +2063,7 @@ _CALLOUT_SCROLL_PIN_TEMPLATE = r"""
     var S = { reverts: 0, stopped: 0, last: null, pinnedAt: null, open: false };
     window[FLAG] = S;
 
-    var openCallout = function () {
-      try {
-        var els = document.querySelectorAll('.ms-Callout');
-        for (var i = 0; i < els.length; i++) {
-          var r = els[i].getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) return els[i];
-        }
-      } catch (e) {}
-      return null;
-    };
+    var openCallout = __CALLOUT_OPEN_FN__;
 
     var pageXY = function () {
       return { x: window.scrollX || window.pageXOffset || 0,
@@ -1791,7 +2130,8 @@ _CALLOUT_SCROLL_PIN_TEMPLATE = r"""
 })()
 """
 
-CALLOUT_SCROLL_PIN_JS = _CALLOUT_SCROLL_PIN_TEMPLATE % json.dumps(CALLOUT_SCROLL_PIN_FLAG)
+CALLOUT_SCROLL_PIN_JS = (_CALLOUT_SCROLL_PIN_TEMPLATE % json.dumps(CALLOUT_SCROLL_PIN_FLAG)
+                         ).replace("__CALLOUT_OPEN_FN__", CALLOUT_OPEN_FN_JS)
 
 # After an interaction, give the slow React app a beat to open a menu / commit react-select
 # state / re-render before the next locator query, so replay doesn't outrun the UI.
@@ -2332,15 +2672,27 @@ async def _reveal_hidden_click(page: Page, step: dict[str, Any]) -> str | None:
         return None
 
 
-async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -> tuple[str, dict[str, Any] | None]:
+async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int, *,
+                            once: bool = False) -> tuple[str, dict[str, Any] | None]:
     """Resolve + click, re-resolving after a settle if the target detaches mid-render.
-    Returns (selector_label, healed_winner_or_None)."""
-    for attempt in range(_MAX_ATTEMPTS):
+    Returns (selector_label, healed_winner_or_None).
+
+    `once` fires the click AT MOST ONCE — no force fallback, no transient re-resolve. For a
+    click whose effect is a NEW TAB every retry here IS a second tab: Playwright's click can
+    time out on a popup-opening link after it has already dispatched, and the force fallback
+    below then opened a duplicate (run 20260825_105115 — two GET /links/... and two POST
+    /public/handshake from one recorded click, which left two extra tabs and cost the
+    segment its gate). Callers that pass `once` own the did-it-land-anyway check.
+    """
+    attempts = 1 if once else _MAX_ATTEMPTS
+    for attempt in range(attempts):
         try:
             loc, sel, healed = await _resolve(page, step, timeout_ms)
             try:
                 await loc.click(timeout=5000)
             except Exception:  # noqa: BLE001 - typically "another element intercepts pointer events"
+                if once:
+                    raise
                 # react-select renders a placeholder div UNDER an input container that intercepts
                 # pointer events; a forced click dispatches at the element's position — i.e. onto
                 # the overlaying control, which is the real target.
@@ -2348,9 +2700,9 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
                 await loc.click(timeout=timeout_ms, force=True)
             return sel, healed
         except Exception as exc:  # noqa: BLE001
-            if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
+            if attempt < attempts - 1 and _is_transient(exc):
                 logger.info("click step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
-                            exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
+                            exc, _SETTLE_MS * 2, attempt + 2, attempts)
                 await page.wait_for_timeout(_SETTLE_MS * 2)
                 continue
             if step.get("hidden_ok"):
@@ -2359,6 +2711,58 @@ async def _click_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) -
                     return used, None
             raise
     raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+async def _await_new_page(context: Any, before: set, timeout_ms: int):
+    """The page `context` gained that is not in `before`, or None once time runs out."""
+    waited, deadline = 0.0, max(timeout_ms, 1000) / 1000.0
+    while waited < deadline:
+        fresh = [pg for pg in context.pages if pg not in before and not pg.is_closed()]
+        if fresh:
+            return fresh[-1]
+        await asyncio.sleep(0.2)
+        waited += 0.2
+    return None
+
+
+async def _click_and_follow(page: Page, step: dict[str, Any], timeout_ms: int
+                            ) -> tuple[str, dict[str, Any] | None, Page]:
+    """Click, and CONTINUE IN THE TAB it opens when the recording did.
+
+    Returns (selector_label, healed, page_to_continue_on). A compiled skill otherwise runs
+    every step against the one Page it started with, and a popup is a DIFFERENT Page — so
+    the OTP segment's step 2 hunted the app tab for a button that exists only in the new
+    one, and the entry could never replay (run 20260825_105115). Only steps compile stamped
+    `opens_tab` follow, so a stray ad/consent popup can never capture a replay.
+    """
+    if not step.get("opens_tab"):
+        sel, healed = await _click_with_retry(page, step, timeout_ms)
+        return sel, healed, page
+    context = page.context
+    before = set(context.pages)
+    try:
+        sel, healed = await _click_with_retry(page, step, timeout_ms, once=True)
+    except Exception:  # noqa: BLE001
+        # The click can land and still raise (a popup-opening link fails Playwright's
+        # post-click wait). Re-clicking would open a SECOND tab, so the only honest
+        # question left is whether a tab appeared.
+        if not [pg for pg in context.pages if pg not in before]:
+            raise
+        sel, healed = (_step_selectors(step) or ["click"])[0], None
+        logger.info("click %r reported a failure but did open a tab; taking it", sel)
+    opened = await _await_new_page(context, before, timeout_ms)
+    if opened is None:
+        # Nothing opened. Say so and stay put, so the next step fails against the page it
+        # can actually see instead of silently acting on the wrong one.
+        logger.warning("step %r was recorded opening a tab, but none appeared; replay "
+                       "continues on the current page", sel)
+        return sel, healed, page
+    try:
+        await opened.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception as exc:  # noqa: BLE001 - a slow tab is still the right tab
+        logger.debug("new tab did not report domcontentloaded: %s", exc)
+    logger.info("click %r opened a tab; replay continues in it (%s)", sel, opened.url)
+    return sel, healed, opened
 
 
 # Non-digits a page may add when it reformats a value it accepted ("£5,000.00" for "5000").
@@ -2374,6 +2778,130 @@ def _as_number(s: str) -> float | None:
         return float(stripped)
     except ValueError:
         return None
+
+
+# ------------------------------- paste delivery -------------------------------
+#
+# A value the page splits across several inputs (an OTP/PIN row, date parts) cannot be
+# typed as one fill: each box holds one character, so a recording types six 1-character
+# fills and the string the run actually used never appears as a step value — nothing for
+# the provenance binder to bind, so the segment re-authors with the LLM forever (subtask
+# 6e8c9bb7ee56a6aa, 107k tokens and 143s every run). Pasting delivers the WHOLE value in
+# one action, and the widget's own handler distributes it.
+#
+# Both JS helpers are written as `(el, ...)` arrows so the live tool (CDP callFunctionOn,
+# element as `this`) and replay (Playwright locator.evaluate, element as arg 0) run the
+# SAME code — the house rule that replay must verify with the predicate that produced the
+# recorded identity.
+
+# Rung 1 of the ladder: a synthetic paste event carrying a DataTransfer. This is what a
+# React onPaste handler reads, it needs no clipboard permission and no document focus,
+# and — unlike a click-driven scroll — the focus() is preventScroll so an open Fluent
+# callout is not dismissed by the very action meant to fill it.
+# Cmd on macOS, Ctrl elsewhere; the `commands` field is what actually executes the paste.
+_PASTE_MODIFIER = 4 if sys.platform == "darwin" else 2
+
+PASTE_EVENT_JS = r"""
+(el, text) => {
+  // preventScroll ALWAYS: a focus that scrolls the caret into view dismisses an open
+  // Fluent callout, and the OTP popup this verb exists for lives in one. The scroll pin
+  // would revert and swallow such a scroll anyway, so this is not the popup's only
+  // protection — it is the cheaper half of it: not moving beats moving and being put
+  // back, which costs a frame of jitter and depends on the pin being installed in THIS
+  // document (a tab created over CDP has it only from the next per-step re-assert).
+  try { el.focus({ preventScroll: true }); } catch (e) {}
+  try {
+    if (el.setSelectionRange && el.value !== undefined) {
+      el.setSelectionRange(0, String(el.value == null ? '' : el.value).length);
+    }
+  } catch (e) {}
+  var dt;
+  try { dt = new DataTransfer(); dt.setData('text/plain', text); }
+  catch (e) { return 'no-datatransfer'; }
+  var ev;
+  try { ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt }); }
+  catch (e) { return 'no-clipboardevent'; }
+  var notPrevented = el.dispatchEvent(ev);
+  // A handler that CONSUMED the paste calls preventDefault, so `false` is the success
+  // shape and `true` often means nobody listened. Neither answer is authoritative — the
+  // caller judges by reading the widget back.
+  return notPrevented ? 'dispatched' : 'handled';
+}
+"""
+
+# The read-back that makes a paste honest on a split widget: box 1 of a six-box OTP reads
+# "5" after a PERFECT paste, so the ordinary single-field check (agent_tools.input's) would
+# call a correct paste a failure. Report the target's own value AND the concatenation of
+# the input group it belongs to, and let the caller accept either.
+GROUP_VALUES_JS = r"""
+(el) => {
+  var read = function (n) {
+    if (!n) return '';
+    return (n.value !== undefined && n.value !== null) ? String(n.value)
+                                                       : String(n.textContent || '');
+  };
+  var group = [el];
+  var scope = el;
+  for (var i = 0; i < 3 && scope.parentElement; i++) {
+    scope = scope.parentElement;
+    var found = Array.prototype.slice.call(scope.querySelectorAll('input, textarea'));
+    if (found.length > 1 && found.indexOf(el) !== -1) { group = found; break; }
+  }
+  return { own: read(el), group: group.map(read) };
+}
+"""
+
+
+# Clearing between rungs, because a rung that lands PART of the value poisons the next
+# one. Measured (chromium, 6 boxes with maxlength=1 and no paste handler): Chrome's own
+# paste command inserts a truncated "5" into box 1 and distributes nothing, after which
+# typing appends to a full box. Uses React's own value-setter workaround — a plain
+# `node.value = ''` is invisible to a controlled component, which is the whole reason
+# browser-use's JS clear had to be replaced by keystrokes elsewhere in this file.
+GROUP_CLEAR_JS = r"""
+(el) => {
+  var group = [el];
+  var scope = el;
+  for (var i = 0; i < 3 && scope.parentElement; i++) {
+    scope = scope.parentElement;
+    var found = Array.prototype.slice.call(scope.querySelectorAll('input, textarea'));
+    if (found.length > 1 && found.indexOf(el) !== -1) { group = found; break; }
+  }
+  group.forEach(function (n) {
+    try {
+      var proto = (n.tagName === 'TEXTAREA') ? window.HTMLTextAreaElement.prototype
+                                             : window.HTMLInputElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      setter.call(n, '');
+      n.dispatchEvent(new Event('input', { bubbles: true }));
+      n.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) { try { n.value = ''; } catch (e2) {} }
+  });
+  return group.length;
+}
+"""
+
+
+def paste_took(text: str, reading: Any) -> tuple[bool, str]:
+    """Did `text` land? True when the target field took it whole (value_took's tolerant
+    rule) OR when the concatenation of its input group equals it exactly. Returns
+    (took, what_is_there) so a refusal can say what the widget actually shows."""
+    own = str((reading or {}).get("own") or "")
+    group = [str(v) for v in ((reading or {}).get("group") or [])]
+    joined = "".join(group).strip()
+    if value_took(text, own):
+        return True, own
+    if joined and joined == (text or "").strip():
+        return True, joined
+    return False, own or joined
+
+
+def paste_group_empty(reading: Any) -> bool:
+    """Nothing at all in the target or its group — the only state in which trying the next
+    rung is safe. A PARTIAL landing is reported instead of stacked on top of."""
+    own = str((reading or {}).get("own") or "").strip()
+    group = "".join(str(v) for v in ((reading or {}).get("group") or [])).strip()
+    return not own and not group
 
 
 def value_took(typed: str, actual: str) -> bool:
@@ -2446,6 +2974,85 @@ async def _fill_with_retry(page: Page, step: dict[str, Any], timeout_ms: int) ->
             if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
                 logger.info("fill step transient (%s); settling %dms then re-resolving (attempt %d/%d)",
                             exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
+                await page.wait_for_timeout(_SETTLE_MS * 2)
+                continue
+            raise
+    raise RuntimeError("unreachable")  # loop either returns or raises
+
+
+async def _paste_into(page: Page, loc: Any, text: str) -> tuple[bool, str]:
+    """Run the same rung ladder the live tool runs (agent_tools.paste_text) and judge it
+    with the same read-back predicates. Returns (took, what_the_widget_shows)."""
+    try:
+        await loc.evaluate(PASTE_EVENT_JS, text)
+    except Exception as exc:  # noqa: BLE001 - a rung that throws is a rung that failed
+        logger.debug("replay synthetic paste failed: %s", exc)
+    await page.wait_for_timeout(150)
+    took, shows = paste_took(text, await loc.evaluate(GROUP_VALUES_JS))
+    if took:
+        return took, shows
+    # Rung 2: real per-character keystrokes into the focused element. Ahead of the browser
+    # paste command on purpose — a widget that advances box-to-box as you type fills
+    # correctly with no paste handler at all, and typing can never truncate the way a
+    # paste into a maxlength=1 box does.
+    await loc.evaluate(GROUP_CLEAR_JS)
+    try:
+        # Same rule as the JS rung: never a scrolling focus (see PASTE_EVENT_JS).
+        await loc.evaluate("(el) => el.focus({ preventScroll: true })")
+        await page.keyboard.type(text, delay=30)
+        await page.wait_for_timeout(150)
+        took, shows = paste_took(text, await loc.evaluate(GROUP_VALUES_JS))
+    except Exception as exc:  # noqa: BLE001 - fall through to the last rung
+        logger.debug("replay keystroke paste failed: %s", exc)
+    if took:
+        return took, shows
+    # Rung 3: Chrome's own paste command, from the real clipboard — a genuine isTrusted
+    # event, for a widget that distributes on paste and REJECTS both of the above.
+    # Playwright reaches it through a CDP session on the page's context.
+    await loc.evaluate(GROUP_CLEAR_JS)
+    try:
+        await page.evaluate("(t) => navigator.clipboard.writeText(t)", text)
+        # Detached in the finally: a CDP session stays attached to the page for the life of
+        # the context otherwise, and this rung runs once per stubborn paste step.
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            await cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "v", "code": "KeyV",
+                "windowsVirtualKeyCode": 86, "modifiers": _PASTE_MODIFIER,
+                "commands": ["paste"]})
+            await cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "v", "code": "KeyV",
+                "windowsVirtualKeyCode": 86, "modifiers": _PASTE_MODIFIER})
+        finally:
+            try:
+                await cdp.detach()
+            except Exception as exc:  # noqa: BLE001 - a stale session must not fail the paste
+                logger.debug("cdp detach after native paste: %s", exc)
+        await page.wait_for_timeout(150)
+        took, shows = paste_took(text, await loc.evaluate(GROUP_VALUES_JS))
+    except Exception as exc:  # noqa: BLE001 - reported by the caller as a failed paste
+        logger.debug("replay native paste failed: %s", exc)
+    return took, shows
+
+
+async def _paste_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
+                            ) -> tuple[str, dict[str, Any] | None]:
+    """Resolve + paste, re-resolving after a settle if the field detaches mid-render.
+    Returns (selector_label, healed_winner_or_None); raises when the value did not land —
+    a silent miss corrupts every step after it exactly as a silent fill does."""
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            loc, sel, healed = await _resolve(page, step, timeout_ms, require_editable=True)
+            value = str(step.get("value", ""))
+            took, shows = await _paste_into(page, loc, value)
+            if not took:
+                raise RuntimeError(
+                    f"paste did not take: the widget reads {shows!r}, expected {value!r}")
+            return sel, healed
+        except Exception as exc:  # noqa: BLE001
+            if attempt < _MAX_ATTEMPTS - 1 and _is_transient(exc):
+                logger.info("paste step transient (%s); settling %dms then re-resolving "
+                            "(attempt %d/%d)", exc, _SETTLE_MS * 2, attempt + 2, _MAX_ATTEMPTS)
                 await page.wait_for_timeout(_SETTLE_MS * 2)
                 continue
             raise
@@ -2724,7 +3331,7 @@ _REOPEN_MS = 8000
 
 async def _click_with_flyout_recovery(
     page: Page, steps: list[dict[str, Any]], idx: int, timeout_ms: int
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, Page]:
     """Click step `idx`, and if its target is unreachable, re-click the nearest PREVIOUS click
     step once, then retry the target.
 
@@ -2737,11 +3344,15 @@ async def _click_with_flyout_recovery(
     """
     step = steps[idx]
     try:
-        return await _click_with_retry(page, step, timeout_ms)
+        return await _click_and_follow(page, step, timeout_ms)
     except Exception as exc:  # noqa: BLE001
         prev = next((steps[j] for j in range(idx - 1, -1, -1)
                      if steps[j].get("action") == "click"), None)
         if prev is None:
+            raise
+        if step.get("opens_tab") or prev.get("opens_tab"):
+            # Neither click may fire twice: re-clicking a tab opener is how one recorded
+            # click became two live tabs (see _click_with_retry's `once`).
             raise
         logger.info("click step %d unreachable (%s); re-clicking predecessor to reopen its "
                     "flyout, then retrying the target once", idx, str(exc)[:120])
@@ -2752,7 +3363,7 @@ async def _click_with_flyout_recovery(
         except Exception:  # noqa: BLE001 - recovery failed; surface the original failure
             raise exc
         logger.info("↺ flyout recovery succeeded for step %d (%s)", idx, sel)
-        return sel, healed
+        return sel, healed, page
 
 
 async def _upload_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
@@ -2806,6 +3417,33 @@ async def _upload_with_retry(page: Page, step: dict[str, Any], timeout_ms: int
     return sel or "input[type=file]", healed
 
 
+_NOTED_TOKEN = re.compile(r"\{\{noted:([A-Za-z0-9_]+)\}\}")
+
+
+def resolve_noted(text: str, extracted: dict[str, str]) -> str:
+    """Substitute {{noted:label}} tokens from the LIVE extract ledger (tier-0 twin of
+    SkillApi.noted). Raises rather than typing the token or a stale value: a self-noted
+    value is a fresh secret (an OTP, a generated reference) and typing yesterday's copy
+    passes every gate this pipeline has while doing nothing at all."""
+    def _one(m: "re.Match[str]") -> str:
+        value = str((extracted or {}).get(m.group(1)) or "").strip()
+        if not value:
+            raise RuntimeError(
+                f"noted value {m.group(1)!r} is empty — the step that captures it either "
+                f"did not run or read nothing (have: {sorted(extracted or {})})")
+        return value
+    return _NOTED_TOKEN.sub(_one, text)
+
+
+def _resolved_step(step: dict[str, Any], extracted: dict[str, str]) -> dict[str, Any]:
+    """`step` with its typed value's noted tokens resolved (a copy; never mutates)."""
+    for key in ("value", "text"):
+        raw = step.get(key)
+        if isinstance(raw, str) and _NOTED_TOKEN.search(raw):
+            step = {**step, key: resolve_noted(raw, extracted)}
+    return step
+
+
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
     """Execute compiled steps over a Playwright page. Returns {executed, failed_at, error, log}.
 
@@ -2828,8 +3466,10 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 # Tier-0 parity for compiled repeats: N clicks with the recorded wait
                 # between (the tier-1 verb adds the readiness poll on top).
                 for rep in range(int(step.get("count", 1))):
-                    sel, healed = await _click_with_flyout_recovery(page, steps, idx,
-                                                                    timeout_ms)
+                    # `page` is REBOUND when the recorded click opened a tab: every step
+                    # after it belongs to that tab (see _click_and_follow).
+                    sel, healed, page = await _click_with_flyout_recovery(page, steps, idx,
+                                                                          timeout_ms)
                     entry = {"step": idx, "action": action, "used": sel}
                     if healed:
                         entry["healed"] = healed
@@ -2852,14 +3492,24 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                     log.append({"step": idx, "action": "click", "used": sel})
                     await page.wait_for_timeout(_SETTLE_MS)
             elif action == "fill":
-                sel, healed = await _fill_with_retry(page, step, timeout_ms)
+                sel, healed = await _fill_with_retry(
+                    page, _resolved_step(step, extracted), timeout_ms)
+                entry = {"step": idx, "action": action, "used": sel}
+                if healed:
+                    entry["healed"] = healed
+                log.append(entry)
+                await page.wait_for_timeout(_SETTLE_MS)
+            elif action == "paste":
+                sel, healed = await _paste_with_retry(
+                    page, _resolved_step(step, extracted), timeout_ms)
                 entry = {"step": idx, "action": action, "used": sel}
                 if healed:
                     entry["healed"] = healed
                 log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "select":
-                sel, healed = await _select_with_retry(page, step, timeout_ms)
+                sel, healed = await _select_with_retry(
+                    page, _resolved_step(step, extracted), timeout_ms)
                 entry = {"step": idx, "action": action, "used": sel}
                 if healed:
                     entry["healed"] = healed
@@ -2871,7 +3521,8 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 # Types into the FOCUSED element — used for an open react-select menu, whose
                 # filter input owns focus. If focus is elsewhere the subsequent click-by-label
                 # times out and validation fails safely (no bad script is ever committed).
-                await page.keyboard.type(step["text"], delay=30)
+                await page.keyboard.type(
+                    resolve_noted(str(step["text"]), extracted), delay=30)
                 await page.wait_for_timeout(_SETTLE_MS)
             elif action == "scroll":
                 await _wheel_scroll(page, float(step.get("pages", 0.5)),
@@ -2883,9 +3534,17 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                                          verify_name=bool(step.get("verify_name")))
                 log.append({"step": idx, "action": action, "used": f"find_click:{name}"})
                 await page.wait_for_timeout(_SETTLE_MS)
-            elif action == "extract":
+            elif action in ("extract", "copy"):
                 value, used, healed = await _extract_value(page, step, timeout_ms)
                 merge_extract(extracted, str(step.get("label") or "value"), value)
+                if action == "copy":
+                    # The clipboard half of copy_text: a replayed paste_text that was
+                    # recorded WITHOUT its own text delivers from here.
+                    try:
+                        await page.evaluate(
+                            "(t) => navigator.clipboard.writeText(t)", value)
+                    except Exception as exc:  # noqa: BLE001 - clipboard is a convenience
+                        logger.debug("replay clipboard write failed: %s", exc)
                 entry = {"step": idx, "action": action, "used": used,
                          "value": value[:200]}
                 if healed:

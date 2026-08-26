@@ -327,3 +327,202 @@ def test_history_extracts_harvests_labels_collision_safe():
     ])
     assert hybrid._history_extracts(history) == {"title": "First", "title_2": "Fresh"}
     assert hybrid._history_extracts(SimpleNamespace(history=[])) == {}
+
+
+# --------------------------- adopting an app-opened tab ---------------------------
+# Run 20260824_163152: subtask 3 clicked the app's external-link button, did the whole
+# OTP handshake in the tab it opened, and reported "Proceed Securely submitted
+# successfully in the new tab" — then close_extra_tabs swept that tab as a misclick
+# popup on the way out of the segment, and subtask 4 (the edits that must happen INSIDE
+# the portal) had nowhere to run. The tab carries a per-request signed URL, so the
+# wording cannot name it and `tab_url` is never set.
+
+_ANNOUNCES = ("Now click on the external link button next to the ref. no, A new tab will "
+              "be open click Already have an OTP, enter the OTP got it from the previous "
+              "step and click proceed Securely.")
+_SILENT = ("Now click the + button next to payment, enter 4000 in the amount field, "
+           "click Save. Close this tab.")
+
+
+def _sub(template_prompt, tab_url=None):
+    return SimpleNamespace(template_prompt=template_prompt, tab_url=tab_url,
+                           instantiated_prompt=template_prompt, index=3)
+
+
+def test_announces_new_tab_matches_the_opener_only():
+    """The URL-free half of the aux test, against the live part2 slices."""
+    from automation.pipeline.decompose import announces_new_tab, _implied_tab_url
+
+    assert announces_new_tab(_ANNOUNCES) is True
+    assert _implied_tab_url(_ANNOUNCES) is None     # the APP supplies the address
+    assert announces_new_tab(_SILENT) is False
+    assert announces_new_tab("Go to Data Request and click Get OTP, note the OTP.") is False
+
+
+async def test_adopted_tab_survives_the_sweep_and_becomes_current():
+    hs, ctx, main = _session()
+    portal = FakePage("https://test.actingoffice.com/employeeapproval/abc123", ctx)
+    ctx.pages.append(portal)
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+    await hs.close_extra_tabs()
+
+    assert not portal.closed and not main.closed
+    assert hs.current_page() is portal          # the next subtask runs INSIDE it
+    # browser-use focus follows, or the next segment acts on (and records) the app tab.
+    assert [e.target_id for e in hs.session.event_bus.events] == [portal.tid]
+
+
+async def test_two_extra_tabs_are_ambiguous_and_none_is_adopted():
+    """One of them IS a misclick and nothing here can say which — today's sweep stands."""
+    hs, ctx, main = _session()
+    portal = FakePage("https://test.actingoffice.com/employeeapproval/abc123", ctx)
+    junk = FakePage("https://ads.example.com", ctx)
+    ctx.pages.extend([portal, junk])
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+    await hs.close_extra_tabs()
+
+    assert hs._aux_page is None
+    assert portal.closed and junk.closed
+    assert hs.current_page() is main
+
+
+async def test_silent_subtask_still_gets_its_popup_swept():
+    """The invariant this must not break: a tab nobody announced is a misclick."""
+    hs, ctx, main = _session()
+    junk = FakePage("https://popup.example.com", ctx)
+    ctx.pages.append(junk)
+
+    await hs.adopt_announced_tab(_sub(_SILENT))
+    await hs.close_extra_tabs()
+
+    assert junk.closed and hs._aux_page is None
+    assert hs.current_page() is main
+
+
+async def test_adoption_never_displaces_a_declared_helper_tab():
+    hs, ctx, main = _session()
+    aux = await hs.open_aux_tab("https://duckduckgo.com")
+    stray = FakePage("https://popup.example.com", ctx)
+    ctx.pages.append(stray)
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES, tab_url="https://duckduckgo.com"))
+
+    assert hs._aux_page is aux
+    await hs.close_extra_tabs()
+    assert stray.closed and not aux.closed
+
+
+async def test_closing_the_adopted_tab_hands_the_run_back_to_main():
+    """The task's own last instruction is "Close this tab." — after that current_page()
+    must fall back to the pinned app page rather than a dead handle."""
+    hs, ctx, main = _session()
+    portal = FakePage("https://test.actingoffice.com/employeeapproval/abc123", ctx)
+    ctx.pages.append(portal)
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    await portal.close()
+
+    assert hs.current_page() is main
+    await hs.close_extra_tabs()                 # a stale _aux_page ref stays harmless
+    assert not main.closed
+
+
+# ------------- which tab: the agent's focus, not the tab count (2026-08-26) -------------
+# Run 20260825_105115 seg 3: the OTP handshake succeeded in the portal tab, but a replay's
+# force-retry had opened that SAME tab twice, so two extras existed, `len(extras) != 1`
+# adopted nothing, close_extra_tabs took both, and the postcondition gate then measured the
+# app tab and failed a segment whose work had landed. Two tabs to one destination are not
+# ambiguous, and the agent had explicitly switched into the one it finished in — so the
+# question "which tab" is answered by the agent's focus, with the count rule kept only as
+# the fallback for when focus cannot be resolved.
+
+
+def _focus(hs, page):
+    """Point the fake browser-use session's agent focus at `page`."""
+    hs.session.get_focused_target = lambda: SimpleNamespace(target_id=page.tid)
+
+
+async def test_two_tabs_to_the_same_url_adopt_the_focused_one():
+    hs, ctx, main = _session()
+    first = FakePage("https://test.actingoffice.com/links/10/c/a/r/b/calcdatarequest", ctx)
+    second = FakePage("https://test.actingoffice.com/links/10/c/a/r/b/calcdatarequest", ctx)
+    ctx.pages += [first, second]
+    _focus(hs, second)                     # the tab the agent actually finished in
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    assert hs._aux_page is second
+    assert hs.current_page() is second     # so every page-dependent measurement follows
+    await hs.close_extra_tabs()
+    assert not second.closed and first.closed
+
+
+async def test_unresolvable_focus_with_two_extras_still_adopts_none():
+    """The count rule survives as the fallback: with no focus to ask and two genuinely
+    different tabs, one of them may be a misclick and nothing here can say which."""
+    hs, ctx, main = _session()
+    a = FakePage("https://portal.example.com/one", ctx)
+    b = FakePage("https://elsewhere.example.com/two", ctx)
+    ctx.pages += [a, b]
+    assert not hasattr(hs.session, "get_focused_target")   # nothing to ask
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    assert hs._aux_page is None
+
+
+async def test_unresolvable_focus_with_one_extra_adopts_it():
+    hs, ctx, main = _session()
+    only = FakePage("https://portal.example.com/one", ctx)
+    ctx.pages.append(only)
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    assert hs._aux_page is only
+
+
+async def test_focus_on_a_tab_is_ignored_when_the_subtask_announced_nothing():
+    """The wording gate still leads: a tab the task never mentioned is a misclick popup,
+    however firmly the agent is focused on it."""
+    hs, ctx, main = _session()
+    popup = FakePage("https://ads.example.com/popup", ctx)
+    ctx.pages.append(popup)
+    _focus(hs, popup)
+
+    await hs.adopt_announced_tab(_sub(_SILENT))
+
+    assert hs._aux_page is None
+    await hs.close_extra_tabs()
+    assert popup.closed
+
+
+async def test_focus_resolution_failure_degrades_to_the_count_rule():
+    """A raising focus probe must not break adoption."""
+    hs, ctx, main = _session()
+    only = FakePage("https://portal.example.com/one", ctx)
+    ctx.pages.append(only)
+
+    def _boom():
+        raise RuntimeError("session manager gone")
+    hs.session.get_focused_target = _boom
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    assert hs._aux_page is only
+
+
+async def test_no_adoption_when_the_pinned_main_page_has_died():
+    """current_page() re-pins a survivor as MAIN; adopting that same page as AUX would
+    give one tab both roles."""
+    hs, ctx, main = _session()
+    await main.close()
+    survivor = FakePage("https://app.example.com/books/x", ctx)
+    ctx.pages.append(survivor)
+
+    await hs.adopt_announced_tab(_sub(_ANNOUNCES))
+
+    assert hs._aux_page is None
+    assert hs.current_page() is survivor        # re-pinned as MAIN, not adopted as AUX
+    assert hs._main_page is survivor

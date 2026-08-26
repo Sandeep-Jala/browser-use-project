@@ -95,6 +95,9 @@ class FakeSession:
     async def current_url(self):
         return "http://app/section"
 
+    async def current_title(self):
+        return ""
+
     async def open_aux_tab(self, url):
         if self.aux_open_error:
             raise RuntimeError(self.aux_open_error)
@@ -119,6 +122,9 @@ class FakeSession:
         seg = self.replays.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
         seg.prompt = sub.instantiated_prompt
+        # Mirror the real replay_segment, which stamps the node kind onto the segment it
+        # builds — without this the stub reports every replay as an "action".
+        seg.kind = getattr(sub, "kind", "action")
         return seg
 
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
@@ -309,11 +315,14 @@ async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
     assert json.loads(ss.steps_path(judge_sid).read_text()) == hollow
 
 
-async def test_loop_node_never_replays_never_commits(stores, monkeypatch):
-    """A repeat-until subtask must run live even when a stale library entry exists (a
-    replayed loop walks a FIXED number of iterations and lands on the wrong row — the
-    observed wrong-employee bug), and its recording must never be committed: the
-    iteration count is live page state."""
+async def test_loop_node_records_commits_and_replays(stores, monkeypatch):
+    """Loops CACHE (user decision 2026-08-25), reversing the older never-cached rule.
+
+    What the entry stores is the iteration count the authoring agent stopped at; the
+    user's position is that a recording replays in the setting it was made in, so that
+    count holds. Overshoot stays honest for free — repeat_click's readiness poll raises
+    when the control runs out early. An UNDER-run stops quietly at the cached count; no
+    guard was built for that, by decision."""
     loop_line = ("process the employees one at a time by clicking Save and Next, and "
                  "after each click check that the next employee has loaded, stopping "
                  "as soon as Owen Millar is the employee shown")
@@ -324,21 +333,46 @@ async def test_loop_node_never_replays_never_commits(stores, monkeypatch):
     ))
     ctx = ss.normalize_context("http://app/section")
     loop_sid = ss.subtask_id(loop_line, ctx)
-    stale = [{"action": "click", "selector": "#save-next"}] * 5   # the old row-jumper
-    _seed_entry(loop_sid, stale)
+    cached = [{"action": "click", "selectors": ["css=#save-next"], "count": 5}]
+    _seed_entry(loop_sid, cached)
 
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")],
+                       replays=[_seg(True)])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    # The loop REPLAYED its entry instead of running the agent — and still reports as a
+    # loop, which it did not before replay_segment carried the kind through.
+    assert [s["kind"] for s in result.subtasks] == ["action", "loop"]
+    assert fake.replay_calls == 1
+    assert result.subtasks[1]["mode"] == "replay"
+    assert result.subtasks[1]["skip_reason"] is None
+
+
+async def test_a_loop_that_authors_gets_a_recording_path(stores, monkeypatch):
+    """The other half: a loop with no entry must RECORD. `commit=False` used to null the
+    record path, so loop segments wrote no history at all — nothing to cache even if the
+    commit gate opened."""
+    loop_line = ("process the employees one at a time by clicking Save and Next, and "
+                 "after each click check that the next employee has loaded, stopping "
+                 "as soon as Owen Millar is the employee shown")
+    prompt = "go to the section. " + loop_line
+    spec = TaskSpec(key="l2", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt=loop_line),
+    ))
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub(
+        [{"action": "click", "selectors": ["css=#save-next"], "count": 5}]))
     fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
                                           _seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
     result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
 
     assert result.is_successful is True
-    assert fake.replay_calls == 0 and fake.agent_calls == 2
-    assert [s["kind"] for s in result.subtasks] == ["action", "loop"]
-    # The loop agent ran WITHOUT a recording path, and the stale entry was not replaced.
-    assert fake.record_paths[1] is None
-    assert not ss.recording_path(loop_sid).exists()
-    assert json.loads(ss.steps_path(loop_sid).read_text()) == stale
+    assert fake.record_paths[1] is not None       # it recorded
+    ctx = ss.normalize_context("http://app/section")
+    assert ss.subtask_id(loop_line, ctx) in ss.load_manifest()   # ...and committed
 
 
 async def test_conditional_guard_never_replays_never_commits(stores, monkeypatch):
@@ -784,6 +818,14 @@ async def test_aux_tab_closes_even_when_the_segment_fails(stores, monkeypatch):
 async def test_aux_sid_keyed_on_tab_url_context_and_manifest_records_it(stores, monkeypatch):
     """Aux identity comes from the DECLARED tab URL (host-qualified), not the main page —
     so the same helper procedure is ONE library entry across every hosting task."""
+    # The slice says "note the title of the top result", so its recording carries the
+    # capture — without one the producer commit guard refuses it, and rightly: a replay
+    # that notes nothing leaves its consumers replaying stale values.
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "goto", "url": "https://duckduckgo.com"},
+        {"action": "extract", "label": "top_result_title",
+         "selectors": ["xpath=/html/body/h3"]},
+    ]))
     fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
                                           _seg(True, mode="authored")])
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
@@ -948,7 +990,8 @@ BOUND_SPEC = TaskSpec(key="b1", prompt=BOUND_PROMPT, subtasks=(
 
 def _fill_steps_stub(steps):
     """A hybrid.save_steps stand-in: pretend the recording compiled to `steps`."""
-    def stub(rec, steps_path, max_steps=None, emit_start_goto=False, repeat_hint=None):
+    def stub(rec, steps_path, max_steps=None, emit_start_goto=False, repeat_hint=None,
+             loop=False):
         steps_path.parent.mkdir(parents=True, exist_ok=True)
         steps_path.write_text(json.dumps(steps))
         return steps
@@ -1003,6 +1046,81 @@ async def test_consumer_with_structured_source_commits_bindings_then_replays(
     assert fake2.replay_calls == 2 and fake2.agent_calls == 0
     assert result2.subtasks[1]["mode"] == "replay"
     assert result2.subtasks[1]["skip_reason"] is None
+
+
+async def test_pasted_otp_binds_where_six_one_character_fills_could_not(
+        stores, monkeypatch):
+    """Run 20260825_090938, subtask 6e8c9bb7ee56a6aa: the OTP dialog has six 1-character
+    boxes, so the recording typed six 1-character fills and the code the run actually used
+    never appeared as a step value. Nothing was flagged (the findings match on whole
+    tokens; the length floors skip 1-char values), `runtime_values` came out empty, and the
+    commit was refused — 107k tokens and 143s of re-authoring every run.
+
+    Delivered as ONE paste, the same segment binds through the machinery that already
+    exists, INCLUDING the line slice: extract_data captured the OTP with the whole employee
+    panel stuck to it, so the code is line 0 of a multi-line source."""
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    otp_block = "502956\nSelect Employee\nAarmaan Aman\nGender\nMale"
+
+    # What the OTP segment records once it pastes instead of typing box by box.
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "paste", "selectors": ['css=[aria-label="Please enter OTP character 1"]'],
+         "value": "502956"},
+        {"action": "click", "selectors": ['text="Proceed Securely"']},
+    ]))
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="otp = 502956",
+             extracted={"otp": otp_block}),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT, spec=BOUND_SPEC)
+
+    assert result.is_successful is True
+    entry = ss.load_manifest()[consumer_sid]
+    assert entry["bindings"] == {
+        "bound_1": {"kind": "extract", "label": "otp",
+                    "transform": {"line": {"index": 0, "count": 1, "join": " "}}}}
+    tmpl = json.loads(ss.template_path(consumer_sid).read_text())
+    assert tmpl["steps"][0]["value"] == "{{bound_1}}"
+
+    # Next run: a FRESH code, resolved from this run's own capture — never the authoring
+    # run's 502956, which by then the app has long since invalidated.
+    fake2 = FakeSession(_runner(), replays=[
+        _seg(True, finding="otp = 771403",
+             extracted={"otp": "771403\nSelect Employee\nAarmaan Aman"}),
+        _seg(True),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake2))
+    result2 = await run_hybrid_task(fake2.runner or _runner(), BOUND_PROMPT, spec=BOUND_SPEC)
+
+    assert result2.is_successful is True
+    assert fake2.replay_calls == 2 and fake2.agent_calls == 0
+    assert result2.subtasks[1]["mode"] == "replay"
+
+
+async def test_six_one_character_fills_are_still_refused(stores, monkeypatch, capsys):
+    """The regression guard for the OTHER half of that diagnosis: without a paste there is
+    still nothing to bind, and the segment must keep authoring rather than cache six digits
+    that were only ever valid for one run."""
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub(
+        [{"action": "fill",
+          "selectors": [f'css=[aria-label="Please enter OTP character {n}"]'],
+          "value": d}
+         for n, d in enumerate("502956", start=1)]))
+    fake = FakeSession(_runner(), agents=[
+        _seg(True, mode="authored", finding="otp = 502956",
+             extracted={"otp": "502956\nSelect Employee"}),
+        _seg(True, mode="authored"),
+    ])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT, spec=BOUND_SPEC)
+
+    ctx = ss.normalize_context("http://app/section")
+    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
+    assert consumer_sid not in ss.load_manifest()
+    assert "no bindable runtime value" in capsys.readouterr().out
 
 
 async def test_consumer_commit_drops_a_typed_value_that_has_no_provenance(
@@ -1305,15 +1423,19 @@ def test_segment_step_budget_marker_headroom():
 
 
 def test_segment_step_budget_loop_headroom():
-    """A loop segment's one budget must cover EVERY iteration (observed live: 17 Save &
-    Next advances to reach the named employee; a successful fully-live pass needed 35
-    steps). Judge and action nodes stay flat; marker and loop headroom stack."""
+    """A loop segment's one budget must cover EVERY iteration, and an iteration is not
+    one click: run 20260824_165824 measured 10 agent steps to fill one employee's three
+    portal dialogs, against a 12-employee list. Judge and action nodes stay flat; marker
+    and loop headroom stack."""
     from automation.pipeline.hybrid import segment_step_budget
 
-    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") == 60
+    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") == 145
     assert segment_step_budget(Gate(kind="steps"), 25, kind="judge") == 25
     assert segment_step_budget(Gate(kind="marker", marker="Payroll"), 25,
-                               kind="loop") == 70
+                               kind="loop") == 155
+    # 12 employees x the measured 10 steps each, with the base left over for setup and
+    # recovery — the shape the old 60-step ceiling starved.
+    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") >= 12 * 10
 
 
 # ------------------------------- unit: gates -------------------------------
@@ -1717,3 +1839,60 @@ async def test_failed_replay_keeps_its_extracts_and_records_why(stores, monkeypa
     assert result.subtasks[0]["replay_error"] == "boom"
     values = json.loads((run_dir / hybrid.VALUES_FILE).read_text())
     assert values["identity_block"] == "Aaran Duncan"
+
+
+# ---------------- producer slices: cacheable, but only with a real capture ----------------
+# node_kind now resolves NOTING wording ("note and remember the OTP") to an action rather
+# than a judge — its replay is a live extract, not a hollow assertion, exactly as the
+# tab_url carve-out has always assumed. That only holds while the recording actually
+# CONTAINS the extract, so the commit guard below is what licenses the classification.
+
+_NOTING_SPEC = TaskSpec(
+    key="k", prompt=PROMPT, marker="Invoices",
+    subtasks=(
+        SubtaskDecl(prompt="open the panel and note the reference number shown"),
+        SubtaskDecl(prompt="add invoice for customer {{customer}} and click save",
+                    values={"customer": "Suresh Gopi"}, marker="Invoices"),
+    ),
+)
+
+
+async def test_noting_segment_without_an_extract_refuses_the_commit(stores, monkeypatch,
+                                                                    capsys):
+    """Prose-only noting must not cache. Its replay would report nothing, the run's
+    findings would go quiet, and the consumer gate — which keys on bool(findings) — would
+    let every downstream consumer replay THIS run's stale values instead."""
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "click", "selectors": ["xpath=/html/body/button"]},
+    ]))
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), PROMPT, spec=_NOTING_SPEC,
+                                   marker="Invoices")
+
+    assert result.is_successful is True          # the run itself is fine
+    noting_sid = ss.subtask_id(_NOTING_SPEC.subtasks[0].prompt,
+                               ss.normalize_context("http://app/start"))
+    assert noting_sid not in ss.load_manifest()  # the noting segment cached nothing
+    assert "NOTES a value" in capsys.readouterr().out
+
+
+async def test_noting_segment_with_an_extract_commits(stores, monkeypatch):
+    """The whole point: a noting slice whose recording carries the capture DOES cache,
+    and its replayed extract re-reads the value fresh every run."""
+    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
+        {"action": "click", "selectors": ["xpath=/html/body/button"]},
+        {"action": "extract", "label": "reference_number",
+         "selectors": ["xpath=/html/body/span"]},
+    ]))
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
+                                          _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), PROMPT, spec=_NOTING_SPEC,
+                          marker="Invoices")
+
+    committed = ss.load_manifest()
+    assert committed, "a noting slice WITH an extract step must be cacheable"
+    assert any("note the reference number" in e["template_prompt"]
+               for e in committed.values())
