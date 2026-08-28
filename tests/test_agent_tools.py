@@ -1421,3 +1421,327 @@ async def test_find_by_text_listing_without_click_first_stays_a_result():
     assert res.error is None
     assert "2 match(es)" in res.extracted_content
     assert "click(index) NOW" in res.extracted_content
+
+
+# --- select_dropdown addressed by its neighbouring label -------------------------------
+# select_dropdown was the one tool that always worked on the Send Email "From" field
+# (4/4 in run 20260827_012631) and the only one that demanded an INDEX. near_text removes
+# the index so the task's own wording maps to a single call. These exercise the resolver
+# JS against a DOM shaped like the live one: the label is a BARE TEXT NODE sharing a block
+# with the widget's current value, and react-select nests its input four levels deep.
+
+import json
+
+from automation.pipeline.agent_tools import _CB_RESOLVE_BY_TEXT_JS
+from tests.test_heal_promotion import _launch
+
+_EMAIL_PANEL = """
+  <div class='email-panel'>
+    <span>Send email</span>
+    <div class='form-row'>
+      From
+      <div class='rs-container'><div class='rs-control'><div class='rs-valueContainer'>
+        <div class='rs-singleValue'>Me</div>
+        <div class='rs-inputContainer'>
+          <input class='rs-input' id='react-select-20-input' type='text' role='combobox'
+                 aria-autocomplete='list' aria-expanded='false' aria-haspopup='true'>
+        </div>
+      </div></div></div>
+      <label><input type='checkbox'> Include signature</label>
+    </div>
+    <button id='mailbtn'>Send</button>
+  </div>
+"""
+
+
+async def _resolve(html, near_text):
+    from playwright.async_api import async_playwright
+
+    tokens = [t for t in near_text.lower().replace("-", " ").split() if t]
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(html)
+        try:
+            return await page.evaluate(_CB_RESOLVE_BY_TEXT_JS % json.dumps(tokens))
+        finally:
+            await browser.close()
+
+
+async def test_from_resolves_to_the_nameless_react_select_input():
+    got = await _resolve(_EMAIL_PANEL, "From")
+    assert len(got["hits"]) == 1
+    assert got["hits"][0]["id"] == "react-select-20-input"
+    assert got["hits"][0]["native"] is False
+
+
+async def test_two_dropdowns_are_told_apart_by_their_labels():
+    """Three anonymous comboboxes on one page is the live shape — each must resolve to
+    itself, and never to a neighbour."""
+    html = """<div>
+        <div class='row'>Tax year<div><div><input role='combobox' id='cb-a'></div></div></div>
+        <div class='row'>Period<div><div><input role='combobox' id='cb-b'></div></div></div>
+      </div>"""
+    a = await _resolve(html, "Tax year")
+    b = await _resolve(html, "Period")
+    assert [h["id"] for h in a["hits"]] == ["cb-a"]
+    assert [h["id"] for h in b["hits"]] == ["cb-b"]
+
+
+async def test_an_ambiguous_label_reports_every_match():
+    """Two boxes under the same word must REFUSE, not silently take the first — this page
+    has comboboxes with no distinguishing attributes at all."""
+    html = """<div>
+        <div class='row'>Amount<div><input role='combobox' id='cb-a'></div></div>
+        <div class='row'>Amount<div><input role='combobox' id='cb-b'></div></div>
+      </div>"""
+    got = await _resolve(html, "Amount")
+    assert len(got["hits"]) == 2
+
+
+async def test_a_miss_reports_the_labels_that_do_exist():
+    got = await _resolve(_EMAIL_PANEL, "Subject")
+    assert got["hits"] == []
+    assert any("From" in lbl for lbl in got["labels"])
+
+
+async def test_a_native_select_is_found_and_flagged_native():
+    html = """<div class='row'>Country<select id='sel-a'>
+                <option>United Kingdom</option><option>Australia</option></select></div>"""
+    got = await _resolve(html, "Country")
+    assert len(got["hits"]) == 1
+    assert got["hits"][0]["native"] is True
+
+
+async def test_a_real_label_element_and_aria_label_both_win():
+    """The wired-up rungs still take priority over the neighbour text."""
+    html = """<div class='row'>Ignore me
+                <input role='combobox' id='cb-a' aria-label='Tax year'></div>"""
+    got = await _resolve(html, "Tax year")
+    assert [h["id"] for h in got["hits"]] == ["cb-a"]
+
+
+async def test_a_hidden_dropdown_is_not_a_match():
+    """A collapsed panel's twin must not shadow the visible control the user named."""
+    html = """<div>
+        <div class='row' style='display:none'>From<input role='combobox' id='cb-hidden'></div>
+        <div class='row'>From<input role='combobox' id='cb-live'></div>
+      </div>"""
+    got = await _resolve(html, "From")
+    assert [h["id"] for h in got["hits"]] == ["cb-live"]
+
+
+async def test_native_select_by_label_stamps_a_replayable_identity():
+    """compile keys the native-select step on metadata.interacted_element; without it the
+    pick is dropped and replay submits the form with its defaults. The resolver's synthetic
+    'ao-cb-N' id must NOT reach that identity — it does not exist on the next run."""
+    from playwright.async_api import async_playwright
+
+    from automation.pipeline.agent_tools import _NATIVE_SELECT_BY_ID_JS
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(
+            "<div>Country<select name='country' id='ao-cb-1'>"
+            "<option>United Kingdom</option><option>Australia</option></select></div>")
+        try:
+            got = await page.evaluate(_NATIVE_SELECT_BY_ID_JS % {
+                "id": json.dumps("ao-cb-1"), "want": json.dumps("Australia")})
+        finally:
+            await browser.close()
+    assert got["ok"] is True
+    assert got["shows"] == "Australia"
+    assert got["attrs"]["name"] == "country"
+    assert "id" not in got["attrs"], "synthetic resolver id must not become a selector"
+
+
+def test_near_text_takes_precedence_over_a_supplied_index():
+    """Live run 20260827_0152: the agent supplies BOTH (near_text='From', index=348). An
+    `index < 0` guard made the label dead weight and left the pick riding a guessed index.
+    The label is the robust address; the index is only the fallback."""
+    src = pathlib.Path(agent_tools.__file__).read_text()
+    body = src[src.index("async def select_dropdown("):]
+    body = body[:body.index("\n    @tools.action")]
+    assert "if near_text.strip():" in body, "near_text must be tried first, unconditionally"
+    assert "if not by_label.error or index < 0:" in body, "index is the fallback only"
+
+
+async def test_the_label_resolver_stamps_the_widget_root():
+    """The 'state' read-back reads the widget root via [data-ao-cb-root]. Without the same
+    stamp the index path sets, the label path clicked the right option and then failed its
+    OWN verification: "the combobox does not show it (reads: '')" (live run 20260827_0159).
+    A unique hit must leave exactly one stamped root, and it must contain the input."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await _launch(pw)
+        page = await browser.new_page()
+        await page.set_content(_EMAIL_PANEL)
+        try:
+            await page.evaluate(_CB_RESOLVE_BY_TEXT_JS % json.dumps(["from"]))
+            roots = await page.eval_on_selector_all(
+                "[data-ao-cb-root]",
+                "els => els.map(e => !!e.querySelector('#react-select-20-input'))")
+            # An ambiguous resolve must NOT leave a stamp pointing at an arbitrary box.
+            await page.evaluate(_CB_RESOLVE_BY_TEXT_JS % json.dumps(["nosuchlabel"]))
+            after_miss = await page.eval_on_selector_all("[data-ao-cb-root]", "els => els.length")
+        finally:
+            await browser.close()
+    assert roots == [True], f"expected exactly one stamped root holding the input, got {roots}"
+    assert after_miss == 1, "a miss must leave the previous stamp alone, not re-point it"
+
+
+# --------------------------- close: last-tab guard ---------------------------
+#
+# Run 20260827_091313 (subtask 8, "… click submit, and then close this tab"): the agent
+# closed the aux client tab correctly, then closed the app's own /datarequests tab one step
+# later on an invented memory of a third tab. Zero tabs remained, browser-use spawned a
+# fresh about:blank, and the next subtask had no app page and no history to go back to — it
+# guessed a URL, hit ERR_NAME_NOT_RESOLVED, and the run stopped. `close` is stock
+# browser-use with no wrapper, so nothing stood between that second call and the workflow's
+# only page.
+
+
+class _FakeTabSession:
+    """browser_session double exposing just get_tabs() — what the guard reads."""
+
+    def __init__(self, tab_ids, raises=False):
+        from types import SimpleNamespace
+
+        self._tabs = [SimpleNamespace(target_id="0000" + t, url="https://test.actingoffice.com/x")
+                      for t in tab_ids]
+        self._raises = raises
+
+    async def get_tabs(self):
+        if self._raises:
+            raise RuntimeError("browser not connected")
+        return self._tabs
+
+
+async def test_close_refuses_the_last_open_tab():
+    fn, pm = _registered_action("close")
+    session = _FakeTabSession(["85A6"])
+
+    res = await fn(params=pm(tab_id="85A6"), browser_session=session)
+
+    # error channel: multi_act must stop, and a queued `done` must not ride on a close
+    # that never happened.
+    assert res.error, f"expected a refusal, got {res!r}"
+    assert "85A6" in res.error
+    assert "last" in res.error.lower()
+    assert not res.extracted_content or "Closed tab" not in res.extracted_content
+
+
+async def test_close_proceeds_when_another_tab_would_remain():
+    fn, pm = _registered_action("close")
+    session = _FakeTabSession(["85A6", "9CD7"])
+
+    res = await fn(params=pm(tab_id="9CD7"), browser_session=session)
+
+    assert not res.error, f"a non-final close must be delegated, got {res.error!r}"
+
+
+async def test_close_fails_open_when_the_tab_list_is_unreadable():
+    """Never break the close path over a diagnosis: an unreadable tab list delegates."""
+    fn, pm = _registered_action("close")
+    session = _FakeTabSession(["85A6"], raises=True)
+
+    res = await fn(params=pm(tab_id="85A6"), browser_session=session)
+
+    assert not res.error, f"unreadable tab list must fail open, got {res.error!r}"
+
+
+# ---- a click_first miss is a REFUSAL, not a probe (run 20260827_104331) --------------
+# The OTP segment batched find_by_text('Close', click_first) -> click(index). The find
+# missed, said so on the SUCCESS channel, and multi_act ran the queued click anyway: the
+# Payroll Review panel was never closed, the click fired against an unchanged page, and
+# the half-trace was committed as if the close had happened (entry 07044b6a0dbf7988).
+
+async def test_a_click_first_miss_rides_the_error_channel(monkeypatch):
+    async def raw(_session, _expr, **kw):
+        return {"count": 0}                       # nothing, control-shaped or static
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Close", click_first=True),
+                   browser_session=_FakeBrowserSession({}))
+
+    assert res.error and "0 matches" in res.error
+    assert not res.extracted_content                 # nothing on the success channel
+    assert (res.metadata or {}).get("no_click") is True
+
+
+async def test_a_probe_miss_still_rides_the_success_channel(monkeypatch):
+    """click_first=False IS a question — "is this text here?" — and no is a valid answer."""
+    async def raw(_session, _expr, **kw):
+        return {"count": 0}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Close"), browser_session=_FakeBrowserSession({}))
+
+    assert not res.error
+    assert "0 matches" in res.extracted_content
+    assert (res.metadata or {}).get("no_click") is True
+
+
+async def test_a_click_first_miss_on_static_text_also_refuses(monkeypatch):
+    """The static-text branch is the same fact — nothing was clicked — so a click_first
+    call must stop the batch there too, while a probe keeps its helpful receipt."""
+    async def raw(_session, expr, **kw):
+        if "DOCLICK" in expr:
+            return {"count": 0}
+        return {"count": 1, "name": "Period to",
+                "element": {"tag": "div", "attrs": {}, "xpath": ""}}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Period to", click_first=True),
+                   browser_session=_FakeBrowserSession({}))
+
+    assert res.error and "STATIC text" in res.error
+    assert (res.metadata or {}).get("no_click") is True
+
+
+async def test_a_nameless_click_stamps_the_row_it_happened_in(monkeypatch):
+    # The recording side of the wrong-row fix (run 20260827_104331): a click with no name
+    # of its own compiles to a positional row path unless the row travels with it.
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+
+    async def fake_row_cells(_session, _node):
+        return {"scope": '[role="row"]', "cells": ["PR/01797494/27/CDR072"]}
+
+    monkeypatch.setattr(agent_tools, "_row_cells", fake_row_cells)
+    node = _FakeDomNode("", attributes={"title": "Open payroll review request as client"})
+
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4), _FakeBrowserSession({4: node}))
+
+    row = ((res.metadata or {}).get("interacted_element") or {}).get("row")
+    assert row and row["cells"] == ["PR/01797494/27/CDR072"]
+
+
+async def test_a_named_click_stamps_no_row(monkeypatch):
+    """A named control is guarded by expect_text at replay; the probe must not run."""
+    from types import SimpleNamespace
+
+    _dialog_states(monkeypatch, {"in_dialog": False, "open": 0}, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    probed = []
+
+    async def fake_row_cells(_session, node):
+        probed.append(node)
+        return {"scope": "tr", "cells": ["nope"]}
+
+    monkeypatch.setattr(agent_tools, "_row_cells", fake_row_cells)
+    node = _FakeDomNode("", attributes={"aria-label": "Delete row"})
+
+    res = await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4), _FakeBrowserSession({4: node}))
+
+    assert not probed
+    assert not ((res.metadata or {}).get("interacted_element") or {}).get("row")

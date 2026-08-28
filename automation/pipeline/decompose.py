@@ -88,6 +88,24 @@ _LOOP_STOP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# An exhaustion phrase carries BOTH cues at once, so it stands alone. "for all of the
+# REMAINING employees" states the repetition (all of them) and the stop condition (the set
+# depletes) in one breath, which is why the repeat+stop pair above misses it: it has no
+# repeat verb and no "until". Run 20260827_091313 subtask 8 compiled its eleven Next
+# clicks to ONE because of exactly this gap.
+#
+# Keyed on the DEPLETING SET ("remaining"), not on the quantifier, and it must follow an
+# iteration preposition. Two deliberate exclusions:
+#   - "Click Next for rest of the employees" stays an ACTION (test_node_kind_loop_detection
+#     pins that ruling to run 20260824_165824, where the slice bundled multi-step per-employee
+#     work); only "remaining" is read as exhaustion here.
+#   - a bare adjective ("tick the remaining periods checkbox") is not an iteration — without
+#     the preposition it never matches.
+_LOOP_EXHAUST_RE = re.compile(
+    r"\b(?:for|through|across)\s+(?:all|each|every|the)?\s*(?:of\s+)?(?:the\s+)?remaining\b",
+    re.IGNORECASE,
+)
+
 # A judge phrase that IS the subtask's head directive ("Verify that each filter...", "Then
 # check that entries do not repeat...") keeps the node a judge even when iteration cues
 # appear in WHAT it checks — only a leading imperative action with verification folded
@@ -168,9 +186,10 @@ def node_kind(template_prompt: str, marker: str | None,
         if produces:
             return "action"
         return "judge"
-    if _LOOP_REPEAT_RE.search(template_prompt) \
-            and _LOOP_STOP_RE.search(template_prompt) \
-            and not _LEADING_JUDGE_RE.match(template_prompt):
+    iterates = (_LOOP_REPEAT_RE.search(template_prompt)
+                and _LOOP_STOP_RE.search(template_prompt)) \
+        or _LOOP_EXHAUST_RE.search(template_prompt)
+    if iterates and not _LEADING_JUDGE_RE.match(template_prompt):
         return "loop"
     return "action"
 

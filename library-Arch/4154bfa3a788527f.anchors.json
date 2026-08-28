@@ -1,0 +1,187 @@
+{
+  "data-request": {
+    "selectors": [
+      "xpath=/html/body/div[1]/div/div/div/div[1]/div/div/nav/div/div[1]/ul/li[8]/a",
+      "css=[id=\"datarequest\"]",
+      "css=[aria-label=\"Data Request\"]",
+      "css=a[href=\"/paye/clients/6a61d0ab5636abb464ba0e13/datarequests\"]"
+    ],
+    "fingerprint": {
+      "tag": "a",
+      "role": "link",
+      "text": "Data Request",
+      "attrs": {
+        "id": "datarequest",
+        "aria-label": "Data Request",
+        "href": "/paye/clients/6a61d0ab5636abb464ba0e13/datarequests"
+      },
+      "xpath": "html/body/div[1]/div/div/div/div[1]/div/div/nav/div/div[1]/ul/li[8]/a",
+      "bounds": {
+        "x": 0.0,
+        "y": 264.0,
+        "width": 200.0,
+        "height": 32.0
+      }
+    },
+    "expect_text": "Data Request"
+  },
+  "request": {
+    "selectors": [
+      "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[2]/div/div/div/div[1]/div[1]/button"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "menuitem",
+      "text": "Request",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[2]/div/div/div/div[1]/div[1]/button",
+      "bounds": {
+        "x": 219.0,
+        "y": 69.0,
+        "width": 102.9453125,
+        "height": 34.0
+      }
+    },
+    "expect_text": "Request"
+  },
+  "payroll-review": {
+    "selectors": [
+      "xpath=/html/body/div[2]/div/div/div/div/div/div/div/ul/li[2]/button",
+      "css=[title=\"Email to client to get employees updated information through payroll review request.\"]"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "menuitem",
+      "text": "Payroll review",
+      "attrs": {
+        "title": "Email to client to get employees updated information through payroll review request."
+      },
+      "xpath": "html/body/div[2]/div/div/div/div/div/div/div/ul/li[2]/button",
+      "bounds": {
+        "x": 223.0,
+        "y": 135.0,
+        "width": 192.0,
+        "height": 32.0
+      }
+    },
+    "expect_text": "Payroll review"
+  },
+  "detailed": {
+    "selectors": [
+      "xpath=/html/body/div[2]/div[2]/div/div/div/div/div/div/ul/li[2]/button",
+      "css=[title=\"Detail data request.\"]"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "menuitem",
+      "text": "Detailed",
+      "attrs": {
+        "title": "Detail data request."
+      },
+      "xpath": "html/body/div[2]/div[2]/div/div/div/div/div/div/ul/li[2]/button",
+      "bounds": {
+        "x": 419.0,
+        "y": 171.0,
+        "width": 110.0,
+        "height": 32.0
+      }
+    },
+    "expect_text": "Detailed"
+  },
+  "react-select-15-input": {
+    "selectors": [
+      "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div/div/div/div[2]/div/div[3]/div/div/div/div[1]/div[2]/input"
+    ],
+    "fingerprint": {
+      "tag": "input",
+      "role": "combobox",
+      "attrs": {
+        "id": "react-select-15-input"
+      },
+      "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div/div/div/div[2]/div/div[3]/div/div/div/div[1]/div[2]/input",
+      "bounds": {
+        "x": 1271.8046875,
+        "y": 37.25,
+        "width": 3.5625,
+        "height": 19.5
+      }
+    }
+  },
+  "row2168-0-checkbox": {
+    "selector_template": "css=[id$=\"-{n}-checkbox\"]",
+    "fingerprint": {
+      "tag": "div",
+      "role": "checkbox",
+      "attrs": {
+        "id": "row2168-0-checkbox",
+        "data-automationid": "DetailsRowCheck"
+      },
+      "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[2]/div/div/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div[1]/div",
+      "bounds": {
+        "x": 940.0,
+        "y": 99.0,
+        "width": 40.0,
+        "height": 32.0
+      }
+    }
+  },
+  "row": {
+    "selectors": [
+      "css=[role=\"row\"]:has-text(\"Declan Moore\") div[role=\"gridcell\"]",
+      "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[2]/div/div/div/div/div[2]/div/div/div/div/div[1]/div[6]/div/div[1]",
+      "css=*:text-is(\"Danny Paterson\") >> xpath=ancestor-or-self::*[.//div][1]//div"
+    ],
+    "fingerprint": {
+      "tag": "div",
+      "role": "gridcell",
+      "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[2]/div/div/div/div/div[2]/div/div/div/div/div[1]/div[6]/div/div[1]",
+      "bounds": {
+        "x": 940.0,
+        "y": 264.0,
+        "width": 40.0,
+        "height": 32.0
+      }
+    }
+  },
+  "row2609-6-checkbox": {
+    "selector_template": "css=[id$=\"-{n}-checkbox\"]",
+    "fingerprint": {
+      "tag": "div",
+      "role": "checkbox",
+      "attrs": {
+        "id": "row2609-6-checkbox",
+        "data-automationid": "DetailsRowCheck"
+      },
+      "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[2]/div/div/div/div/div[2]/div/div/div/div/div[1]/div[7]/div/div[1]/div",
+      "bounds": {
+        "x": 940.0,
+        "y": 297.0,
+        "width": 40.0,
+        "height": 32.0
+      }
+    }
+  },
+  "save": {
+    "selectors": [
+      "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div/div/div/div[2]/div/button[2]"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "button",
+      "text": "Save",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div/div/div/div[2]/div/button[2]",
+      "bounds": {
+        "x": 1358.734375,
+        "y": 634.0,
+        "width": 71.265625,
+        "height": 26.0
+      }
+    },
+    "expect_text": "Save"
+  }
+}

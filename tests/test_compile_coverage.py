@@ -1963,3 +1963,406 @@ def test_a_loops_wait_separated_clicks_count_the_same_either_way(tmp_path):
                                   loop=loop)
         clicks = [s for s in steps if s["action"] == "click"]
         assert clicks[0]["count"] == 3, (loop, steps)
+
+
+# ------- relabelled control at one position + the loop node's dissolved count -------
+# Run 20260827_091313 subtask 8 ("click Next for all of the remaining employees … then
+# click submit"): the app renders Submit at the SAME DOM position as Next — it swaps the
+# button's label on the last employee. Recorded faithfully (11x ax_name="Next", then
+# ax_name="Submit", all at .../div[2]/button[2]), the compiler lost both facts:
+#   A. _push_step keys repeats on `selectors` ALONE, so the Submit was absorbed as an
+#      11th "Next" iteration and its identity discarded.
+#   B. save_steps never forwarded `loop` to _apply_repeat_hint, so the cluster dissolved
+#      to one click whatever the node kind — kind=loop compiled byte-identically to
+#      kind=action, voiding the loop contract (the authoring run's iteration count IS the
+#      cached artifact).
+# Net: 11 Next + 1 Submit compiled to a single click stamped expect_text="Next".
+
+
+def _named_btn(text):
+    """Two controls sharing one DOM position, told apart only by their recorded name."""
+    return {"node_name": "button", "ax_name": text,
+            "attributes": {"type": "button"},
+            "x_path": "html/body/div/div/form/div[2]/button[2]"}
+
+
+def test_a_relabelled_control_at_the_same_position_is_not_a_repeat(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_named_btn("Next")),
+               _item({"wait": {"seconds": 1}}),
+               _item({"click": {"index": 1}}, element=_named_btn("Next")),
+               _item({"click": {"index": 1}}, element=_named_btn("Submit"))]
+
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    clicks = [s for s in steps if s["action"] == "click"]
+    names = [(s.get("fingerprint") or {}).get("text") for s in clicks]
+    assert names == ["Next", "Submit"], f"the Submit must survive as its own step: {names}"
+    assert clicks[0]["count"] == 2          # the two real Next clicks still fuse
+    assert "count" not in clicks[1]         # the Submit is one click, not an iteration
+
+
+def test_nameless_repeat_clicks_at_one_position_still_fuse(tmp_path):
+    """The split is name-driven and conservative: with no recorded name to disagree on
+    (icon-only buttons), the existing repeat behaviour must be untouched."""
+    icon = {"node_name": "button", "ax_name": None,
+            "attributes": {"class": "ms-Button--icon"},
+            "x_path": "html/body/div/div/form/div[2]/button[2]"}
+    history = []
+    for _ in range(3):
+        history.append(_item({"click": {"index": 1}}, element=icon))
+        history.append(_item({"wait": {"seconds": 1}}))
+
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    clicks = [s for s in steps if s["action"] == "click"]
+    assert len(clicks) == 1 and clicks[0]["count"] == 3
+
+
+def test_a_loop_nodes_repeat_cluster_survives_an_unnumbered_slice(tmp_path):
+    """A loop node's iteration count is its cached artifact — the dissolve must not
+    reach it. Only an ACTION node's undeclared repeat is a retry."""
+    history = []
+    for _ in range(4):
+        history.append(_item({"click": {"index": 1}}, element=_btn("Next")))
+        history.append(_item({"wait": {"seconds": 1}}))
+
+    from automation.pipeline.script_compile import save_steps
+    steps = save_steps(_write(tmp_path, history), tmp_path / "steps.json",
+                       emit_start_goto=False, repeat_hint=None, loop=True)
+
+    assert steps[0]["count"] == 4, f"loop count dissolved: {steps}"
+    assert steps[0]["repeat_wait_s"] == 1.0
+
+
+def test_an_action_nodes_unnumbered_repeat_still_dissolves(tmp_path):
+    """The toggle guard (Download menu, 2026-08-24) must survive the loop carve-out."""
+    history = []
+    for _ in range(4):
+        history.append(_item({"click": {"index": 1}}, element=_btn("Download")))
+        history.append(_item({"wait": {"seconds": 1}}))
+
+    from automation.pipeline.script_compile import save_steps
+    steps = save_steps(_write(tmp_path, history), tmp_path / "steps.json",
+                       emit_start_goto=False, repeat_hint=None, loop=False)
+
+    assert "count" not in steps[0]
+
+
+# --- the combobox opener (entry aa3a76b7c82dcf8b, run 20260827_112618) ----------------
+# select_dropdown opens the widget INSIDE the tool, so a trace that used it holds no click
+# on the box. The type+pick pair compile synthesizes only works on an OPEN menu, and
+# api.select_option's fallback ("re-click the previous click") re-clicked the envelope icon
+# that opens the Send Email panel. The pick could never work.
+
+_OPTION_EL = {"node_name": "DIV", "ax_name": "no-reply",
+              "attributes": {"id": "react-select-18-option-1", "class": "rs-option"}}
+_COMBO_EL = {"node_name": "INPUT", "ax_name": "From :",
+             "attributes": {"role": "combobox", "id": "react-select-18-input"},
+             "x_path": "html/body/div[2]/div/div/div[3]/input"}
+
+
+def _pick_item(opener=_COMBO_EL, **kw):
+    meta = {"interacted_element": _OPTION_EL}
+    if opener is not None:
+        meta["opener_element"] = opener
+    return _item({"select_dropdown": {"text": "no-reply", "near_text": "From", "index": 0}},
+                 result=[{"extracted_content": "Selected 'no-reply'", "metadata": meta}],
+                 **kw)
+
+
+def test_tool_opened_combobox_pick_compiles_its_opener(tmp_path):
+    steps = compile_recording(_write(tmp_path, [_pick_item()]), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "type", "click"]
+    # The opener is anchored on the CONTROL, never on the option row.
+    assert steps[0]["selectors"][0] == "xpath=/html/body/div[2]/div/div/div[3]/input"
+    assert steps[0].get("fingerprint", {}).get("tag") == "input"
+    # The label the agent addressed it by survives as the last selector rung: a
+    # react-select input has no attribute that can name it.
+    assert any('text-is("From :")' in s for s in steps[0]["selectors"])
+    assert steps[1]["text"] == "no-reply" and steps[2]["expect_text"] == "no-reply"
+
+
+def test_a_pick_after_a_real_click_on_the_box_gets_no_second_opener(tmp_path):
+    """The common shape (entry 4154bfa3a788527f): the agent clicked the combobox itself
+    before calling select_dropdown. A second click there would CLOSE the menu."""
+    history = [_item({"click": {"index": 7}}, element=_COMBO_EL), _pick_item()]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["click", "type", "click"]
+
+
+def test_a_pick_with_no_opener_stamp_compiles_as_before(tmp_path):
+    """Old recordings carry no stamp — they must keep compiling, not raise."""
+    steps = compile_recording(_write(tmp_path, [_pick_item(opener=None)]),
+                              emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["type", "click"]
+
+
+# --- the wrong ROW (entry 07044b6a0dbf7988, run 20260827_104331) -----------------------
+# The Data Request grid's external-link icon has no name, every row carries one with the
+# same title, and its href embeds the RECORD id. Compile's only anchor was the positional
+# path `.../div[2]/div[9]/…`: the run created CDR072, clicked whatever link sat there, and
+# wrote 13 UpdateCal POSTs into CDR054 — the previous day's request.
+
+_LINK_EL = {
+    "node_name": "A", "ax_name": None,
+    "attributes": {"target": "_blank", "title": "Open payroll review request as client",
+                   "href": "/links/10/c/6a61d0ab5636abb464ba0e13/r/6a8f6b691522ef667cd114cf/"
+                           "calcdatarequest"},
+    "x_path": "html/body/div[1]/div/div/div[2]/div[9]/div/div/div[2]/div/a",
+    "row": {"scope": '[role="row"]',
+            "cells": ["1", "PR/01797494/27/CDR072", "FOOD LIMITED", "Drafted"]},
+}
+
+
+def test_a_nameless_in_row_click_is_anchored_by_its_row(tmp_path):
+    steps = compile_recording(
+        _write(tmp_path, [_item({"click": {"index": 9}}, element=_LINK_EL)]),
+        emit_start_goto=False)
+    sels = steps[0]["selectors"]
+    # The row's own data leads — ahead of the positional path.
+    assert sels[0] == ('css=[role="row"]:has-text("PR/01797494/27/CDR072") '
+                       'a[title="Open payroll review request as client"]')
+    assert sels.index(sels[0]) < sels.index("xpath=/" + _LINK_EL["x_path"])
+    # A column value that repeats down the grid still gets a candidate; it resolves
+    # ambiguously at replay and _resolve skips it. Order is longest-first.
+    assert any('has-text("FOOD LIMITED")' in s for s in sels)
+    # The recorded href points at the row this recording acted on, forever. Gone.
+    assert not any("6a8f6b69" in s for s in sels)
+
+
+def test_the_row_identity_survives_browser_uses_own_element_capture(tmp_path):
+    """The row is read by our click override, but browser-use's state.interacted_element
+    wins over the stamp — the row must ride across, or it is dropped for every indexed
+    click that has one."""
+    state_el = {k: v for k, v in _LINK_EL.items() if k != "row"}
+    state_el["backend_node_id"] = 40465
+    stamped = dict(_LINK_EL, backend_node_id=40465)
+    history = [_item({"click": {"index": 9}}, element=state_el,
+                     result=[{"extracted_content": "Clicked a",
+                              "metadata": {"interacted_element": stamped}}])]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps[0]["selectors"][0].startswith('css=[role="row"]:has-text(')
+
+    # Two captures that describe DIFFERENT nodes never lend each other a row.
+    other = dict(stamped, backend_node_id=999)
+    history[0]["result"][0]["metadata"]["interacted_element"] = other
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert steps[0]["selectors"][0].startswith("xpath=")
+
+
+def test_a_named_row_click_keeps_todays_ladder(tmp_path):
+    """A named control is already guarded by expect_text at replay — the record side
+    stamps no row for it, and its selectors must not move."""
+    named = {"node_name": "BUTTON", "ax_name": "PR/01797494/27/CDR072",
+             "attributes": {"type": "button"},
+             "x_path": "html/body/div[1]/div/div/div[1]/div[1]/div/div/div[2]/div/button"}
+    steps = compile_recording(
+        _write(tmp_path, [_item({"click": {"index": 9}}, element=named)]),
+        emit_start_goto=False)
+    assert steps[0]["selectors"][0].startswith("xpath=")
+
+
+def test_our_own_synthetic_combobox_id_is_volatile():
+    """library/5a90660d1df6a541 (Additions/Deductions), the two <select> steps: both were
+    anchored on `ao-cb-7` / `ao-cb-8` — the id _CB_RESOLVE_JS STAMPS ONTO a control that
+    had none, so the resolver has something to hold. It is our own scratch attribute and
+    it does not exist on any later run.
+
+    _NATIVE_SELECT_BY_ID_JS already strips the prefix from the attrs IT reports, but these
+    elements reached compile through browser-use's own state.interacted_element capture,
+    taken AFTER the stamp — so the guard was bypassed and the id arrived looking
+    app-authored. That cost the step twice over: a `css=[id="ao-cb-7"]` candidate that can
+    never match, and (worse) a fingerprint carrying attrs={"id": "ao-cb-7"}, which made
+    _xpath_matches_fingerprint REFUSE the correct positional-xpath hit on every replay and
+    drop the step into healing — where two anonymous sibling <select>s score alike and the
+    heal cannot break the tie.
+
+    The 3+ digit rule already caught `ao-cb-123` by accident, so the failure was
+    counter-value dependent: the same control replayed fine once the page had stamped a
+    hundred controls, and not at all before that."""
+    from automation.pipeline.script_compile import _is_dynamic_id, _selectors_from_parts
+
+    for volatile in ("ao-cb-7", "ao-cb-8", "ao-cb-1", "ao-cb-123"):
+        assert _is_dynamic_id(volatile), volatile
+    # `cb2` stays stable — the guard is the exact `ao-cb-` prefix we stamp, not a
+    # letters-and-digits rule (see the Fluent-counter test above).
+    assert not _is_dynamic_id("cb2")
+
+    # The attrs exactly as recorded for the "Period to" select (history item 4).
+    attrs = {"class": "mt-l form-select form-select-sm",
+             "style": "width: 300px; font-size: 12px;", "id": "ao-cb-7"}
+    assert not [s for s in _selectors_from_parts("select", attrs, "") if "ao-cb" in s]
+
+
+def test_an_errored_select_dropdown_compiles_to_nothing(tmp_path):
+    """entry 4154bfa3a788527f, run 20260827_131953: the agent aimed select_dropdown
+    ('May-26') at the PAY FREQUENCY combobox, which answered "no such option. The dropdown
+    ACTUALLY lists: 'Monthly', 'Weekly', ..." — it set nothing. It then clicked the correct
+    date box and picked May-26 there, and that pair worked.
+
+    Compile stored BOTH, wrong one first, because the select_dropdown branch never asked
+    whether the action succeeded: the recorded interacted_element is the PRE-action DOM
+    snapshot, so it names the wrong box even though the tool did nothing to it. The skill
+    typed 'May-26' into the pay-frequency dropdown on every replay. react-select discards
+    unmatched filter text, so it passed some runs and killed the segment on others
+    ("no unique candidate matched ... role=option[name='May-26'] -> no match").
+
+    Unlike the no_fill/no_click twins above, this tool's refusal stamps NO metadata — but
+    it is atomic (it opens, picks, and reads the value back), so a result carrying an error
+    is proof the value was never set."""
+    wrong = {"node_name": "INPUT", "attributes": {"id": "react-select-14-input"},
+             "x_path": "html/body/form/div[2]/input"}
+    right = {"node_name": "INPUT", "attributes": {"id": "react-select-15-input"},
+             "x_path": "html/body/form/div[3]/input"}
+    rec = _write(tmp_path, [
+        _item({"select_dropdown": {"text": "May-26", "index": 1}}, element=wrong,
+              result=[{"error": "select_dropdown 'May-26' at index 1: no such option. "
+                                "The dropdown ACTUALLY lists: 'Monthly', 'Weekly'."}]),
+        _item({"click": {"index": 2}}, element=right,
+              result=[{"extracted_content": "Clicked input id=react-select-15-input"}]),
+    ])
+
+    steps = compile_recording(rec)
+    sels = [s for step in steps for s in (step.get("selectors") or [])]
+    assert not [s for s in sels if "div[2]" in s], f"wrong combobox compiled: {sels}"
+    assert [s for s in sels if "div[3]" in s], f"right combobox lost: {sels}"
+
+
+def test_dropdown_opener_comes_from_the_tools_stamp_not_the_snapshot(tmp_path):
+    """entry aa3a76b7c82dcf8b, run 20260827_131953: the compiled opener for the Send Email
+    From dropdown was byte-for-byte the panel's CLOSE (X) button, so the skill closed the
+    panel and then hunted the From menu inside it — 21 minutes and 750k tokens of recovery
+    before the segment failed.
+
+    select_dropdown opens the widget itself, so this branch has to synthesize the opener
+    click. It read `element` — browser-use's state.interacted_element — and assumed "not an
+    option row, so it must be the combobox". For a select_dropdown that snapshot can name
+    something the tool never touched; here it named the close button. agent_tools stamps the
+    combobox it ACTUALLY opened in metadata.opener_element, which the sibling branch already
+    trusts. Prefer the stamp; fall back to the snapshot so stamp-less older recordings keep
+    working."""
+    close_btn = {"node_name": "BUTTON",
+                 "attributes": {"class": "ms-Panel-closeButton"},
+                 "x_path": "html/body/panel/div[1]/div/button"}
+    combobox = {"node_name": "INPUT",
+                "attributes": {"id": "react-select-16-input", "role": "combobox"},
+                "x_path": "html/body/panel/form/div[1]/input", "ax_name": "Me From"}
+    rec = _write(tmp_path, [
+        _item({"select_dropdown": {"text": "no-reply", "index": 1}}, element=close_btn,
+              result=[{"extracted_content": "Selected 'no-reply'",
+                       "metadata": {"opener_element": combobox}}]),
+    ])
+
+    sels = [s for step in compile_recording(rec) for s in (step.get("selectors") or [])]
+    assert not [s for s in sels if "div[1]/div/button" in s], f"close button opener: {sels}"
+    assert [s for s in sels if "form/div[1]/input" in s], f"real combobox lost: {sels}"
+
+
+def test_a_control_with_only_its_own_name_gets_an_anchor():
+    """entry 8dd0163e663bfbf0 (Add Payments), runs 20260827_2241/2246/2226: the dialog's
+    Save is `<button type="button" class="btn btn-primary btn-sm">Save</button>` — no id,
+    no name, no aria-label — so the attribute ladder came back EMPTY, and the label rung
+    refused because the listing line above it is 'Cancel', which names a DIFFERENT control.
+    That left ONE positional xpath and nothing behind it, so the step fell into the
+    fingerprint heal on every single run: `score=6.5 margin=3.2`, three runs running,
+    identical — the heal was scoring the very name the ladder had declined to use
+    (text +3, role +2, tag +1, type +0.5). It was not replaying, it was guessing right."""
+    from automation.pipeline.script_compile import _selectors
+
+    save = {"node_name": "BUTTON", "ax_name": "Save",
+            "attributes": {"type": "button", "class": "btn btn-primary btn-sm"},
+            "x_path": "html/body/form/div[5]/div/div/div[3]/button[2]"}
+    sels = _selectors(save, label="Cancel")
+    assert 'css=button:text-is("Save")' in sels
+    # The neighbour label must STILL be refused — 'Cancel' names another button.
+    assert not [s for s in sels if "Cancel" in s]
+
+    # A control an attribute CAN name never reaches the rung: the 2026-08-13
+    # "xpaths for everything, no random searches" rule is untouched for those.
+    named = dict(save, attributes={"type": "button", "id": "mailbtn"})
+    assert not [s for s in _selectors(named, label="Cancel") if ":text-is(" in s]
+
+    # Restricted to <button>/<a> — the tags whose TEXT IS THEIR NAME. Anything else and
+    # the text is content or data, which is the search this ladder refuses to do. Both of
+    # these were live regressions when the rung was first written tag-agnostic:
+    #   - a bare <div> with text must stay unanchorable by design
+    #   - the 'Sent' status chip is a <span> whose text is the ROW'S DATA, so
+    #     css=span:text-is("Sent") would match whichever row says Sent today
+    for tag, name in (("div", "Some text"), ("span", "Sent"), ("input", "Amount")):
+        other = {"node_name": tag, "ax_name": name, "attributes": {},
+                 "x_path": "html/body/form/x"}
+        assert not [s for s in _selectors(other, label="Cancel") if ":text-is(" in s], tag
+
+
+def test_an_ambiguous_self_name_falls_through_instead_of_clicking_the_first():
+    """Two buttons saying 'Save' is the one ambiguity this rung cannot settle, so it is
+    denied _resolve's last-candidate first-visible concession — it falls through to the
+    fingerprint heal, which is what the step did before the rung existed. The ` >> ` test
+    keeps the denial off _label_scoped_css, which also uses :text-is and keeps its
+    concession."""
+    from automation.pipeline.script_compile import _is_self_named, _label_scoped_css
+
+    assert _is_self_named('css=button:text-is("Save")')
+    assert not _is_self_named(_label_scoped_css("select", "Period to"))
+    assert not _is_self_named('css=[id="mailbtn"]')
+
+
+def test_a_control_only_its_class_can_name_gets_an_anchor():
+    """entry 07044b6a0dbf7988 (the OTP segment), run 20260828_004155: Fluent's panel close
+    button. Its whole DOM-listing line is `*[8657]<button />` — ax_name None, no id, no
+    aria-label, no title, no name — so the attribute ladder is empty, the self-name rung
+    has no name, and the label rung has no label. Its ONLY anchor was a positional xpath
+    through `body/div[2]`, which is Fluent's LAYER HOST, and that index moves run to run
+    (div[3] vs div[2]). When it moved the step failed outright and the segment — ~240k
+    tokens to author — dropped to the LLM.
+
+    The churn that keeps `class` out of the attribute ladder lives in the MOUNT-COUNTER
+    suffix (`closeButton-1220`), not in the component name in front of it."""
+    from automation.pipeline.script_compile import _selectors
+
+    close = {"node_name": "BUTTON", "ax_name": None,
+             "attributes": {"type": "button", "data-is-visible": "true",
+                            "class": "ms-Button ms-Panel-closeButton ms-PanelAction-close "
+                                     "ms-Button--icon closeButton-1220"},
+             "x_path": "html/body/div[2]/div/div[1]/div/button[2]"}
+    sels = _selectors(close)
+    # Longest token first, so the component name outranks the generic one.
+    assert sels[1] == "css=button.ms-Panel-closeButton"
+    # The mount counter is never an anchor, and short/generic tokens are dropped.
+    assert not [s for s in sels if "1220" in s or s.endswith(".ms-Button")]
+    assert len([s for s in sels if s.startswith("css=button.")]) <= 3
+
+    # An element an attribute CAN name never reaches the rung.
+    named = dict(close, attributes={"id": "mailbtn", "class": "ms-Panel-closeButton"})
+    assert not [s for s in _selectors(named) if s.startswith("css=button.")]
+
+    # Nor one the label rung already named: the class is the LAST resort, not a peer.
+    labelled = {"node_name": "select", "ax_name": "", "attributes": {"class": "form-select-sm"},
+                "x_path": "html/body/form/select"}
+    assert not [s for s in _selectors(labelled, label="Period to")
+                if s.startswith("css=select.")]
+
+
+def test_a_purely_utility_class_is_not_an_anchor():
+    """A STYLING class must never anchor a step, only a framework COMPONENT class.
+
+    The separator is the camelCase hump: Fluent and CSS-modules write
+    `ms-Panel-closeButton`, Bootstrap writes `form-select form-select-sm` / `btn
+    btn-primary` — classes shared by every control of that kind. Gating on length alone
+    let `form-select-sm` through and broke the rule that a shadow <select> with no
+    attribute and no label is unanchorable by design; a step must never LOOK anchorable
+    while its only candidate matches every select on the page."""
+    from automation.pipeline.script_compile import (_selectors, _is_class_scoped,
+                                                    _semantic_class_selectors)
+
+    chip = {"node_name": "SPAN", "ax_name": None,
+            "attributes": {"class": "label label-148", "style": "display: block;"},
+            "x_path": "html/body/div[1]/span/span"}
+    assert _selectors(chip) == ["xpath=/html/body/div[1]/span/span"]
+    for tag, cls in (("select", "form-select form-select-sm"),
+                     ("button", "btn btn-primary btn-sm"),
+                     ("span", "label label-148")):
+        assert _semantic_class_selectors(tag, {"class": cls}) == [], cls
+    # Denied _resolve's first-visible concession: a class names a KIND, not one control.
+    assert _is_class_scoped("css=button.ms-Panel-closeButton")
+    assert not _is_class_scoped('css=[id="mailbtn"]')

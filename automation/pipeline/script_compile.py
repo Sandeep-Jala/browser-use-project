@@ -34,8 +34,18 @@ _DYNAMIC_ID = re.compile(r"\d{3,}")
 #   :r3: / :ra:                                       (React useId / Radix / MUI)
 #   mui-42 / headlessui-menu-3                        (MUI / Headless UI)
 #   TextField99 / Toggle21 / Dropdown4                Fluent getId() — a MOUNT counter
+#   ao-cb-7 / ao-cb-8                                 OURS — see below
+# `ao-cb-N` is not a framework's id at all: _CB_RESOLVE_JS in agent_tools.py STAMPS it onto a
+# combobox that has none ("if (!input.id) input.id = 'ao-cb-' + ++seq") so the resolver has a
+# handle to hold. It is scratch state from one run of one tool and exists on no later run.
+# _NATIVE_SELECT_BY_ID_JS strips it from the attrs IT reports, but browser-use's own
+# state.interacted_element snapshot is taken AFTER the stamp and carries it into compile
+# looking app-authored (library/5a90660d1df6a541, both <select> steps). Listed here rather
+# than left to _DYNAMIC_ID's 3+ digit rule, which caught it only once the page had stamped a
+# hundred controls — the same step replayed or died on the value of a counter.
 _FRAMEWORK_ID = re.compile(
-    r"^(react-select-\d+|:r[0-9a-z]+:|mui-\d+|headlessui-[\w-]*\d+|radix-[\w:-]+)",
+    r"^(react-select-\d+|:r[0-9a-z]+:|mui-\d+|headlessui-[\w-]*\d+|radix-[\w:-]+"
+    r"|ao-cb-\d+$)",
     re.IGNORECASE,
 )
 # Fluent's getId('TextField') ids are a per-mount counter, so the SAME control is
@@ -89,6 +99,55 @@ def _role_of(attrs: dict[str, Any], tag: str) -> str | None:
     return _TAG_ROLE.get(tag)
 
 
+# An href that embeds a RECORD id is data, not identity: it matches the row the recording
+# happened to act on and no other. Digits/hex runs are what tell those apart from a route.
+_ID_IN_HREF = re.compile(r"[0-9a-f]{12,}|\d{4,}")
+
+
+def _leaf_sel(tag: str, attrs: dict[str, Any]) -> str:
+    """The element itself as a css leaf, inside an already-scoped ancestor: its tag plus
+    ONE attribute that says what it is. Every row's copy of a control shares these, which
+    is exactly why they are useless alone and precise once the row is pinned."""
+    for key in ("data-testid", "data-automationid", "name", "aria-label", "title",
+                "placeholder", "inputmode", "role", "type"):
+        if attrs.get(key):
+            return f'{tag or "*"}[{key}="{_esc(str(attrs[key]))}"]'
+    return tag or "*"
+
+
+def _row_scoped_selectors(element: dict[str, Any]) -> list[str]:
+    """Locate a NAMELESS in-row control by the row's own data — "the external-link icon in
+    the row that reads PR/…/CDR073" — instead of by the row's POSITION.
+
+    The recorded cell texts become the scope literals, so the provenance binder rewrites
+    them like any other recorded value (hybrid.tokenize_steps rewrites selectors too) and
+    each run anchors on ITS OWN row. Every qualifying cell gets a candidate, longest
+    first: a cell that repeats down the column ("FOOD LIMITED") resolves ambiguously and
+    _resolve skips it, while the one that identifies the row wins. Ambiguity costs a
+    probe; a positional path costs the wrong record (run 20260827_104331 wrote 13
+    UpdateCal POSTs into CDR054, the previous day's request).
+    """
+    row = element.get("row")
+    if not isinstance(row, dict):
+        return []
+    scope = str(row.get("scope") or "").strip()
+    if not scope:
+        return []
+    leaf = _leaf_sel((element.get("node_name") or "").lower(),
+                     element.get("attributes") or {})
+    cells = [" ".join(str(c).split()) for c in (row.get("cells") or [])]
+    cells = [c for c in cells if 3 <= len(c) <= 60 and any(ch.isalnum() for ch in c)]
+    cells.sort(key=len, reverse=True)
+    seen: set[str] = set()
+    out = []
+    for cell in cells:
+        sel = f'css={scope}:has-text("{_esc(cell)}") {leaf}'
+        if sel not in seen:
+            seen.add(sel)
+            out.append(sel)
+    return out
+
+
 def _selectors(element: dict[str, Any], *, shadow_contained: bool = False,
                label: str | None = None) -> list[str]:
     """Ranked list of Playwright selectors for a recorded element (most → least durable).
@@ -96,6 +155,10 @@ def _selectors(element: dict[str, Any], *, shadow_contained: bool = False,
     Replay tries these in order and uses the first that resolves UNIQUELY, so a fragile primary
     anchor (a framework id, a moved node) degrades to a stabler fallback instead of stopping the
     run or clicking the wrong element. Order:
+      0a. row-scoped candidates for a NAMELESS control inside a data row (see
+         _row_scoped_selectors) — ahead of the positional path because this is the
+         name-anchored form of the step, and a data row's position is the one thing
+         about it that is guaranteed to change.
       0. the positional xpath — deterministic-first (2026-08-12, user choice): the
          recorded position leads, sanity-gated at resolve time against the fingerprint
          (_resolve refuses a drifted hit and falls through to the semantic ladder).
@@ -127,11 +190,37 @@ def _selectors(element: dict[str, Any], *, shadow_contained: bool = False,
     tag = (element.get("node_name") or "").lower()
     ax_name = (element.get("ax_name") or "").strip()
     cands: list[str] = []
+    # 0a. A nameless control inside a data row: its ROW, named by the row's own data.
+    #     Ahead of the positional path because this IS the name-anchored form of the
+    #     step — the POSITION-vs-NAME rule. Only the record side stamps `row`, and only
+    #     for a click with no name of its own, so nothing else changes rank.
+    row_scoped = _row_scoped_selectors(element)
+    cands.extend(row_scoped)
     xpath = element.get("x_path")
     if xpath and not shadow_contained:
         cands.append("xpath=/" + xpath.lstrip("/"))
     hard = _selectors_from_parts(tag, attrs, ax_name)
+    if row_scoped:
+        # The recorded href of a row control embeds THAT row's record id. It resolves
+        # uniquely — onto the row this recording acted on, forever. _resolve's docstring
+        # names it as a wrong-row source, and a nameless element gives expect_text
+        # nothing to catch it with, so it must not be a candidate at all.
+        hard = [s for s in hard
+                if not (s.startswith(f'css={tag or "*"}[href=') and _ID_IN_HREF.search(s))]
     cands.extend(hard)
+    if not hard and tag in _TAG_ROLE and _has_letters(ax_name):
+        # The element's OWN name, ranked ahead of the neighbour-label rung: a control
+        # that says what it is needs no label to name it.
+        #
+        # Restricted to _TAG_ROLE — <button> and <a> — because those are the tags whose
+        # TEXT IS THEIR ACCESSIBLE NAME. For anything else the text is content or data,
+        # and turning it into a locator is the search this ladder refuses to do: a bare
+        # <div> with text must stay unanchorable by design (test_selectors_are_xpath_
+        # then_hard_identity_only), and the 'Sent' status chip is a <span> whose text is
+        # the row's DATA — `css=span:text-is("Sent")` would match whichever row happens
+        # to say Sent today (test_labelless_click_recovers_text_from_state_message).
+        # Both were caught as regressions when this rung was first written tag-agnostic.
+        cands.append(_self_named_css(tag, ax_name))
     if not hard and tag and _label_names(label, ax_name):
         # Ranked last, and offered ONLY to an element no attribute can name: a real
         # attribute beats a label every time. For a control whose only identity is the
@@ -140,6 +229,11 @@ def _selectors(element: dict[str, Any], *, shadow_contained: bool = False,
         # both wrong (it fired on every native input) and beside the point — what makes
         # the rung necessary is the missing attribute, not the shadow boundary.
         cands.append(_label_scoped_css(tag, label))
+    if not hard and not [c for c in cands if not c.startswith("xpath=")]:
+        # LAST rung, and only when NOTHING so far names this element — no row scope, no
+        # own name, no label, no attribute — leaving the positional xpath alone. What the
+        # framework calls it. See _semantic_class_selectors.
+        cands.extend(_semantic_class_selectors(tag, attrs))
     return cands
 
 
@@ -358,6 +452,93 @@ def _label_scoped_css(tag: str, label: str) -> str:
             f'xpath=ancestor-or-self::*[.//{tag}][1]//{tag}')
 
 
+def _self_named_css(tag: str, ax_name: str) -> str:
+    """A locator for a control whose only identity is its OWN accessible name.
+
+    The dialog Save button (`8dd0163e663bfbf0`, Add Payments) is the motivating case:
+    `<button type="button" class="btn btn-primary btn-sm">Save</button>` — no id, no name,
+    no aria-label, so `_selectors_from_parts` came back EMPTY, and the label rung refused
+    (rightly: the listing line above it is 'Cancel', which names a different control).
+    That left ONE positional xpath and nothing behind it, so every run drifted straight
+    into the fingerprint heal — logged on three consecutive runs at the identical
+    `score=6.5 margin=3.2`, because the heal was scoring the very same name (text 'Save'
+    +3, role +2, tag +1, type +0.5). The step was not replaying, it was guessing right.
+
+    Emitting the name as an EXACT, tag-scoped candidate is strictly narrower than the heal
+    it replaces: `:text-is` is exact where the heal is a fuzzy whole-page score, and this
+    rung is offered ONLY to an element no attribute can name. It does not reopen the
+    2026-08-13 'xpaths for everything, no random searches' rule for elements that HAVE
+    attribute identity — those never reach here."""
+    return f'css={tag}:text-is("{_esc(ax_name)}")'
+
+
+# Class tokens are kept out of the attribute ladder (and out of _FP_ATTRS) because this
+# app churns them — but the churn lives in the MOUNT-COUNTER suffix Fluent and CSS-modules
+# append (`closeButton-1220`, `input-708`, `label-148`, `option-721`), never in the
+# component name in front of it. `ms-Panel-closeButton` is Fluent's semantic class and is
+# the same on every render.
+_VOLATILE_CLASS = re.compile(r"-\d+$|\d{3,}")
+_CLASS_TOKEN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def _semantic_class_selectors(tag: str, attrs: dict[str, Any]) -> list[str]:
+    """Component-class candidates for a control NOTHING else can name.
+
+    The motivating element is Fluent's panel close button (`07044b6a0dbf7988`, the OTP
+    segment): its whole listing line is `*[8657]<button />` — ax_name None, no id, no
+    aria-label, no title, no name — so the attribute ladder is empty, the self-name rung
+    has no name and the label rung has no label. Its ONLY anchor was a positional xpath
+    through `body/div[2]`, which is Fluent's LAYER HOST, and that index moves run to run
+    (`div[3]` vs `div[2]`). When it moved the step failed outright and the OTP segment —
+    ~240k tokens to author — fell back to the LLM (run 20260828_004155).
+
+    Ranked LAST and offered only when `hard` came back empty: a class is what the
+    FRAMEWORK calls an element, weaker than what it says (self-name) or what names it
+    (label). Longest token first, so `ms-Panel-closeButton` outranks `ms-Button`, and
+    capped at 3 so a utility-class pile-up cannot cost a long probe chain. Short tokens
+    (`btn`, `mt-l`, `label`) are dropped as too generic to identify anything; an ambiguous
+    one that survives resolves to >1 and _resolve skips it.
+
+    A token must also carry a CAMELCASE HUMP. That is what separates a framework COMPONENT
+    class from a styling UTILITY: Fluent and CSS-modules write `ms-Panel-closeButton`,
+    while Bootstrap writes `form-select form-select-sm` / `btn btn-primary`, which match
+    every select and every button on the page. Length alone let `form-select-sm` through
+    and broke the rule that a shadow `<select>` with no attribute and no label is
+    UNANCHORABLE by design (test_a_shadow_element_with_neither_attribute_nor_label_is_
+    unanchorable) — a step must never look anchorable while its only candidate is a class
+    shared by every control of its kind."""
+    toks = [t for t in str(attrs.get("class") or "").split()
+            if len(t) >= 8 and _CLASS_TOKEN.match(t) and not _VOLATILE_CLASS.search(t)
+            and any(ch.isupper() for ch in t)]
+    toks.sort(key=len, reverse=True)
+    out: list[str] = []
+    for tok in toks:
+        sel = f'css={tag or "*"}.{tok}'
+        if sel not in out:
+            out.append(sel)
+        if len(out) == 3:
+            break
+    return out
+
+
+def _is_class_scoped(sel: str) -> bool:
+    """A candidate from `_semantic_class_selectors`. Denied _resolve's last-candidate
+    first-visible concession for the same reason as `_is_self_named`: a class names a
+    KIND of control, not one control, so acting on the first match is a coin flip.
+    Ambiguity falls through to the fingerprint heal — the behaviour before the rung."""
+    return bool(re.match(r"^css=[A-Za-z*]+\.[A-Za-z][A-Za-z0-9_-]*$", sel))
+
+
+def _is_self_named(sel: str) -> bool:
+    """A candidate produced by `_self_named_css`. Denied _resolve's last-candidate
+    first-visible concession: two controls sharing a name is exactly the ambiguity this
+    rung cannot settle, and taking the first would be the wrong-button click. Ambiguity
+    falls through to the fingerprint heal — what the step did before the rung existed, so
+    the rung can only add precision, never a new way to land wrong. The ` >> ` test keeps
+    this off `_label_scoped_css`, which also uses `:text-is` and keeps its concession."""
+    return sel.startswith("css=") and ":text-is(" in sel and " >> " not in sel
+
+
 # The DOCUMENT_FRAGMENT of a shadow root is serialised as its own line, and the tree it
 # contains is indented one level below it (browser_use/dom/serializer/serializer.py:1069):
 #
@@ -418,6 +599,63 @@ def _stamped_element(results: list[Any], i: int) -> dict[str, Any] | None:
         return None
     element = md.get("interacted_element")
     return element if isinstance(element, dict) else None
+
+
+def _clicks_element(steps: list[dict[str, Any]], element: dict[str, Any]) -> bool:
+    """Does the LAST compiled click already target `element`? Compared on the recorded
+    xpath, the one identity both sides always carry. Used to keep the synthesized
+    combobox opener from duplicating a click the agent really made — a second click on
+    an open react-select CLOSES it."""
+    xpath = str(element.get("x_path") or "").strip().lstrip("/")
+    if not xpath:
+        return False
+    want = "xpath=/" + xpath
+    for step in reversed(steps):
+        if step.get("action") in ("wait", "press", "type"):
+            continue
+        if step.get("action") != "click":
+            return False
+        return want in (step.get("selectors") or [])
+    return False
+
+
+def _with_stamped_row(element: dict[str, Any] | None, results: list[Any],
+                      i: int) -> dict[str, Any] | None:
+    """Carry the ROW identity from the result stamp onto the element compile is using.
+
+    browser-use's own state.interacted_element wins over our stamp (it is the fuller
+    capture), but only agent_tools reads the row a click happened in — so without this
+    the row is captured live and then dropped on the floor for every indexed click,
+    which is every click that has one. Attached only when both records describe the SAME
+    node; a mismatch means the two captures disagree and the row is not this element's.
+    """
+    if not isinstance(element, dict) or element.get("row"):
+        return element
+    stamped = _stamped_element(results, i)
+    if not isinstance(stamped, dict) or not isinstance(stamped.get("row"), dict):
+        return element
+    for key in ("backend_node_id", "x_path"):
+        here, there = element.get(key), stamped.get(key)
+        if here and there and here != there:
+            return element
+    return {**element, "row": stamped["row"]}
+
+
+def _stamped_opener(results: list[Any], i: int) -> dict[str, Any] | None:
+    """The COMBOBOX a select_dropdown pick opened, as an element (agent_tools stamps it).
+
+    select_dropdown opens the widget inside the tool, so a trace that used it holds no
+    click on the box — and the compiled script then has nothing that opens the menu. The
+    `type` + option-click pair _dropdown_option_steps synthesizes both assume an OPEN
+    menu. See the select_dropdown branch, which turns this into the missing opener click.
+    """
+    if i >= len(results) or not isinstance(results[i], dict):
+        return None
+    md = results[i].get("metadata")
+    if not isinstance(md, dict):
+        return None
+    opener = md.get("opener_element")
+    return opener if isinstance(opener, dict) else None
 
 
 def _recovered_selectors(attrs: dict[str, str]) -> list[str]:
@@ -518,6 +756,18 @@ def _index_miss(results: list[Any], i: int) -> bool:
                for k in ("extracted_content", "long_term_memory", "error"))
 
 
+def _action_errored(results: list[Any], i: int) -> bool:
+    """Did the action at history position `i` come back as an ERROR?
+
+    An errored action is a phantom: it reports what the tool WOULD have needed, not what
+    the page received. Used by the select_dropdown branch, whose tool is atomic by
+    contract — it opens the menu, picks the option and reads the value back — so an error
+    means the value was never set.
+    """
+    r = results[i] if i < len(results) and isinstance(results[i], dict) else None
+    return bool(r is not None and str(r.get("error") or "").strip())
+
+
 def _ax_label(element: dict[str, Any]) -> str:
     """The element's short accessible name for landed-click verification ('' when the
     recorder captured none, or only a >60-char announcement blob). Editable elements
@@ -588,6 +838,25 @@ def _stamp_opens_tab(steps: list[dict[str, Any]], since: int) -> None:
             return
 
 
+def _name_conflict(prev: dict[str, Any], step: dict[str, Any]) -> bool:
+    """Do two same-position steps name DIFFERENT controls?
+
+    Selectors are xpath-first, so one DOM position is one selector list — but an app may
+    render two different controls there. The payroll review footer swaps its button's
+    label on the last employee: eleven clicks on `.../div[2]/button[2]` named "Next", then
+    a twelfth named "Submit" (run 20260827_091313 subtask 8). Keyed on selectors alone,
+    the Submit fused into the Next cluster as a twelfth iteration and its identity was
+    discarded — the compiled step read `expect_text: "Next"` and the submit never replayed.
+
+    Conservative on purpose: only a DISAGREEMENT between two recorded names splits the
+    cluster. Nameless controls (icon-only buttons) have nothing to disagree on and keep
+    the existing repeat behaviour.
+    """
+    a = ((prev.get("fingerprint") or {}).get("text") or "").strip()
+    b = ((step.get("fingerprint") or {}).get("text") or "").strip()
+    return bool(a and b and a != b)
+
+
 def _push_step(steps: list[dict[str, Any]], step: dict[str, Any], *,
                count_adjacent: bool = False) -> None:
     """Append a step, distinguishing slow-app retries from intentional repeats.
@@ -618,6 +887,7 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any], *,
             prev is not None
             and prev.get("action") == step["action"]
             and prev.get("selectors") == step.get("selectors")
+            and not _name_conflict(prev, step)
         ):
             if step["action"] in ("fill", "paste"):
                 steps[prev_idx] = step  # same field written again → keep the final value
@@ -743,7 +1013,8 @@ def repeat_hint_from_wording(prompt: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None) -> list[dict[str, Any]]:
+def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None, *,
+                       loop: bool = False) -> list[dict[str, Any]]:
     """Reconcile recorded repeat clusters with the slice WORDING.
 
     Wording that pins a count ("exactly 5 clicks") keeps its single cluster and has the
@@ -766,6 +1037,13 @@ def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None) -> list[di
     clusters = [s for s in steps
                 if s.get("action") == "click" and int(s.get("count", 1)) > 1]
     if not clusters:
+        return steps
+    if loop and not hint:
+        # A LOOP node's repeated clicks ARE its iterations — that count is the whole
+        # cached artifact (node_kind: "the authoring run's iteration count is what a loop
+        # entry stores"). Dissolving it made kind="loop" compile byte-identically to
+        # kind="action" and silently stop after one pass. The retry reading below is only
+        # ever right for an action node, which is where the toggle bug lived.
         return steps
     if hint:
         if len(clusters) == 1 and int(clusters[0]["count"]) != int(hint):
@@ -1030,6 +1308,7 @@ def compile_recording(
                     "the replayable path", name, item_idx, seg_host)
                 continue
             element = elements[i] if i < len(elements) else None
+            element = _with_stamped_row(element, results, i)
             if element is None:
                 # browser-use fills state.interacted_element from the snapshot it takes
                 # AFTER the action, so a click that switched tabs records nulls. Our
@@ -1135,6 +1414,25 @@ def compile_recording(
                     _push_step(steps, {"action": ext_action, "label": ext_label,
                                        "query": ext_query})
             elif name in ("select_dropdown", "select_dropdown_option"):
+                if _action_errored(results, i):
+                    # The pick FAILED and set nothing — most often "no such option",
+                    # which is what the tool says when the agent aimed at the wrong
+                    # combobox. The recorded interacted_element is the PRE-action
+                    # snapshot, so it names that wrong box and the synthesis below would
+                    # happily compile an opener+type+pick for it: entry
+                    # 4154bfa3a788527f typed 'May-26' into the PAY FREQUENCY dropdown
+                    # ('Monthly', 'Weekly', ...) on every replay, ahead of the correct
+                    # date box the agent went on to use. react-select discards unmatched
+                    # filter text, so it passed some runs and killed the segment on
+                    # others (run 20260827_131953: "no unique candidate matched ...
+                    # role=option[name='May-26'] -> no match"). Same phantom-action rule
+                    # as the no_fill/no_click refusals and the index miss — this tool's
+                    # refusals just carry no metadata to key on, and it is atomic, so an
+                    # error means nothing was selected.
+                    logger.info("compile: skipping recorded %s at step %d — it returned "
+                                "an error, so it selected nothing (%s)", name, item_idx,
+                                str((results[i] or {}).get("error"))[:120])
+                    continue
                 # A pick on a NATIVE <select> (helper/public pages — the app's react-selects
                 # go through click steps instead). Dropping these used to compile the
                 # surrounding flow WITHOUT the picks, so replay submitted the form with its
@@ -1196,15 +1494,57 @@ def compile_recording(
                             # without it replay searched a CLOSED menu and the gender
                             # pick failed every replay (run 20260814_113403). The
                             # combobox's own xpath must never anchor the option row.
-                            opener = _selectors(element)
+                            #
+                            # PREFER THE TOOL'S OWN STAMP. `element` here is browser-use's
+                            # state.interacted_element, and for a select_dropdown it can
+                            # name something the tool never touched: on the Send Email
+                            # panel it named the panel's CLOSE (X) button, and this
+                            # branch's "not an option row, so it must be the combobox"
+                            # assumption compiled that button as the opener — so the skill
+                            # CLOSED the panel and then hunted the From menu inside it
+                            # (entry aa3a76b7c82dcf8b, run 20260827_131953, 21 min and
+                            # 750k tokens of recovery before the segment failed).
+                            # agent_tools stamps the combobox it actually opened in
+                            # metadata.opener_element; the sibling branch below already
+                            # trusts it. Fall back to `element` so older recordings that
+                            # carry no stamp keep the gender-pick behaviour intact.
+                            opener_el = _stamped_opener(results, i) or element
+                            opener = _selectors(opener_el)
                             if opener:
                                 synth.append(_attach_fp(
-                                    {"action": "click", "selectors": opener}, element))
+                                    {"action": "click", "selectors": opener}, opener_el))
                         synth += [
                             {"action": "type", "text": option},
                             {"action": "click", "selectors": opt_sels,
                              "expect_text": option},
                         ]
+                    else:
+                        # _dropdown_option_steps recognized the recorded element as an
+                        # OPTION and synthesized the type+pick pair — but those only work
+                        # on an OPEN menu, and this tool opened it ITSELF, so the trace
+                        # holds no click on the box. Emit that opener from the tool's own
+                        # stamp. Without it the compiled skill has nothing that opens the
+                        # menu, and replay's only recourse is select_option's "re-click
+                        # the previous click" guess: on the Send Email panel the previous
+                        # click was the envelope icon that OPENS the panel, so the pick
+                        # could never work (entry aa3a76b7c82dcf8b, run 20260827_112618).
+                        # Skipped when the recorded trace already clicked that same box —
+                        # the common shape, and a second click there CLOSES the menu.
+                        # Only the type-then-pick shape needs one. When the pair
+                        # collapsed to a lone option click, the filter text is already a
+                        # recorded fill step — the box was reached by the agent's own
+                        # interaction, and a click on it AFTER that fill would close the
+                        # menu the fill just filtered.
+                        opener_el = (_stamped_opener(results, i)
+                                     if synth and synth[0].get("action") == "type"
+                                     else None)
+                        if opener_el and not _clicks_element(steps, opener_el):
+                            opener = _selectors(
+                                opener_el,
+                                label=(opener_el.get("ax_name") or "") or sm_label)
+                            if opener:
+                                synth.insert(0, _attach_fp(
+                                    {"action": "click", "selectors": opener}, opener_el))
                     for s in synth:
                         _push_step(steps, s)
                 elif option:
@@ -1477,7 +1817,7 @@ def save_steps(
     steps = _apply_repeat_hint(
         compile_recording(recording_path, max_steps=max_steps,
                           emit_start_goto=emit_start_goto, loop=loop),
-        repeat_hint)
+        repeat_hint, loop=loop)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 
@@ -2442,6 +2782,14 @@ async def _candidate_names_value(loc: Any, expect: str) -> bool:
     return False
 
 
+def _is_row_scoped(sel: str) -> bool:
+    """A candidate that identifies its target by the DATA in its row (see
+    _row_scoped_selectors). Denied the last-candidate first-visible concession: an
+    ambiguous row scope means the text does not identify a row, and acting on the first
+    match is precisely the wrong-row click the scope was added to prevent."""
+    return sel.startswith("css=") and ":has-text(" in sel
+
+
 async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
                    require_editable: bool = False):
     """Return (locator, selector_label, healed_winner) for the first candidate that resolves
@@ -2504,7 +2852,8 @@ async def _resolve(page: Page, step: dict[str, Any], timeout_ms: int,
             visible = named
         if len(visible) == 1:
             candidate = loc.nth(visible[0])
-        elif last:
+        elif last and not _is_row_scoped(sel) and not _is_self_named(sel) \
+                and not _is_class_scoped(sel):
             # Exhausted durable candidates; act on the first VISIBLE match (already
             # name-filtered when the step is value-anchored) but record it.
             logger.warning("ambiguous selector %r: %d visible matches; using the first",

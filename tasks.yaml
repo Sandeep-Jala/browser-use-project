@@ -803,8 +803,7 @@ payroll_food_limited_e2e_rti:
         employee to fully load after each click.
     - prompt: >-
         With the 7th employee of the pay run now shown, click Add Expenses or Benefits, set
-        Type to 'Assets transferred', set the period from April 2026 and set period to May
-        2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
+        Type to 'Assets transferred', set the period from Apr-2026 and set period to May-2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
         expense exactly once: the dialog simply closes on Save with no confirmation
         message, and the grid then lists the expense at its net value 100.00 (the 200 cost
         minus the 100 contribution), which is a successful add; do not click Add Expenses
@@ -841,7 +840,7 @@ payroll_detailed_review_fps_part1:
         Now Go to Data Request Section. Click + Request, click Payroll Review, click Detailed, change the date combobox to
         May-26, select only the first 12 employees in the list, and click Save.
     - prompt: >-
-        In the Send Email section that opens, click on the From dropdown and select the no-reply
+        In the Send Email section that opens, click on the dropdown next to from and select the no-reply
         option, then click Send; if the Send Email section has not closed after clicking
         Send, click Save again. If the email was not sent, it is saved as Drafted; click the
         email button next to the Drafted status to reopen the Send Email section, then click
@@ -887,11 +886,72 @@ payroll_detailed_review_fps_part2:
         If a popup appears at any point after clicking Save & Next, tick 'Don't show this
         again', click Process, and continue.
     - prompt: >-
-        Click Save & Next for the first 10 employees: exactly 10 clicks,  waiting for the
+        Click Save & Next for the first 5 employees, waiting for the
         next employee to fully load after each click.
-    - prompt: >-
-        Then click Save & Next for the next 7 employees in the same way: exactly 7 more
-        clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit.
+    - prompt: >-
+        change the period to Jul-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Aug-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Sep-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Oct-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Nov-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Dec-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Jan-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Feb-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        change the period to Mar-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    

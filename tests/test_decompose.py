@@ -823,3 +823,39 @@ def test_producer_wording_still_loses_to_loop_and_marker():
         "employee is reached", None) == "loop"
     assert decompose.node_kind(_OTP_SLICE, "Payroll") == "action"
     assert decompose.node_kind(_OTP_SLICE, None, declared="judge") == "judge"
+
+
+# ---------------- exhaustion wording: "for all of the REMAINING x" ----------------
+# Run 20260827_091313 subtask 8. "Then click Next for all of the remaining employees,
+# waiting for the next employee to fully load after each click and doing nothing else on
+# any of them. Then click submit, and then close this tab." classified ACTION: it carries
+# no repeat cue ("for each"/"repeat"/"keep …ing"/"at a time") and NO stop cue at all. The
+# only thing that matched was "each" — from "after each click" — in _LOOP_CUE_RE, which
+# only the judge branch consults. Eleven Next clicks compiled to one.
+#
+# "remaining" (and "the rest") after an iteration preposition IS the stop condition: the
+# set depletes, so the phrase carries both cues at once. Deliberately keyed on "remaining"
+# rather than on the quantifier, so the documented "Click Next for rest of the employees"
+# ruling in test_node_kind_loop_detection is untouched.
+
+
+def test_exhausting_a_remaining_set_is_a_loop():
+    assert decompose.node_kind(
+        "Then click Next for all of the remaining employees, waiting for the next "
+        "employee to fully load after each click and doing nothing else on any of them. "
+        "Then click submit, and then close this tab.", None) == "loop"
+    assert decompose.node_kind(
+        "step through the remaining employees doing nothing else", None) == "loop"
+
+
+def test_remaining_alone_is_not_an_iteration_cue():
+    """The cue is an iteration preposition PLUS a depleting set, not the bare adjective —
+    a one-shot control that happens to be named "remaining" is still an action."""
+    assert decompose.node_kind(
+        "tick the remaining periods checkbox and click Save", None) == "action"
+
+
+def test_a_marker_still_outranks_exhaustion_wording():
+    """Machine ground truth caches safely regardless of wording (node_kind's marker rule)."""
+    assert decompose.node_kind(
+        "click Next for all of the remaining employees", "Payroll") == "action"

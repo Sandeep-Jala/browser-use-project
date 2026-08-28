@@ -202,3 +202,116 @@ async def test_the_fingerprint_gate_ignores_a_fluent_counter_id():
         # A genuinely stable id must still be compared, or positional drift goes unseen.
         assert not await sc._xpath_matches_fingerprint(
             page.locator("#TextField130"), {"tag": "input", "attrs": {"id": "btnSave"}})
+
+
+# --- row-scoped anchoring for a NAMELESS in-row control ------------------------------
+# Run 20260827_104331: the Data Request grid's external-link icon has no name, every row
+# carries one with the same title, and its href embeds the record id — so the only anchor
+# compile could build was `.../div[2]/div[9]/…`. The run created CDR072, clicked whatever
+# link sat at that position, and wrote 13 UpdateCal POSTs into CDR054. Shape copied from
+# the live Fluent DetailsList (a row of role=gridcell divs, icons as PUA text nodes).
+_GRID_PAGE = """
+    <div role="grid">
+      <div role="row">
+        <div role="gridcell">1</div>
+        <div role="gridcell">PR/01797494/27/CDR073</div>
+        <div role="gridcell">FOOD LIMITED</div>
+        <div role="gridcell">Drafted
+          <a title="Open payroll review request as client" href="/links/10/c/C/r/NEW/x">
+            </a></div>
+      </div>
+      <div role="row">
+        <div role="gridcell">2</div>
+        <div role="gridcell">PR/01797494/27/CDR054</div>
+        <div role="gridcell">FOOD LIMITED</div>
+        <div role="gridcell">Sent
+          <a title="Open payroll review request as client" href="/links/10/c/C/r/OLD/x">
+            </a></div>
+      </div>
+    </div>
+"""
+
+
+async def _grid(pw):
+    page = await (await _launch(pw)).new_page()
+    await page.set_content(_GRID_PAGE)
+    return page
+
+
+async def test_row_cells_js_reads_the_row_a_click_happened_in():
+    from automation.pipeline import agent_tools
+
+    async with async_playwright() as pw:
+        page = await _grid(pw)
+        expr = "el => (" + agent_tools._ROW_CELLS_JS + ").call(el)"
+        got = await page.locator('a[href="/links/10/c/C/r/OLD/x"]').evaluate(expr)
+
+        assert got["scope"] == '[role="row"]'
+        assert "PR/01797494/27/CDR054" in got["cells"]
+        # The icon is a literal PUA glyph in this app; it must never reach a selector.
+        assert not any("" in c for c in got["cells"])
+
+
+async def test_the_row_scoped_candidate_resolves_to_the_named_rows_control():
+    """The whole point: the same nameless link in two rows, told apart by row data."""
+    async with async_playwright() as pw:
+        page = await _grid(pw)
+        element = {"node_name": "A", "ax_name": None,
+                   "attributes": {"title": "Open payroll review request as client"},
+                   "row": {"scope": '[role="row"]',
+                           "cells": ["1", "PR/01797494/27/CDR073", "FOOD LIMITED"]}}
+        sels = sc._row_scoped_selectors(element)
+
+        loc, sel, _healed = await sc._resolve(page, {"selectors": sels}, 2000)
+        assert "CDR073" in sel
+        assert await loc.get_attribute("href") == "/links/10/c/C/r/NEW/x"
+
+
+async def test_a_column_value_shared_by_every_row_refuses_rather_than_guessing():
+    """'FOOD LIMITED' scopes to BOTH rows: _resolve must skip it, never take the first."""
+    async with async_playwright() as pw:
+        page = await _grid(pw)
+        sels = ['css=[role="row"]:has-text("FOOD LIMITED") '
+                'a[title="Open payroll review request as client"]',
+                'css=[role="row"]:has-text("PR/01797494/27/CDR073") '
+                'a[title="Open payroll review request as client"]']
+
+        _loc, sel, _healed = await sc._resolve(page, {"selectors": sels}, 2000)
+        assert "CDR073" in sel
+
+
+# --- the combobox opener's identity (entry aa3a76b7c82dcf8b) -------------------------
+_COMBO_PAGE = """
+    <div><div>From <div class="rs"><input id="react-select-18-input"
+        role="combobox" autocomplete="off"></div></div></div>
+"""
+
+
+async def test_cb_identity_js_reads_a_recordable_element():
+    from automation.pipeline import agent_tools
+
+    async with async_playwright() as pw:
+        page = await (await _launch(pw)).new_page()
+        await page.set_content(_COMBO_PAGE)
+        got = await page.evaluate(
+            agent_tools._CB_IDENTITY_JS % {"id": '"react-select-18-input"'})
+
+        assert got["node_name"] == "INPUT"
+        assert got["attributes"]["role"] == "combobox"
+        # The path is document-rooted and resolves back to the same element.
+        assert await page.locator("xpath=/" + got["x_path"]).get_attribute("id") \
+            == "react-select-18-input"
+
+
+async def test_cb_identity_js_never_records_the_synthetic_resolver_id():
+    """_CB_RESOLVE_JS stamps 'ao-cb-N' on a control that had no id. That id does not
+    exist on the next run and must never reach a selector."""
+    from automation.pipeline import agent_tools
+
+    async with async_playwright() as pw:
+        page = await (await _launch(pw)).new_page()
+        await page.set_content('<select id="ao-cb-7"><option>a</option></select>')
+        got = await page.evaluate(agent_tools._CB_IDENTITY_JS % {"id": '"ao-cb-7"'})
+
+        assert "id" not in got["attributes"]
+        assert got["x_path"] == "html/body/select"

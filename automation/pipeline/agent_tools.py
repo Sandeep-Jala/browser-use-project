@@ -957,6 +957,94 @@ function () {
 }
 """.replace("STAMP", _CB_STAMP)
 
+# Resolve a combobox by the LABEL a human reads beside it, so the agent never has to
+# supply an index. This exists because select_dropdown was the ONE tool that always worked
+# on the Send Email "From" field (4/4 in run 20260827_012631) and the ONLY tool that
+# demanded an index — every other tool takes text. The agent therefore reached for
+# text-shaped tools first, burned steps on a panel that was not open yet, and only landed
+# on select_dropdown after failing. Two earlier attempts at helping it FIND the box (a
+# positional identity in list_actions; a borrowed name in RAW_FIND_JS) were never called
+# once in three live runs, because both ended in "now go call select_dropdown with an
+# index" — the extra hop the agent skips.
+#
+# react-select gives its input no aria-label / aria-labelledby / name / placeholder, and
+# the visible label is a separate node — often a BARE TEXT NODE sharing a block with the
+# widget's current value ("From Me  Include signature" in the live DOM). So the match runs
+# over preceding siblings including text nodes, collecting the two nearest: the innermost
+# is the VALUE ("Me") and the label ("From") is further out. Placeholder: %s = JSON tokens.
+_CB_RESOLVE_BY_TEXT_JS = r"""
+(function () {
+  var TOKENS = %s;
+  var CTRL_SEL = 'input[role=combobox], input[id^="react-select"][id$="-input"], select';
+  var t = function (s) { return String(s || '').replace(/\s+/g, ' ').trim(); };
+  var labelOf = function (el) {
+    var ids = el.getAttribute('aria-labelledby');
+    if (ids) {
+      var j = t(ids.split(/\s+/).map(function (id) {
+        var n = document.getElementById(id); return n ? t(n.textContent) : ''; }).join(' '));
+      if (j) return j;
+    }
+    if (el.labels && el.labels.length) { var lt = t(el.labels[0].textContent); if (lt) return lt; }
+    var w = el.closest ? el.closest('label') : null;
+    if (w) { var wt = t(w.textContent); if (wt) return wt; }
+    for (var a = 0; a < ['aria-label', 'title', 'placeholder'].length; a++) {
+      var v = t(el.getAttribute(['aria-label', 'title', 'placeholder'][a]));
+      if (v) return v;
+    }
+    // Nothing wired up: the two nearest preceding texts, innermost first. previousSibling
+    // (not previousElementSibling) because the label is frequently a bare text node.
+    var found = [], node = el;
+    for (var hop = 0; hop < 8 && node && found.length < 2; hop++) {
+      for (var s = node.previousSibling; s && found.length < 2; s = s.previousSibling) {
+        // A preceding sibling holding its OWN dropdown is the previous FIELD, not this
+        // one's label. Without this the walk climbed out of its row and 'Tax year' also
+        // matched the Period box sitting under it — two anonymous comboboxes, one label.
+        if (s.nodeType === 1 && s.querySelector && s.querySelector(CTRL_SEL)) continue;
+        var st = s.nodeType === 3 ? t(s.data)
+               : s.nodeType === 1 ? t(s.innerText || s.textContent) : '';
+        if (st) found.push(st.slice(0, 80));
+      }
+      node = node.parentNode;
+      if (node && node.nodeType !== 1) break;
+    }
+    return found.join(' ');
+  };
+  var boxes = [], seen = {};
+  var all = document.querySelectorAll(CTRL_SEL);
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i], r = el.getBoundingClientRect();
+    // A control the user cannot see is not the one they named. react-select's input is
+    // narrow but never zero-area; a display:none twin in a collapsed panel is.
+    if (!r.width && !r.height) continue;
+    var label = labelOf(el);
+    if (!el.id) el.id = 'ao-cb-' + (++window.__ao_cb_seq || (window.__ao_cb_seq = 1));
+    if (seen[el.id]) continue;
+    seen[el.id] = 1;
+    boxes.push({ id: el.id, label: label, native: el.tagName === 'SELECT' });
+  }
+  var hits = boxes.filter(function (b) {
+    var l = b.label.toLowerCase();
+    return TOKENS.every(function (tk) { return l.indexOf(tk) !== -1; });
+  });
+  if (hits.length === 1) {
+    // Mark the widget root the 'state' read-back reads from — same walk _CB_RESOLVE_JS
+    // does on the index path: climb while the subtree still holds exactly OUR control.
+    var input = document.getElementById(hits[0].id);
+    var root = input && (input.parentElement || input);
+    for (var h = 0; root && h < 4; h++) {
+      var par = root.parentElement;
+      if (!par || par.querySelectorAll(CTRL_SEL).length !== 1) break;
+      root = par;
+    }
+    var prev = document.querySelectorAll('[STAMP]');
+    for (var k = 0; k < prev.length; k++) prev[k].removeAttribute('STAMP');
+    if (root) root.setAttribute('STAMP', '1');
+  }
+  return { hits: hits, labels: boxes.map(function (b) { return b.label; }).filter(Boolean) };
+})()
+""".replace("STAMP", _CB_STAMP)
+
+
 # Document-level ops on the resolved combobox, addressed by the input's id.
 #   open    — focus the input and fire a real pointer+mouse sequence on it (react-select
 #             opens on the control's mousedown; a bare .focus() or .click() does nothing).
@@ -1084,6 +1172,50 @@ def _cb_option_lines(options: list[dict[str, Any]], limit: int = 10) -> str:
     return shown + more
 
 
+# The combobox CONTROL's identity, for the recording. select_dropdown opens the widget
+# INSIDE the tool, so a run that used it leaves no click on the box anywhere in its trace —
+# and the compiled script then has nothing that opens the menu. script_compile synthesizes
+# an opener from this stamp (see the select_dropdown branch); without it, replay's only
+# recourse is api.select_option's "re-click the previous click" guess, which on the Send
+# Email panel re-clicked the envelope icon that OPENS the panel and could never work
+# (entry aa3a76b7c82dcf8b, run 20260827_112618). Shaped like DOMInteractedElement.to_dict()
+# so compile anchors it through the same _selectors/_fingerprint path as any recorded
+# click. The synthetic 'ao-cb-N' id the resolver stamps is stripped: it does not exist on
+# the next run and must never reach a selector. Placeholder: %(id)s = JSON input id.
+_CB_IDENTITY_JS = r"""
+(function () {
+  var el = document.getElementById(%(id)s);
+  if (!el) return null;
+  var t = function (s) { return String(s || '').replace(/\s+/g, ' ').trim(); };
+  // Same positional-path shape script_compile records for every other element.
+  var xpathOf = function (e) {
+    if (!e || e === document.documentElement) return '/html';
+    var ix = 1, sib, n = 0;
+    for (sib = e.parentNode ? e.parentNode.firstElementChild : null; sib;
+         sib = sib.nextElementSibling) {
+      if (sib.tagName === e.tagName) { n++; if (sib === e) ix = n; }
+    }
+    return xpathOf(e.parentElement) + '/' + e.tagName.toLowerCase() +
+           (n > 1 ? '[' + ix + ']' : '');
+  };
+  var attrs = {};
+  ['id', 'role', 'name', 'class', 'aria-label', 'title', 'placeholder',
+   'data-testid', 'data-automationid'].forEach(function (a) {
+    var v = el.getAttribute(a);
+    if (v && !(a === 'id' && v.indexOf('ao-cb-') === 0)) attrs[a] = v;
+  });
+  var r = el.getBoundingClientRect();
+  var out = { node_name: el.tagName, attributes: attrs,
+              x_path: (el.getRootNode && el.getRootNode() !== document)
+                        ? '' : xpathOf(el).replace(/^\//, '') };
+  if (r && (r.width || r.height)) {
+    out.bounds = { x: r.left, y: r.top, width: r.width, height: r.height };
+  }
+  return out;
+})()
+"""
+
+
 async def _cb_op(browser_session, op: str, input_id: str, wanted: str | None = None):
     expr = _CB_OPS_JS % {"id": json.dumps(input_id), "op": json.dumps(op),
                          "wanted": json.dumps(wanted)}
@@ -1136,13 +1268,150 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
             "<select> and no combobox input (role=combobox / react-select) exists at or "
             "around it. Pass the index of the dropdown's input, its placeholder/current-"
             "value text, or its container."))
-    input_id = str(info["input_id"])
+    return await _combobox_pick(browser_session, str(info["input_id"]),
+                                target, f"at index {params.index}")
 
+
+_NATIVE_SELECT_BY_ID_JS = r"""
+(function () {
+  var el = document.getElementById(%(id)s), want = %(want)s;
+  if (!el) return { error: 'gone' };
+  var n = function (s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); };
+  var w = n(want), opts = [], i;
+  for (i = 0; i < el.options.length; i++) opts.push(el.options[i]);
+  var hit = null;
+  for (i = 0; i < opts.length && !hit; i++) {
+    if (n(opts[i].text) === w || n(opts[i].value) === w) hit = opts[i];
+  }
+  for (i = 0; i < opts.length && !hit; i++) {
+    if (n(opts[i].text).indexOf(w) !== -1) hit = opts[i];
+  }
+  if (!hit) return { error: 'no-option',
+                     options: opts.slice(0, 30).map(function (o) { return o.text; }) };
+  el.value = hit.value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  var sel = el.selectedOptions && el.selectedOptions[0];
+  // Identity for the recording. compile keys the native-select step on
+  // metadata.interacted_element (node_name SELECT + attributes) — without it the pick is
+  // dropped and replay submits the form with its DEFAULTS. The resolver stamps a synthetic
+  // 'ao-cb-N' id on any control that had none; that id does not exist on the next run, so
+  // it must never reach a selector.
+  var attrs = {};
+  ['id', 'name', 'class', 'aria-label', 'title', 'data-testid'].forEach(function (a) {
+    var v = el.getAttribute(a);
+    if (v && !(a === 'id' && v.indexOf('ao-cb-') === 0)) attrs[a] = v;
+  });
+  return { ok: true, shows: (sel && sel.text) || el.value, attrs: attrs };
+})()
+"""
+
+
+async def _native_select_by_id(browser_session, el_id: str, target: str,
+                               where: str) -> ActionResult:
+    """Set a native <select> located by label. Reports what the select SHOWS afterwards —
+    never the request — so a refused pick cannot read as success."""
+    try:
+        got = await _eval_js(browser_session, _NATIVE_SELECT_BY_ID_JS % {
+            "id": json.dumps(el_id), "want": json.dumps(target)})
+    except Exception as exc:  # noqa: BLE001
+        return ActionResult(error=f"select_dropdown '{target}' {where}: {exc}")
+    if not isinstance(got, dict) or got.get("error"):
+        if isinstance(got, dict) and got.get("error") == "no-option":
+            listed = ", ".join(f"'{o}'" for o in (got.get("options") or []))
+            return ActionResult(error=(
+                f"select_dropdown '{target}' {where}: no such option. The dropdown "
+                f"ACTUALLY lists: {listed}. Pick one of these exact texts."))
+        return ActionResult(error=(
+            f"select_dropdown '{target}' {where}: the dropdown went away before it "
+            "could be set. Re-read the page and try again."))
+    shows = str(got.get("shows") or "")
+    meta = {"interacted_element": {"node_name": "SELECT",
+                                   "attributes": dict(got.get("attrs") or {}),
+                                   "ax_name": target}}
+    msg = (f"Selected '{target}' in the dropdown {where} — it now shows '{shows}'. "
+           "Do NOT set it again.")
+    logger.info("🔽 %s", msg)
+    return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg,
+                        metadata=meta)
+
+
+async def _select_dropdown_by_label(browser_session, near_text: str,
+                                    target: str) -> ActionResult:
+    """select_dropdown addressed by the LABEL beside the control instead of by index.
+
+    Refuses honestly rather than guessing: nothing matched lists the labels that DO exist
+    on the page (the same redirect the option-miss receipt gives), and two matches name
+    both so the agent can say which — a silent .first here would set the wrong field, and
+    this page has three comboboxes that carry no distinguishing attributes at all."""
+    # Same token grammar find_by_text uses, so a label matches here exactly as it would
+    # there — one grammar across the toolbox, no per-tool surprises.
+    tokens = [t for t in re.split(r"[^a-z0-9]+", near_text.lower()) if t]
+    if not tokens:
+        return ActionResult(error="select_dropdown: near_text is empty.")
+    try:
+        got = await _eval_js(browser_session, _CB_RESOLVE_BY_TEXT_JS % json.dumps(tokens))
+    except Exception as exc:  # noqa: BLE001 - a resolver that cannot run must say so
+        return ActionResult(error=f"select_dropdown near '{near_text}': could not read the "
+                                  f"page to locate the dropdown ({exc}).")
+    hits = (got or {}).get("hits") or []
+    if not hits:
+        listed = ", ".join(f"'{lbl}'" for lbl in (got or {}).get("labels") or []) or "none"
+        return ActionResult(error=(
+            f"select_dropdown near '{near_text}': no dropdown on this page sits beside "
+            f"that text. The dropdowns actually on the page are labelled: {listed}. Pick "
+            "one of those labels, or check you are on the right page/panel."))
+    if len(hits) > 1:
+        listed = ", ".join(f"'{h.get('label')}'" for h in hits)
+        return ActionResult(error=(
+            f"select_dropdown near '{near_text}': {len(hits)} dropdowns match that text "
+            f"({listed}) — cannot know which you mean. Use the fuller label that tells "
+            "them apart, or pass index=<the combobox input's index>."))
+    hit = hits[0]
+    where = f"near '{near_text}'"
+    if hit.get("native"):
+        # A native <select> beside that label: drive it through the same read-back path the
+        # index form uses, by handing the id straight to the DOM.
+        return await _native_select_by_id(browser_session, str(hit["id"]), target, where)
+    # The label the agent addressed it by rides along: it is the only name this control
+    # has, and the compiled opener needs it for the label-scoped selector rung.
+    return await _combobox_pick(browser_session, str(hit["id"]), target, where,
+                                label=str(hit.get("label") or near_text))
+
+
+async def _cb_identity(browser_session, input_id: str,
+                       label: str = "") -> dict[str, Any] | None:
+    """The combobox control as a recordable element, or None when it cannot be read.
+    Best-effort: a pick that worked must never fail over its own bookkeeping."""
+    try:
+        got = await _eval_js(browser_session,
+                             _CB_IDENTITY_JS % {"id": json.dumps(input_id)})
+    except Exception as exc:  # noqa: BLE001 - identity is bookkeeping; the pick stands
+        logger.debug("combobox identity probe failed: %s", exc)
+        return None
+    if not isinstance(got, dict) or not got.get("node_name"):
+        return None
+    name = " ".join(str(label or "").split())
+    if name:
+        # The label the agent addressed the box BY ("From :"). _selectors offers the
+        # label-scoped rung to a control no attribute can name, which is exactly what a
+        # react-select input is (volatile id, no aria-label, no placeholder).
+        got["ax_name"] = name
+    return got
+
+
+async def _combobox_pick(browser_session, input_id: str, target: str,
+                         where: str, label: str = "") -> ActionResult:
+    """Open the resolved combobox, pick `target`, verify it took. Everything here is keyed
+    on the input's DOM id, so it serves BOTH addressing modes — by index (the element the
+    agent already has) and by label (`near_text`). `where` is how the receipts name the
+    target back to the agent ("at index 7093" / "near 'From'") and is the ONLY difference
+    between the two paths: the pick machinery itself is measured-good and stays untouched."""
     try:
         await _cb_op(browser_session, "open", input_id)
     except Exception as exc:  # noqa: BLE001 - report; the agent recovers via its receipt
         return ActionResult(error=(
-            f"select_dropdown '{target}' at index {params.index}: could not open the "
+            f"select_dropdown '{target}' {where}: could not open the "
             f"combobox ({exc})."))
     options = await _cb_poll_options(browser_session, input_id, timeout=4.0)
 
@@ -1209,13 +1478,13 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         listed = _cb_option_lines(options)
         if options:
             return ActionResult(error=(
-                f"select_dropdown '{target}' at index {params.index}: no such option. "
+                f"select_dropdown '{target}' {where}: no such option. "
                 f"The dropdown ACTUALLY lists: {listed}. These are all that exist — "
                 f"re-read the task and pick one of these exact texts with "
-                f"select_dropdown(index={params.index}, text='<option>'). Do NOT hunt "
+                f"select_dropdown(index=<the combobox index>, text='<option>'). Do NOT hunt "
                 f"the page for '{target}'."))
         return ActionResult(error=(
-            f"select_dropdown '{target}' at index {params.index}: the combobox opened but "
+            f"select_dropdown '{target}' {where}: the combobox opened but "
             "its option list NEVER rendered — even after clearing the filter, reopening "
             "the menu, and waiting. The dropdown's data source did not load on this page "
             "view; retyping into it as-is will keep showing no options. Recover the way "
@@ -1234,7 +1503,7 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         last_seen = picked.get("options") if isinstance(picked, dict) else None
         listed = _cb_option_lines(last_seen or options)
         return ActionResult(error=(
-            f"select_dropdown '{target}' at index {params.index}: the option "
+            f"select_dropdown '{target}' {where}: the option "
             f"'{chosen.get('text')}' vanished before it could be clicked (menu re-render). "
             f"Options last seen: {listed}. Call select_dropdown again with the same "
             "arguments."))
@@ -1267,14 +1536,19 @@ async def _combobox_select(browser_session, params: SelectDropdownOptionAction,
         "attributes": dict(picked.get("attrs") or {}),
         "ax_name": str(chosen.get("text") or target).strip(),
     }}
+    # ...and the OPENER's, because THIS tool opened the menu: nothing else in the trace
+    # does, so compile has to synthesize that click (see _CB_IDENTITY_JS).
+    opener = await _cb_identity(browser_session, input_id, label)
+    if opener:
+        meta["opener_element"] = opener
     if took:
-        msg = (f"Selected '{chosen.get('text')}' in the combobox at index {params.index} — "
+        msg = (f"Selected '{chosen.get('text')}' in the combobox {where} — "
                f"it now shows '{display}'. Do NOT set it again.")
         logger.info("🔽 %s", msg)
         return ActionResult(extracted_content=msg, include_in_memory=True,
                             long_term_memory=msg, metadata=meta)
     return ActionResult(error=(
-        f"select_dropdown '{target}' at index {params.index}: clicked the option "
+        f"select_dropdown '{target}' {where}: clicked the option "
         f"'{chosen.get('text')}' but the combobox does not show it (reads: '{display}'). "
         "Do not report it as set — re-check the field and call select_dropdown again if "
         "it still shows the old value."))
@@ -1791,6 +2065,19 @@ def _stamp_interacted(meta: dict[str, Any] | None, node: Any) -> dict[str, Any] 
     return {**(meta or {}), "interacted_element": captured}
 
 
+def _with_row(meta: dict[str, Any] | None,
+              row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Attach the clicked element's row identity to the element already stamped in
+    `meta`. No row, or no element to attach it to -> meta comes back untouched, so an
+    unstamped result stays byte-identical."""
+    if not row or not isinstance(meta, dict):
+        return meta
+    element = meta.get("interacted_element")
+    if not isinstance(element, dict) or element.get("row"):
+        return meta
+    return {**meta, "interacted_element": {**element, "row": row}}
+
+
 async def _click_outcome_suffix(browser_session, t0: float,
                                 pre: dict[str, Any] | None,
                                 node: Any = None,
@@ -1881,6 +2168,65 @@ _ROW_LABEL_JS = (
 )
 
 
+# The ROW a click happened in, as compilable identity: which container it is, and the
+# texts of its cells. Compile turns those into row-scoped selectors so a click with no
+# name of its own is located by the row it belongs to instead of by row POSITION.
+#
+# Why it must exist: the Data Request grid's external-link icon has no name, every row
+# carries one with the identical title, and its href embeds the RECORD id — so compile's
+# only usable anchor was `.../div[2]/div[9]/...`. Run 20260827_104331 created CDR072,
+# clicked whatever link sat at that position, and wrote 13 UpdateCal POSTs into CDR054, a
+# request from the day before. A positional path resolves confidently onto the wrong row
+# and nothing downstream can tell.
+#
+# PUA glyphs are stripped (Fluent renders its icons as literal text nodes — the 2026-08-21
+# pencil trap) and each cell is capped, because a cell text becomes a selector literal.
+_ROW_CELLS_JS = (
+    "function(){ var t = function(s){ return String(s || '')"
+    ".replace(/[\\uE000-\\uF8FF]/g, '').replace(/\\s+/g, ' ').trim(); };"
+    " var SCOPES = [['[role=\"row\"]', '[role=\"row\"]'], ['tr', 'tr'], ['li', 'li'],"
+    "               ['[class*=\"List-cell\"]', '[class*=\"List-cell\"]']];"
+    " var r = null, sel = '';"
+    " for (var s = 0; s < SCOPES.length && !r; s++) {"
+    "   r = this.closest(SCOPES[s][0]); if (r) sel = SCOPES[s][1]; }"
+    " if (!r) return null;"
+    " var out = [], push = function (v) { v = t(v);"
+    "   if (v && out.indexOf(v) < 0 && v.length <= 60) out.push(v); };"
+    " var cells = r.querySelectorAll("
+    "   '[role=\"gridcell\"], [role=\"cell\"], td, [class*=\"Row-cell\"]');"
+    " for (var i = 0; i < cells.length && out.length < 8; i++)"
+    "   push(cells[i].innerText || cells[i].textContent);"
+    " if (!out.length) push(r.innerText || r.textContent);"
+    " return { scope: sel, cells: out }; }"
+)
+
+
+def _named_element(node: Any) -> bool:
+    """Does this element carry a name of its own? A named click is already guarded by
+    expect_text at replay, so it needs no row scope; a NAMELESS one has nothing but its
+    position and is the class of click that lands on the wrong row."""
+    attrs = getattr(node, "attributes", None) or {}
+    ax = getattr(getattr(node, "ax_node", None), "name", None)
+    return bool(str(ax or "").strip() or str(attrs.get("aria-label") or "").strip())
+
+
+async def _row_cells(browser_session, node) -> dict[str, Any] | None:
+    """The clicked element's row scope + cell texts, or None. Best-effort: identity is
+    bookkeeping and must never cost the click."""
+    try:
+        handle = await _field_handle(browser_session, node)
+        if not handle:
+            return None
+        got = await _call_on_field(handle, _ROW_CELLS_JS)
+    except Exception as exc:  # noqa: BLE001 - same degradation as _row_context_label
+        logger.debug("row-cells probe failed: %s", exc)
+        return None
+    if not isinstance(got, dict) or not got.get("cells"):
+        return None
+    return {"scope": str(got.get("scope") or ""),
+            "cells": [str(c) for c in got["cells"] if str(c).strip()]}
+
+
 def _is_anonymous_toggle(node: Any) -> bool:
     """A checkbox/radio-ish element with no name of its own — the one click whose
     receipt would otherwise verify nothing."""
@@ -1888,6 +2234,29 @@ def _is_anonymous_toggle(node: Any) -> bool:
     toggle = (attrs.get("role") or "").strip().lower() in ("checkbox", "switch") \
         or (attrs.get("type") or "").strip().lower() in ("checkbox", "radio")
     return toggle and not (attrs.get("aria-label") or "").strip()
+
+
+def _nothing_clicked(msg: str, click_first: bool) -> ActionResult:
+    """Receipt for a find_by_text call that clicked NOTHING.
+
+    The channel is decided by INTENT, not by why the click did not happen. With
+    `click_first` the agent asked for an action, so a miss is a refusal and must ride the
+    ERROR channel: browser-use's multi_act stops a step's remaining queued actions on an
+    error, and on the success channel it does not. That is the exact hole the ambiguous
+    branch closed in run 20260824_155123 — and the one the 0-match branch still had on
+    2026-08-27, when a batched `find_by_text('Close', click_first) -> click(index)` sailed
+    past a miss: the Payroll Review panel was never closed, the follow-up click fired
+    against an unchanged page, and the half-trace was committed as if the close had
+    happened (run 20260827_104331, entry 07044b6a0dbf7988).
+
+    Without `click_first` the call IS a probe — "is this text here?" is a legitimate
+    question whose answer can be no — so it keeps the success channel. `no_click` is
+    stamped either way: compile must never read one of these as a click.
+    """
+    if click_first:
+        return ActionResult(error=msg, metadata={"no_click": True})
+    return ActionResult(extracted_content=msg, long_term_memory=msg,
+                        include_in_memory=True, metadata={"no_click": True})
 
 
 async def _row_context_label(browser_session, node) -> str | None:
@@ -1916,9 +2285,14 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
             node = await browser_session.get_element_by_index(index)
         except Exception:  # noqa: BLE001 - the built-in will report the real lookup error
             node = None
-    row_label = None
+    row_label, row = None, None
     if node is not None and _is_anonymous_toggle(node):
         row_label = await _row_context_label(browser_session, node)
+    if node is not None and not _named_element(node):
+        # Identity for the RECORDING (not the receipt): a click with no name of its own
+        # compiles to a positional row path, which resolves onto the wrong row on the
+        # next run's data (see _ROW_CELLS_JS).
+        row = await _row_cells(browser_session, node)
     pre = await _dialog_state(browser_session, node) if node is not None else None
     t0 = _stamp_action()
     res = await builtin_click(params=params, browser_session=browser_session)
@@ -1939,6 +2313,7 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
     # element, so the stamp always names what we actually acted on. Same shape (and same
     # reason) as find_by_text's stamp.
     merged = _stamp_interacted(meta, node)
+    merged = _with_row(merged, row)
     merged = _with_write_outcome(merged, outcome)
     if not suffix and merged is meta:
         return res
@@ -1974,6 +2349,39 @@ def build_tools() -> Tools:
     @tools.action(_builtin_click.description, param_model=_builtin_click.param_model)
     async def click(params, browser_session=None) -> ActionResult:
         return await _click_with_dialog_outcome(_builtin_click_fn, params, browser_session)
+
+    # Same-name override of `close` that DELEGATES to the built-in, refusing only the one
+    # close that cannot be recovered from: the LAST open tab. Closing it destroys the page
+    # the workflow runs in — browser-use then spawns a fresh about:blank with no history,
+    # so the next segment has nothing to go back to and no URL to return to (run
+    # 20260827_091313 subtask 8: the agent correctly closed the aux client tab, then closed
+    # the app's own /datarequests tab one step later on an invented memory of a third tab;
+    # subtask 9 opened on about:blank, guessed a URL, and died on ERR_NAME_NOT_RESOLVED).
+    # Only the terminal case is guarded: a segment told to "close this tab" still closes its
+    # aux tab normally, and the tab-count DROP that _recording_closed_its_page reads to skip
+    # the end-context pin is unchanged.
+    _builtin_close = tools.registry.registry.actions["close"]
+    _builtin_close_fn = _builtin_close.function
+
+    @tools.action(_builtin_close.description, param_model=_builtin_close.param_model)
+    async def close(params, browser_session=None) -> ActionResult:
+        try:
+            remaining = len(await browser_session.get_tabs())
+        except Exception as exc:  # noqa: BLE001 - never break the close path over a diagnosis
+            logger.debug("close guard: unreadable tab list (%s) - delegating", exc)
+            remaining = 0                      # fail OPEN: 0 skips the guard below
+        if remaining == 1:
+            msg = (f"REFUSED — did NOT close tab #{params.tab_id}: it is the LAST open tab, "
+                   "and closing it destroys the page this workflow is running in. The next "
+                   "step would start on a blank page with no history and no way back to the "
+                   "app. If your instruction to close a tab meant the extra tab this workflow "
+                   "opened, that tab is already closed — nothing further to close. Call done "
+                   "instead.")
+            logger.info("⛔ %s", msg)
+            # error channel: multi_act stops the remaining queued actions, so a `done`
+            # batched behind this close cannot report a close that never happened.
+            return ActionResult(error=msg, metadata={"no_close": True})
+        return await _builtin_close_fn(params=params, browser_session=browser_session)
 
     # Same name/param model as the built-in: same-name registration OVERRIDES it (excluding
     # "input" would drop this replacement too), and the recorder still captures the
@@ -2130,16 +2538,33 @@ def build_tools() -> Tools:
     # built-in shape and the compiler's native-select path needs no changes.
     @tools.action(
         'Pick an option in ANY dropdown by its visible text: native <select> elements AND '
-        'custom comboboxes (react-select etc.). For a custom combobox, pass the index of '
-        'its input, its placeholder/current-value text element, or its container — the '
-        'tool opens the menu, picks the matching option, and verifies it took, all in one '
-        'action. If your text is not among the options, the error lists what the dropdown '
-        'ACTUALLY offers.',
-        param_model=SelectDropdownOptionAction,
+        'custom comboboxes (react-select etc.). ADDRESS IT BY THE LABEL BESIDE IT — '
+        'select_dropdown(near_text="From", text="no-reply") — which is the form to use '
+        'whenever the task names the field by its label. A custom dropdown usually has NO '
+        'name of its own (its label is a separate piece of text), so no text search can '
+        'find the control itself; near_text matches on that neighbouring label for you and '
+        'needs no index. Pass index instead ONLY when you already have the combobox '
+        "input's index. Either way the tool opens the menu, picks the matching option and "
+        'verifies it took, in one action. If your text is not among the options, the error '
+        'lists what the dropdown ACTUALLY offers.',
     )
-    async def select_dropdown(params: SelectDropdownOptionAction,
-                              browser_session=None) -> ActionResult:
+    async def select_dropdown(text: str, near_text: str = "", index: int = -1,
+                              browser_session=None) -> ActionResult:  # injected by name
         _stamp_action()   # verify_save_registered windows on the LAST acting verb
+        if browser_session is None:
+            return ActionResult(error="select_dropdown: BrowserSession not injected")
+        if near_text.strip():
+            by_label = await _select_dropdown_by_label(browser_session, near_text, text)
+            if not by_label.error or index < 0:
+                return by_label
+            logger.info("🔽 near_text '%s' did not resolve (%s); falling back to index %d",
+                        near_text, by_label.error, index)
+        if index < 0:
+            return ActionResult(error=(
+                "select_dropdown needs a target: pass near_text='<the label beside the "
+                "dropdown>' (preferred — no index needed), or index=<the combobox "
+                "input's index>."))
+        params = SelectDropdownOptionAction(index=index, text=text)
         node = await browser_session.get_element_by_index(params.index)
         if node is None:
             msg = (f"Element index {params.index} not available - page may have changed. "
@@ -2578,15 +3003,13 @@ def build_tools() -> Tools:
                            f"now. If you expected a dropdown option: open the dropdown and "
                            f"choose from the options it ACTUALLY lists instead of this text.")
                     logger.info("🔎 %s", msg)
-                    return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                        include_in_memory=True, metadata={"no_click": True})
+                    return _nothing_clicked(msg, click_first)
                 names = ", ".join(f"'{n}'" for n in (raw.get("names") or []) if n)
                 msg = (f"find_by_text('{query}'): {raw['count']} match(es) exist in the DOM but "
                        f"are NOT clickable via index (0-size/virtualized): {names}. Re-call "
                        f"find_by_text('{query}', click_first=true) to click the best match directly.")
                 logger.info("🔎 %s", msg)
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return _nothing_clicked(msg, click_first)
             # Last probe before claiming absence: the query may exist as STATIC text — a
             # label/heading with no control shape ('Period to' in the shadow-DOM modal,
             # run 20260805_123407_334719). The old receipt asserted "not in this page's
@@ -2608,8 +3031,7 @@ def build_tools() -> Tools:
                        "index). Nothing was clicked.")
                 logger.info("🔎 %s", msg)
                 # no_click: a probe that touched nothing — same compile rule as below.
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return _nothing_clicked(msg, click_first)
             if popup:
                 # A popup IS open and nothing in it (or behind it) matches. Sending the
                 # agent scroll-hunting here is the one move that destroys the popup, and
@@ -2625,8 +3047,7 @@ def build_tools() -> Tools:
                     "the popup, close the popup first."
                 )
                 logger.info("🔎 %s", msg)
-                return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                    include_in_memory=True, metadata={"no_click": True})
+                return _nothing_clicked(msg, click_first)
             msg = (
                 f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
                 "The element is not in this page's DOM. FIRST check: is this the page you think "
@@ -2635,12 +3056,11 @@ def build_tools() -> Tools:
                 "pages at most) or apply the ELEMENT NOT FOUND POLICY; do not repeat this query."
             )
             logger.info("🔎 %s", msg)
-            # no_click: this was a PROBE that touched nothing — without the stamp, compile
-            # treats a metadata-less click_first result as a dropped-metadata click and
-            # emits a semantic find_click (observed live: a closed-panel check committed
-            # a find_click('save') that then failed every replay on the healthy page).
-            return ActionResult(extracted_content=msg, long_term_memory=msg,
-                                include_in_memory=True, metadata={"no_click": True})
+            # no_click: this touched nothing — without the stamp, compile treats a
+            # metadata-less click_first result as a dropped-metadata click and emits a
+            # semantic find_click (observed live: a closed-panel check committed a
+            # find_click('save') that then failed every replay on the healthy page).
+            return _nothing_clicked(msg, click_first)
 
         # One control wrapped in same-text divs is not an ambiguity — collapse it first,
         # so the exact-label preference and the single-match click below see the real

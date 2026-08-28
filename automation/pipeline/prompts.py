@@ -142,7 +142,7 @@ after typing (its receipt says "pressed Enter"), so:
     happened. Just wait ~2 seconds for results to load.
   • EXCEPTION: dropdown/combobox filters (react-select) are
     NOT search boxes — don't type into them with `input` at
-    all. Pick the option with select_dropdown(index, text)
+    all. Pick the option with select_dropdown(near_text, text)
     (see DROPDOWN / COMBOBOX PICKS); never send Enter in a
     combobox (it selects whatever option happens to be
     focused).
@@ -360,22 +360,33 @@ DROPDOWN / COMBOBOX PICKS — use select_dropdown, ONE action
 ───────────────────────────────────────────────────────────
 For EVERY dropdown pick — native <select> AND custom comboboxes
 (react-select "react-select-N-input", role=combobox) — call
-select_dropdown(index, text). It opens the menu, clicks the
-matching option the way the widget requires, and VERIFIES the
-value took, all in one action. Do NOT hand-roll dropdown picks
-with click + input + find_by_text — typed filter text makes the
-combobox input match your own find_by_text query, and batched
-follow-up clicks close the menu you just opened.
+select_dropdown. It opens the menu, clicks the matching option
+the way the widget requires, and VERIFIES the value took, all in
+one action. Do NOT hand-roll dropdown picks with click + input +
+find_by_text — typed filter text makes the combobox input match
+your own find_by_text query, and batched follow-up clicks close
+the menu you just opened.
 
-  • TARGETING among several adjacent comboboxes: their inputs
-    all look identical (nameless role=combobox). Locate the one
-    you mean by its VISIBLE placeholder or current value —
-    find_by_text('Select employee') / find_by_text('Monthly') —
-    then call select_dropdown on THAT index. Never guess between
-    anonymous combobox inputs.
+  • ADDRESS IT BY THE LABEL BESIDE IT, in ONE call:
+        select_dropdown(near_text='From', text='no-reply')
+    A custom dropdown has NO name of its own — the label you can
+    see is a separate piece of text next to it — so no text
+    search can find the control, and there is nothing to click
+    first. near_text matches on that neighbouring label for you.
+    Use this form whenever the task names the field by its label
+    ("the From dropdown", "the Tax year box"). Do not look up an
+    index first; do not click the box first.
+  • Pass index=<the combobox input's index> ONLY when you already
+    have that index in front of you.
+  • TARGETING among several adjacent comboboxes: their inputs all
+    look identical (nameless role=combobox), so name them apart
+    by their labels — near_text='Tax year' vs near_text='Period'.
+    If the receipt says two dropdowns matched, use the fuller
+    label that separates them. Never guess between anonymous
+    combobox inputs.
   • If the receipt says "the dropdown ACTUALLY lists: ...", those
     options are ALL that exist. Re-read the task and pick the one
-    it means with select_dropdown(index, text='<option>') — do
+    it means with select_dropdown(..., text='<option>') — do
     NOT hunt the page for your original text or type it anywhere.
   • NEVER batch Save/submit (or any other click) into the same
     step as a dropdown pick. Pick → read the receipt → THEN save
@@ -403,7 +414,8 @@ fail_and_stop — supply a value and keep going. Two triggers:
 How to supply the value depends on the control:
 
 DROPDOWNS — the option list is fixed; you cannot invent one:
-    1. Call select_dropdown(index, text) with the task-given
+    1. Call select_dropdown(near_text='<the label beside the
+       dropdown>', text=...) with the task-given
        value. If it errors listing the ACTUAL options, pick the
        matching one from that list; if the task names no value,
        pick any appropriate listed option.

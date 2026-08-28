@@ -1,0 +1,393 @@
+{
+  "source_prompt": "Now go to Data Request, click on the staus of the top ref. no., Select the Status Submitted and Add a note, Well done and Save. and click on the top ref. no. link to open the Payroll Review panel, click the employee checkbox to select all the employee and then click Verify all.",
+  "params": {
+    "note": "Well done",
+    "status": "Submitted"
+  },
+  "steps": [
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Payroll Calculation review\") span",
+        "css=[role=\"row\"]:has-text(\"PR/01797494/27/CDR083\") span",
+        "css=[role=\"row\"]:has-text(\"FOOD LIMITED\") span",
+        "css=[role=\"row\"]:has-text(\"27/08/2026\") span",
+        "css=[role=\"row\"]:has-text(\"2026-27\") span",
+        "css=[role=\"row\"]:has-text(\"Sent\") span",
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span/span"
+      ],
+      "expect_text": "Sent",
+      "fingerprint": {
+        "tag": "span",
+        "text": "Sent",
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span/span",
+        "bounds": {
+          "x": 1277.0,
+          "y": 143.0,
+          "width": 100.0,
+          "height": 20.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[3]/div[10]/div/div/div[8]/div/span/span"
+      ],
+      "hidden_ok": true,
+      "expect_text": "Submitted",
+      "fingerprint": {
+        "tag": "span",
+        "text": "Submitted",
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[3]/div[10]/div/div/div[8]/div/span/span",
+        "bounds": {
+          "x": 1277.0,
+          "y": 1056.5,
+          "width": 100.0,
+          "height": 20.0
+        }
+      }
+    },
+    {
+      "action": "fill",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea"
+      ],
+      "value": "{{note}}",
+      "clear": true,
+      "fingerprint": {
+        "tag": "textarea",
+        "attrs": {
+          "id": "TextField6331"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea",
+        "bounds": {
+          "x": 614.328125,
+          "y": 173.0,
+          "width": 269.6640625,
+          "height": 63.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]"
+      ],
+      "expect_text": "Save",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Save",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]",
+        "bounds": {
+          "x": 813.734375,
+          "y": 324.0,
+          "width": 71.265625,
+          "height": 26.0
+        }
+      }
+    },
+    {
+      "action": "fill",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div/input"
+      ],
+      "value": "",
+      "clear": true,
+      "fingerprint": {
+        "tag": "input",
+        "role": "combobox",
+        "attrs": {
+          "id": "react-select-26-input",
+          "type": "text"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div/input",
+        "bounds": {
+          "x": 623.828125,
+          "y": 139.25,
+          "width": 62.9765625,
+          "height": 19.5
+        }
+      },
+      "field_id": "react-select-26"
+    },
+    {
+      "action": "wait",
+      "seconds": 1.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[2]/div"
+      ],
+      "expect_text": "<svg /> <!-- SVG content collapsed -->",
+      "fingerprint": {
+        "tag": "div",
+        "text": "<svg /> <!-- SVG content collapsed -->",
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[2]/div",
+        "bounds": {
+          "x": 738.328125,
+          "y": 137.0,
+          "width": 24.0,
+          "height": 24.0
+        }
+      }
+    },
+    {
+      "action": "wait",
+      "seconds": 1.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Payroll Calculation review\") span",
+        "css=[role=\"row\"]:has-text(\"PR/01797494/27/CDR083\") span",
+        "css=[role=\"row\"]:has-text(\"FOOD LIMITED\") span",
+        "css=[role=\"row\"]:has-text(\"27/08/2026\") span",
+        "css=[role=\"row\"]:has-text(\"2026-27\") span",
+        "css=[role=\"row\"]:has-text(\"Sent\") span",
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span"
+      ],
+      "fingerprint": {
+        "tag": "span",
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span",
+        "bounds": {
+          "x": 1277.0,
+          "y": -568.0,
+          "width": 100.0,
+          "height": 20.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[2]/div/div/div/div[2]/div/div/div[3]/div/div/div[1]/div[2]/input",
+        "css=*:text-is(\"All status \ue721\") >> xpath=ancestor-or-self::*[.//input][1]//input"
+      ],
+      "fingerprint": {
+        "tag": "input",
+        "role": "combobox",
+        "text": "All status \ue721",
+        "attrs": {
+          "id": "react-select-25-input"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[2]/div/div/div/div[2]/div/div/div[3]/div/div/div[1]/div[2]/input",
+        "bounds": {
+          "x": 1294.5,
+          "y": 78.25,
+          "width": 3.5625,
+          "height": 19.5
+        }
+      }
+    },
+    {
+      "action": "type",
+      "text": "{{status}}",
+      "field_id": "react-select-25"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "role=option[name=\"{{status}}\"]",
+        "text=\"{{status}}\"",
+        "css=[id$=\"-option-0\"]"
+      ],
+      "expect_text": "Submitted"
+    },
+    {
+      "action": "fill",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea"
+      ],
+      "value": "{{note}}",
+      "clear": true,
+      "fingerprint": {
+        "tag": "textarea",
+        "attrs": {
+          "id": "TextField6331"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea",
+        "bounds": {
+          "x": 614.328125,
+          "y": 173.0,
+          "width": 269.6640625,
+          "height": 63.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]"
+      ],
+      "expect_text": "Save",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Save",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]",
+        "bounds": {
+          "x": 813.734375,
+          "y": 324.0,
+          "width": 71.265625,
+          "height": 26.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div[2]/input"
+      ],
+      "fingerprint": {
+        "tag": "input",
+        "role": "combobox",
+        "attrs": {
+          "id": "react-select-26-input",
+          "type": "text"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div[2]/input",
+        "bounds": {
+          "x": 623.828125,
+          "y": 139.25,
+          "width": 3.5625,
+          "height": 19.5
+        }
+      }
+    },
+    {
+      "action": "type",
+      "text": "{{status}}",
+      "field_id": "react-select-26"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[5]/div/div/div[2]",
+        "role=option[name=\"{{status}}\"]",
+        "text=\"{{status}}\"",
+        "css=[id$=\"-option-0\"]"
+      ],
+      "expect_text": "Submitted"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]"
+      ],
+      "expect_text": "Save",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Save",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]",
+        "bounds": {
+          "x": 813.734375,
+          "y": 324.0,
+          "width": 71.265625,
+          "height": 26.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button"
+      ],
+      "expect_text": "PR/01797494/27/CDR084",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "PR/01797494/27/CDR084",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button",
+        "bounds": {
+          "x": 268.0,
+          "y": 143.0,
+          "width": 146.296875,
+          "height": 21.5
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Select Employee\") div[data-automationid=\"DetailsRowCheck\"]",
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[1]/span/div",
+        "css=[id$=\"-check\"]",
+        "css=[data-automationid=\"DetailsRowCheck\"]"
+      ],
+      "fingerprint": {
+        "tag": "div",
+        "role": "checkbox",
+        "attrs": {
+          "id": "header7545-check",
+          "data-automationid": "DetailsRowCheck"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[1]/span/div",
+        "bounds": {
+          "x": 140.0,
+          "y": 93.0,
+          "width": 40.0,
+          "height": 32.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Select Employee\") div[role=\"button\"]",
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[3]",
+        "css=*:text-is(\"Select Employee\") >> xpath=ancestor-or-self::*[.//div][1]//div"
+      ],
+      "fingerprint": {
+        "tag": "div",
+        "role": "button",
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[3]",
+        "bounds": {
+          "x": 359.0,
+          "y": 93.0,
+          "width": 16.0,
+          "height": 32.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[4]/button[3]",
+        "css=[id=\"btn-Verify\"]"
+      ],
+      "expect_text": "Verify All",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Verify All",
+        "attrs": {
+          "id": "btn-Verify",
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[4]/button[3]",
+        "bounds": {
+          "x": 1332.953125,
+          "y": 634.0,
+          "width": 97.046875,
+          "height": 26.0
+        }
+      }
+    }
+  ]
+}

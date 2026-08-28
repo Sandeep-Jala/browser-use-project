@@ -1,0 +1,63 @@
+{
+  "click": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[1]/div/div/button",
+      "css=*:text-is(\"Payments\") >> xpath=ancestor-or-self::*[.//button][1]//button"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "button",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[1]/div/div/button",
+      "bounds": {
+        "x": 1371.4921875,
+        "y": 208.0,
+        "width": 35.5,
+        "height": 31.0
+      }
+    }
+  },
+  "fill": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[5]/div/div/div[2]/div[2]/div[2]/div/input",
+      "css=[inputmode=\"decimal\"]"
+    ],
+    "fingerprint": {
+      "tag": "input",
+      "attrs": {
+        "type": "text"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[5]/div/div/div[2]/div[2]/div[2]/div/input",
+      "bounds": {
+        "x": 738.328125,
+        "y": 235.1953125,
+        "width": 151.328125,
+        "height": 31.0
+      }
+    }
+  },
+  "save": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[5]/div/div/div[3]/button[2]",
+      "css=button:text-is(\"Save\")"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "button",
+      "text": "Save",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[5]/div/div/div[3]/button[2]",
+      "bounds": {
+        "x": 1003.9140625,
+        "y": 299.1953125,
+        "width": 49.0859375,
+        "height": 31.0
+      }
+    },
+    "expect_text": "Save"
+  }
+}

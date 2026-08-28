@@ -27,7 +27,7 @@ def build_llm(config: Config) -> BaseChatModel:
             model=config.azure_model,
             api_key=config.azure_api_key,
             base_url=config.azure_base_url,
-            temperature=0.0,
+            temperature=0.3,
             # Reliability params pinned rather than inherited from browser-use defaults
             # (these ARE 0.13.3's defaults — pinned so an upgrade can't silently move them).
             # frequency_penalty is deliberately left at its 0.3 default: it exists to stop

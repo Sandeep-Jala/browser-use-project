@@ -1,0 +1,219 @@
+{
+  "source_prompt": "Now go to Data Request, and on the top row (S.No. 1, the newest request) click the ref. no. to open the Payroll Review panel, and click Get OTP, copy the 6 digit number (OTP), close the review panel. Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, paste the OTP from the previous step into the first code box and click proceed Securely.",
+  "params": {
+    "bound_1": "PR/01797494/27/CDR079"
+  },
+  "steps": [
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[1]/div/div/nav/div/div[1]/ul/li[8]/a",
+        "css=[id=\"datarequest\"]",
+        "css=[aria-label=\"Data Request\"]",
+        "css=a[href=\"/paye/clients/6a61d0ab5636abb464ba0e13/datarequests\"]"
+      ],
+      "expect_text": "Data Request",
+      "fingerprint": {
+        "tag": "a",
+        "role": "link",
+        "text": "Data Request",
+        "attrs": {
+          "id": "datarequest",
+          "aria-label": "Data Request",
+          "href": "/paye/clients/6a61d0ab5636abb464ba0e13/datarequests"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[1]/div/div/nav/div/div[1]/ul/li[8]/a",
+        "bounds": {
+          "x": 0.0,
+          "y": 264.0,
+          "width": 200.0,
+          "height": 32.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button"
+      ],
+      "expect_text": "{{bound_1}}",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "PR/01797494/27/CDR079",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button",
+        "bounds": {
+          "x": 268.0,
+          "y": 143.0,
+          "width": 146.296875,
+          "height": 21.5
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div"
+      ],
+      "hidden_ok": true,
+      "expect_text": "Get OTP",
+      "fingerprint": {
+        "tag": "div",
+        "text": "Get OTP",
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div",
+        "bounds": {
+          "x": 1373.0078125,
+          "y": 33.25,
+          "width": 46.9921875,
+          "height": 19.5
+        }
+      }
+    },
+    {
+      "action": "copy",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div/span/span"
+      ],
+      "label": "otp",
+      "fingerprint": {
+        "tag": "span",
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[1]/div/div/span/span",
+        "bounds": {
+          "x": 1381.1875,
+          "y": 35.25,
+          "width": 38.8125,
+          "height": 16.0
+        }
+      },
+      "query": "index 41358"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[1]/div/button[2]"
+      ],
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[1]/div/button[2]",
+        "bounds": {
+          "x": 1410.0,
+          "y": 0.0,
+          "width": 30.0,
+          "height": 29.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/a",
+        "css=[title=\"Open payroll review request as client\"]",
+        "css=a[href=\"/links/10/c/6a61d0ab5636abb464ba0e13/r/6a9054ec226b8586b7bb88bd/calcdatarequest\"]"
+      ],
+      "expect_text": "Open payroll review request as client",
+      "fingerprint": {
+        "tag": "a",
+        "role": "link",
+        "text": "Open payroll review request as client",
+        "attrs": {
+          "title": "Open payroll review request as client",
+          "href": "/links/10/c/6a61d0ab5636abb464ba0e13/r/6a9054ec226b8586b7bb88bd/calcdatarequest"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/a",
+        "bounds": {
+          "x": 425.0,
+          "y": 143.0,
+          "width": 13.0,
+          "height": 21.5
+        }
+      },
+      "opens_tab": true
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[3]/div/div/form/div/div[2]/div[1]/div/div/button[1]"
+      ],
+      "expect_text": "Already have an OTP",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Already have an OTP",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[3]/div/div/form/div/div[2]/div[1]/div/div/button[1]",
+        "bounds": {
+          "x": 734.3828125,
+          "y": 419.0,
+          "width": 152.0390625,
+          "height": 31.0
+        }
+      }
+    },
+    {
+      "action": "paste",
+      "selectors": [
+        "xpath=/html/body/div[3]/div/div/form/div/div[2]/div[2]/div[3]/div/input[1]",
+        "css=[aria-label=\"Please enter OTP character 1\"]",
+        "css=[inputmode=\"numeric\"]"
+      ],
+      "value": "{{noted:otp}}",
+      "fingerprint": {
+        "tag": "input",
+        "text": "Please enter OTP character 1",
+        "attrs": {
+          "aria-label": "Please enter OTP character 1",
+          "type": "tel"
+        },
+        "xpath": "html/body/div[3]/div/div/form/div/div[2]/div[2]/div[3]/div/input[1]",
+        "bounds": {
+          "x": 556.9140625,
+          "y": 372.5,
+          "width": 40.0,
+          "height": 45.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[3]/div/div/form/div/div[3]/button[2]"
+      ],
+      "expect_text": "Proceed Securely",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Proceed Securely",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[3]/div/div/form/div/div[3]/button[2]",
+        "bounds": {
+          "x": 671.9765625,
+          "y": 438.5,
+          "width": 150.0,
+          "height": 31.0
+        }
+      }
+    }
+  ],
+  "bindings": {
+    "bound_1": {
+      "kind": "created",
+      "method": "POST",
+      "endpoint": "/payroll/clients/*/calculationdatarequest",
+      "path": [
+        "result",
+        "number"
+      ]
+    }
+  }
+}

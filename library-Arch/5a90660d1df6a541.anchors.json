@@ -1,0 +1,132 @@
+{
+  "click": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[7]/div[1]/div[1]/button",
+      "css=*:text-is(\"Additions or Deductions\") >> xpath=ancestor-or-self::*[.//button][1]//button"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "button",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[7]/div[1]/div[1]/button",
+      "bounds": {
+        "x": 1371.4921875,
+        "y": 573.0,
+        "width": 35.5,
+        "height": 31.0
+      }
+    }
+  },
+  "select": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[1]/div[2]/div/select",
+      "css=*:text-is(\"Type\") >> xpath=ancestor-or-self::*[.//select][1]//select"
+    ],
+    "fingerprint": {
+      "tag": "select",
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[1]/div[2]/div/select",
+      "bounds": {
+        "x": 738.328125,
+        "y": 263.1953125,
+        "width": 151.328125,
+        "height": 28.0
+      }
+    }
+  },
+  "ao-cb-6": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[3]/div[2]/div/select",
+      "css=*:text-is(\"Period to\") >> xpath=ancestor-or-self::*[.//select][1]//select"
+    ],
+    "fingerprint": {
+      "tag": "select",
+      "attrs": {
+        "id": "ao-cb-6"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[3]/div[2]/div/select",
+      "bounds": {
+        "x": 738.328125,
+        "y": 327.1953125,
+        "width": 151.328125,
+        "height": 28.0
+      }
+    }
+  },
+  "ao-cb-7": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[4]/div[2]/div/select",
+      "css=*:text-is(\"Name\") >> xpath=ancestor-or-self::*[.//select][1]//select"
+    ],
+    "fingerprint": {
+      "tag": "select",
+      "attrs": {
+        "id": "ao-cb-7"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[4]/div[2]/div/select",
+      "bounds": {
+        "x": 738.328125,
+        "y": 359.1953125,
+        "width": 151.328125,
+        "height": 28.0
+      }
+    }
+  },
+  "fill": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[5]/div[2]/div/input",
+      "css=*:text-is(\"Description\") >> xpath=ancestor-or-self::*[.//input][1]//input"
+    ],
+    "fingerprint": {
+      "tag": "input",
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[5]/div[2]/div/input",
+      "bounds": {
+        "x": 738.328125,
+        "y": 391.1953125,
+        "width": 300.0,
+        "height": 28.0
+      }
+    }
+  },
+  "fill-2": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[6]/div[2]/input",
+      "css=[inputmode=\"decimal\"]"
+    ],
+    "fingerprint": {
+      "tag": "input",
+      "attrs": {
+        "type": "text"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[2]/div[6]/div[2]/input",
+      "bounds": {
+        "x": 738.328125,
+        "y": 423.1953125,
+        "width": 150.0,
+        "height": 31.0
+      }
+    }
+  },
+  "save": {
+    "selectors": [
+      "xpath=/html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[3]/button[2]"
+    ],
+    "fingerprint": {
+      "tag": "button",
+      "role": "button",
+      "text": "Save",
+      "attrs": {
+        "type": "button"
+      },
+      "xpath": "html/body/div/div/div/div[2]/div/div/form/div/div/div/div[2]/div[2]/div[1]/div/div/div[2]/div/div[2]/div[8]/div/div/div[3]/button[2]",
+      "bounds": {
+        "x": 1003.9140625,
+        "y": 487.1953125,
+        "width": 49.0859375,
+        "height": 31.0
+      }
+    },
+    "expect_text": "Save"
+  }
+}

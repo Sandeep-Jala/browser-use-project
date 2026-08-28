@@ -1,0 +1,65 @@
+{
+  "source_prompt": "In the Send Email section that opens, click on the dropdown next to from and select the no-reply option, then click Send; if the Send Email section has not closed after clicking Send, click Save again. If the email was not sent, it is saved as Drafted; click the email button next to the Drafted status to reopen the Send Email section, then click Send. if you see a notification of \"Why not wish them a great weekend \ud83d\ude42\", click send again.",
+  "params": {
+    "from_address": "no-reply"
+  },
+  "steps": [
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div/div[2]/div/div[2]/div/form/div/div[1]/div[1]/div/div/div[1]/div[2]/input"
+      ],
+      "fingerprint": {
+        "tag": "input",
+        "role": "combobox",
+        "attrs": {
+          "id": "react-select-16-input",
+          "type": "text"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div/div[2]/div/div[2]/div/form/div/div[1]/div[1]/div/div/div[1]/div[2]/input",
+        "bounds": {
+          "x": 644.6640625,
+          "y": 43.25,
+          "width": 3.5625,
+          "height": 19.5
+        }
+      }
+    },
+    {
+      "action": "type",
+      "text": "{{from_address}}"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "role=option[name=\"{{from_address}}\"]",
+        "text=\"{{from_address}}\"",
+        "css=[id$=\"-option-0\"]"
+      ]
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div/div[2]/div/div[3]/div/div/div/div[2]/div/div/span/button[1]",
+        "css=[id=\"mailbtn\"]"
+      ],
+      "expect_text": "Send",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Send",
+        "attrs": {
+          "id": "mailbtn",
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div/div[2]/div/div[3]/div/div/div/div[2]/div/div/span/button[1]",
+        "bounds": {
+          "x": 1318.0,
+          "y": 634.0,
+          "width": 80.0,
+          "height": 26.0
+        }
+      }
+    }
+  ]
+}

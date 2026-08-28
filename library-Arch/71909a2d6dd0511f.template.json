@@ -1,0 +1,197 @@
+{
+  "source_prompt": "Now go to Data Request, click on the staus of the top ref. no., Select the Status Submitted and Add a note, Well done and Save. and click on the top ref. no. link to open the Payroll Review panel, click the employee checkbox to select all the employee and then click Verify all.",
+  "params": {
+    "bound_1": "PR/01797494/27/CDR079"
+  },
+  "steps": [
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Payroll Calculation review\") span",
+        "css=[role=\"row\"]:has-text(\"{{bound_1}}\") span",
+        "css=[role=\"row\"]:has-text(\"FOOD LIMITED\") span",
+        "css=[role=\"row\"]:has-text(\"27/08/2026\") span",
+        "css=[role=\"row\"]:has-text(\"2026-27\") span",
+        "css=[role=\"row\"]:has-text(\"Sent\") span",
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span/span"
+      ],
+      "expect_text": "Sent",
+      "fingerprint": {
+        "tag": "span",
+        "text": "Sent",
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[8]/div/span/span",
+        "bounds": {
+          "x": 1277.0,
+          "y": 143.0,
+          "width": 100.0,
+          "height": 20.0
+        }
+      }
+    },
+    {
+      "action": "wait",
+      "seconds": 1.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div[2]/input"
+      ],
+      "fingerprint": {
+        "tag": "input",
+        "role": "combobox",
+        "attrs": {
+          "id": "react-select-25-input"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[2]/div/div/div/div/div[1]/div[2]/input",
+        "bounds": {
+          "x": 623.828125,
+          "y": 139.25,
+          "width": 3.5625,
+          "height": 19.5
+        }
+      }
+    },
+    {
+      "action": "type",
+      "text": "Submitted"
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "role=option[name=\"Submitted\"]",
+        "text=\"Submitted\""
+      ],
+      "expect_text": "Submitted"
+    },
+    {
+      "action": "fill",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea"
+      ],
+      "value": "Well done",
+      "clear": true,
+      "fingerprint": {
+        "tag": "textarea",
+        "attrs": {
+          "id": "TextField7770"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/form/div[3]/div/div/div/textarea",
+        "bounds": {
+          "x": 614.328125,
+          "y": 173.0,
+          "width": 269.6640625,
+          "height": 63.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]"
+      ],
+      "expect_text": "Save",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Save",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[3]/div[2]/div[2]/button[2]",
+        "bounds": {
+          "x": 813.734375,
+          "y": 324.0,
+          "width": 71.265625,
+          "height": 26.0
+        }
+      }
+    },
+    {
+      "action": "wait",
+      "seconds": 1.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button"
+      ],
+      "hidden_ok": true,
+      "expect_text": "{{bound_1}}",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "PR/01797494/27/CDR079",
+        "attrs": {
+          "type": "button"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div[3]/div/div/div[2]/div/div/div/div/div[1]/div[1]/div/div/div[2]/div/button",
+        "bounds": {
+          "x": 268.0,
+          "y": 143.0,
+          "width": 146.296875,
+          "height": 21.5
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "css=[role=\"row\"]:has-text(\"Select Employee\") div[data-automationid=\"DetailsRowCheck\"]",
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[1]/span/div",
+        "css=[id$=\"-check\"]",
+        "css=[data-automationid=\"DetailsRowCheck\"]"
+      ],
+      "fingerprint": {
+        "tag": "div",
+        "role": "checkbox",
+        "attrs": {
+          "id": "header8650-check",
+          "data-automationid": "DetailsRowCheck"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[3]/div[1]/div/div/div/div/div[1]/div/div/div/div/div[1]/span/div",
+        "bounds": {
+          "x": 140.0,
+          "y": 93.0,
+          "width": 40.0,
+          "height": 32.0
+        }
+      }
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[4]/button[3]",
+        "css=[id=\"btn-Verify\"]"
+      ],
+      "expect_text": "Verify All",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "Verify All",
+        "attrs": {
+          "id": "btn-Verify",
+          "type": "button"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div[2]/div[2]/div/div[2]/div/form/div[4]/button[3]",
+        "bounds": {
+          "x": 1332.953125,
+          "y": 633.0,
+          "width": 97.046875,
+          "height": 26.0
+        }
+      }
+    }
+  ],
+  "bindings": {
+    "bound_1": {
+      "kind": "created",
+      "method": "POST",
+      "endpoint": "/payroll/clients/*/calculationdatarequest",
+      "path": [
+        "result",
+        "number"
+      ]
+    }
+  }
+}

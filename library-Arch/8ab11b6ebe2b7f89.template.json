@@ -1,0 +1,120 @@
+{
+  "source_prompt": "Go to the Payroll module, search for and select the business name FOOD LIMITED.",
+  "params": {
+    "business_name": "FOOD LIMITED"
+  },
+  "steps": [
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div/div/div/div/div[2]/div[1]/div[4]/div/div/button[1]",
+        "css=[id=\"btn-menus-callout\"]",
+        "css=[aria-label=\"menus\"]",
+        "css=[title=\"Modules\"]"
+      ],
+      "expect_text": "menus",
+      "fingerprint": {
+        "tag": "button",
+        "role": "button",
+        "text": "menus",
+        "attrs": {
+          "id": "btn-menus-callout",
+          "aria-label": "menus",
+          "title": "Modules"
+        },
+        "xpath": "html/body/div/div/div/div/div[2]/div[1]/div[4]/div/div/button[1]",
+        "bounds": {
+          "x": 1160.0,
+          "y": 0.0,
+          "width": 40.0,
+          "height": 40.0
+        }
+      }
+    },
+    {
+      "action": "wait",
+      "seconds": 1.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[2]/div/div/div/div/div/div/div/a[3]",
+        "css=a[href=\"/paye\"]"
+      ],
+      "hidden_ok": true,
+      "expect_text": "Payroll",
+      "fingerprint": {
+        "tag": "a",
+        "role": "link",
+        "text": "Payroll",
+        "attrs": {
+          "href": "/paye"
+        },
+        "xpath": "html/body/div[2]/div/div/div/div/div/div/div/a[3]",
+        "bounds": {
+          "x": 1180.0,
+          "y": 45.0,
+          "width": 90.0,
+          "height": 90.0
+        }
+      }
+    },
+    {
+      "action": "fill",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div/div[1]/input",
+        "css=[placeholder=\"Search\"]"
+      ],
+      "value": "{{business_name}}",
+      "clear": true,
+      "fingerprint": {
+        "tag": "input",
+        "role": "searchbox",
+        "text": "Search",
+        "attrs": {
+          "id": "SearchBox144",
+          "placeholder": "Search"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div[2]/div/div/div/div[2]/div/div/div[1]/input",
+        "bounds": {
+          "x": 791.0,
+          "y": 76.0,
+          "width": 112.0,
+          "height": 21.0
+        }
+      }
+    },
+    {
+      "action": "press",
+      "keys": "Enter"
+    },
+    {
+      "action": "wait",
+      "seconds": 2.0
+    },
+    {
+      "action": "click",
+      "selectors": [
+        "xpath=/html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div[3]/div/div/div[2]/div/div/div/div/div/div[2]/div/div/div[3]/a",
+        "css=a[href=\"/paye/clients/6a61d0ab5636abb464ba0e13/rti/payrun\"]"
+      ],
+      "hidden_ok": true,
+      "expect_text": "FOOD LIMITED",
+      "fingerprint": {
+        "tag": "a",
+        "role": "link",
+        "text": "FOOD LIMITED",
+        "attrs": {
+          "href": "/paye/clients/6a61d0ab5636abb464ba0e13/rti/payrun"
+        },
+        "xpath": "html/body/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div[3]/div/div/div[2]/div/div/div/div/div/div[2]/div/div/div[3]/a",
+        "bounds": {
+          "x": 368.0,
+          "y": 173.0,
+          "width": 85.84375,
+          "height": 17.5
+        }
+      }
+    }
+  ]
+}
