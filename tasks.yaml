@@ -803,7 +803,7 @@ payroll_food_limited_e2e_rti:
         employee to fully load after each click.
     - prompt: >-
         With the 7th employee of the pay run now shown, click Add Expenses or Benefits, set
-        Type to 'Assets transferred', set the period from Apr-2026 and set period to May-2026, set Cost to 200, set Employee contribution to 100, and click Save. Add this
+        Type to 'Assets transferred', set the period from Apr-26 and set period to May-26, set Cost to 200, set Employee contribution to 100, and click Save. Add this
         expense exactly once: the dialog simply closes on Save with no confirmation
         message, and the grid then lists the expense at its net value 100.00 (the 200 cost
         minus the 100 contribution), which is a successful add; do not click Add Expenses
@@ -818,10 +818,10 @@ payroll_food_limited_e2e_rti:
         Then click Save & Next for the next 5 employees in the same way: exactly 5 more
         clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then select bulk upload FPS which is a button next to Save & Next. The checkbox in
+        Then select FPS which is a button next to Save & Next. The checkbox in
         the grid header row, left of 'Employees', selects or unselects all employees at
-        once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click upload FPS on the bottom , select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. if it shows an error, click cancel.
+        once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click FPS on the bottom, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
       # This slice declares its own error branch ("if it shows an error, click
       # cancel"), so a REFUSED FPS submit is a sanctioned ending, not a failed
       # segment. Without the waiver the window write rule demotes it (run
@@ -830,6 +830,9 @@ payroll_food_limited_e2e_rti:
       # reported under the segment's write_rollup, and a run whose submit IS accepted
       # commits to the library as normal.
       allow_write_refusal: true
+    - prompt: >-
+        If an error is shown after Submit, click Cancel to close it.
+      probe: {text_visible: "already submitted"}
     - prompt: >-
         Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
         May-26, and click Save & Next exactly 3 times.

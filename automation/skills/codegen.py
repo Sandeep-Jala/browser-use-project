@@ -126,10 +126,17 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
     anchors: dict[str, Any] = {}
     used: set[str] = set()
     lines: list[str] = []
+    optional_open = False
     i = 0
     while i < len(steps):
         step, action = steps[i], steps[i].get("action")
         nxt = steps[i + 1] if i + 1 < len(steps) else None
+        if step.get("optional") and not optional_open:
+            # From here on the compiled steps are the slice's declared error branch, not
+            # its work (script_compile.compile_recording's `optional_from`). One mark, not
+            # a per-call flag: the branch is always the trailing tail.
+            lines.append("    await api.begin_optional()")
+            optional_open = True
         if action == "type" and nxt is not None and _is_option_click(nxt):
             expr = _value_expr(str(step.get("text", "")), param_set)
             lines.append(f"    await api.select_option({expr})")

@@ -451,6 +451,27 @@ _LAYOUT_JS = r"""
 """
 
 
+def _control_name(node: Any, index: int | None = None) -> str:
+    """A human name for a control, for receipts.
+
+    The accessible name lives at `node.ax_node.name` — NOT `node.ax_name`, which does not
+    exist on a live EnhancedDOMTreeNode (see _captured_element below, which reads it
+    correctly). repeat_click read the wrong attribute and so reported "Clicked element 1063
+    5 times" for a button whose captured metadata said "Save & Next"; a receipt that cannot
+    name what it acted on is exactly what lets an agent lose track of what it has already
+    done, and run 20260901_122209 then clicked Save & Next sixteen times for a slice asking
+    five."""
+    ax = getattr(getattr(node, "ax_node", None), "name", None)
+    if str(ax or "").strip():
+        return str(ax).strip()
+    attrs = getattr(node, "attributes", None) or {}
+    for attr in ("aria-label", "title", "name", "id"):
+        if str(attrs.get(attr) or "").strip():
+            return str(attrs[attr]).strip()
+    text = str(getattr(node, "node_value", "") or "").strip()
+    return text or (f"element {index}" if index is not None else "the control")
+
+
 def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
     """The clicked element's identity, DOMInteractedElement-shaped, for the recording.
 
@@ -703,6 +724,51 @@ async def _callout_open(browser_session) -> bool:
         logger.debug("callout probe failed: %s", exc)
         return False
     return bool(isinstance(got, dict) and not got.get("error") and got.get("open"))
+
+
+# How many times each control has been clicked in THIS segment, and the number of repeats
+# the segment's own wording declares ("exactly 5 more clicks" -> 5, parsed by
+# script_compile.repeat_hint_from_wording, the same value the compiler already uses).
+#
+# Why a ledger at all: repeat_click counts WITHIN a call, but nothing stopped the agent
+# calling it again. Run 20260901_122209 subtask 15 asked for "exactly 5 more clicks"; the
+# agent clicked once by hand, then called repeat_click(times=5) THREE times — each eval
+# saying the previous repeat had succeeded, then re-forming the same goal — for 16 clicks and
+# 26 payroll writes where the task wanted 11. The prompt already says to call it ONCE
+# (prompts.py) and that was not enough, so the budget is enforced rather than advised.
+#
+# NOTE this reads a NUMBER THE USER WROTE, which is not the wording inference banned on
+# 2026-08-28: that rule forbids deciding a subtask's KIND or cacheability from prose. A
+# declared count is a declaration.
+_CLICK_LEDGER: dict[str, int] = {}
+_REPEAT_BUDGET: int | None = None
+
+
+def set_repeat_budget(budget: int | None) -> None:
+    """Declare this segment's repeat count (runner-owned, once per segment)."""
+    global _REPEAT_BUDGET
+    _REPEAT_BUDGET = int(budget) if budget else None
+
+
+def _ledger_key(node: Any) -> str:
+    """Stable-ish identity for a control across re-renders. The id attribute is the best
+    key this app offers (btnSave survives the row swapping behind it); the accessible name
+    is the fallback, and both beat a backend node id, which changes every render."""
+    attrs = getattr(node, "attributes", None) or {}
+    for attr in ("id", "data-automationid", "aria-label", "name"):
+        if str(attrs.get(attr) or "").strip():
+            return f"{attr}={str(attrs[attr]).strip()}"
+    return f"name={_control_name(node)}"
+
+
+def _note_clicks(node: Any, n: int = 1) -> int:
+    """Add `n` clicks for `node` to this segment's ledger and return its new total."""
+    try:
+        key = _ledger_key(node)
+    except Exception:  # noqa: BLE001 - accounting must never break a click
+        return 0
+    _CLICK_LEDGER[key] = _CLICK_LEDGER.get(key, 0) + int(n)
+    return _CLICK_LEDGER[key]
 
 
 # repeat_click's cadence (the live twin of skills/api.py's constants). Between clicks the
@@ -1705,6 +1771,7 @@ def set_live_network(collector: Any) -> None:
     consumed in the next, and is stale by the one after."""
     global _LIVE_NETWORK, _SEGMENT_T0, _FAIL_BOUNCED, _LAST_ACTION_T0
     _LIVE_NETWORK = collector
+    _CLICK_LEDGER.clear()   # per-segment, like every other name reset here
     _SEGMENT_T0 = time.monotonic()
     _LAST_ACTION_T0 = _SEGMENT_T0    # no action yet: the whole segment is the window
     _FAIL_BOUNCED = False
@@ -2353,6 +2420,12 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
             node = await browser_session.get_element_by_index(index)
         except Exception:  # noqa: BLE001 - the built-in will report the real lookup error
             node = None
+    if node is not None:
+        # A plain click counts toward the segment's repeat ledger: subtask 15 of run
+        # 20260901_122209 clicked Save & Next once by hand BEFORE calling repeat_click, so a
+        # budget that ignored manual clicks would still overshoot by one. Recorded only —
+        # an ordinary click is never refused for being over budget.
+        _note_clicks(node, 1)
     row_label, row = None, None
     if node is not None and _is_anonymous_toggle(node):
         row_label = await _row_context_label(browser_session, node)
@@ -2583,6 +2656,15 @@ def build_tools() -> Tools:
         else:
             msg = f"Typed '{params.text}' and pressed Enter"
         if verified is not None and not _value_took(params.text, verified):
+            # The page REFUSED this value, so the action is a phantom — it reports what the
+            # tool tried, not what the field holds. Stamped the way every other did-not-take
+            # path stamps it (the stale-index refind above, paste_text, select_dropdown), so
+            # the compiler drops it by metadata rather than by parsing this prose. Content
+            # channel, not the error channel: the agent recovers from this on its own, and
+            # receipt_rollup's refusal rule wants an error beside the stamp.
+            # Without it, subtask 13 of the payroll e2e committed a fill the page had
+            # rejected and re-authored itself every run (20260901_110833).
+            meta["no_fill"] = True
             # Two causes, one receipt: the text went into a NEIGHBOURING control (the field
             # you aimed at never changed), or this field refuses the value. Escape+relocate
             # fixes the first and costs little on the second; the reload is the last resort.
@@ -2973,8 +3055,31 @@ def build_tools() -> Tools:
                 error=f"repeat_click: element index {index} is not available — re-read the "
                       f"page and use a current index.",
                 metadata={"no_click": True})
-        label = (getattr(node, "ax_name", "") or "").strip() or f"element {index}"
+        label = _control_name(node, index)
         want = max(0, int(times or 0))
+        # Budget check BEFORE clicking anything. The ledger already holds the clicks this
+        # segment has spent on this control — including plain `click` calls, so the agent's
+        # manual first click counts — and the segment's declared "exactly N" caps the total.
+        already = _CLICK_LEDGER.get(_ledger_key(node), 0)
+        if _REPEAT_BUDGET is not None:
+            remaining = _REPEAT_BUDGET - already
+            if remaining <= 0:
+                # ERROR channel: multi_act stops the rest of a batched step, which is how the
+                # repeat_click+done pair of run 20260901_122209 slipped a whole extra pass in.
+                msg = (f"repeat_click REFUSED — did NOT click: {label} has already been "
+                       f"clicked {already} time(s) in this step, which is the "
+                       f"{_REPEAT_BUDGET} this step asks for. The repetition is COMPLETE. Do "
+                       f"NOT repeat it — verify the end state on the page and call done.")
+                logger.info("⛔ %s", msg)
+                return ActionResult(error=msg, metadata={"no_click": True})
+            if want and want > remaining:
+                logger.info("🔁 repeat_click: %s asked for %d but only %d of this step's "
+                            "%d remain — clamping", label, want, remaining, _REPEAT_BUDGET)
+                want = remaining
+            if not want:
+                # times=0 under a declared budget: the number IS known, so use it rather than
+                # clicking until the control dies (which would run the whole list).
+                want = remaining
         # times=0 means "until it stops advancing"; the hard cap is a runaway guard, not an
         # expected stop — reaching it is reported as a failure, never as a finished list.
         cap = want or _REPEAT_HARD_CAP
@@ -3000,6 +3105,12 @@ def build_tools() -> Tools:
                 stopped = why
                 break
 
+        # Ledger BEFORE the verdicts below: the clicks landed whether or not the count came
+        # out right, and the next call must account for them.
+        total = _note_clicks(node, done) if done else already
+        spent = (f" {total} click(s) on it in this step so far"
+                 + (f" of the {_REPEAT_BUDGET} this step asks for." if _REPEAT_BUDGET
+                    else ".")) if total != done else ""
         if want:
             if done < want:
                 # A shortfall rides the ERROR channel so a queued Submit cannot fire on a
@@ -3010,7 +3121,9 @@ def build_tools() -> Tools:
                        f"this step done: check how far the list actually got before acting.")
                 logger.info("⛔ %s", msg)
                 return ActionResult(error=msg, metadata={"no_click": True})
-            msg = f"Clicked {label} {done} times ({done} of {want} asked)."
+            msg = (f"Clicked {label} {done} times ({done} of {want} asked).{spent} "
+                   f"The repetition is COMPLETE — do NOT call repeat_click on {label} again "
+                   f"in this step; verify the end state and move on.")
         else:
             if not done:
                 msg = (f"repeat_click: {label} was not clickable at all "
@@ -3024,7 +3137,8 @@ def build_tools() -> Tools:
                 logger.info("⛔ %s", msg)
                 return ActionResult(error=msg, metadata={"no_click": True})
             msg = (f"Clicked {label} {done} times, until it stopped advancing "
-                   f"({stopped}) — the run is complete at {done}.")
+                   f"({stopped}) — the run is complete at {done}.{spent} Do NOT call "
+                   f"repeat_click on {label} again in this step.")
         logger.info("🔁 %s", msg)
         return ActionResult(
             extracted_content=msg, long_term_memory=msg, include_in_memory=True,

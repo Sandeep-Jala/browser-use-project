@@ -66,6 +66,9 @@ class SkillApi:
         self._last_click: dict[str, Any] | None = None   # for flyout-reopen recovery
         # (fill step, ledger index just after it) — the commit rung of click()
         self._last_fill: tuple[dict[str, Any], int] | None = None
+        # Ledger position where the slice's DECLARED error branch begins, once
+        # begin_optional() marks it; None while every call is load-bearing work.
+        self.optional_from: int | None = None
 
     # ------------------------------- internals -------------------------------
 
@@ -447,6 +450,20 @@ class SkillApi:
         await self.page.keyboard.press(keys)
         # keys ride the ledger so _pending_commit can replay the commit
         self._done("press", keys=keys)
+
+    async def begin_optional(self) -> None:
+        """Everything after this call is the slice's declared error branch, not the work.
+
+        Emitted by the transpiler for the steps compiled after a REFUSED write (see
+        script_compile.compile_recording's `optional_from`): the slice said "if it shows an
+        error, click cancel", so on a run where the write is ACCEPTED those steps have
+        nothing to act on and their failure IS the success case. `_execute_code` reads this
+        mark. A plain api.* call rather than an `async with` block, so codegen's AST
+        whitelist — the gate that keeps a hand-edited skill inside api.* — stays as narrow
+        as it is."""
+        # Deliberately NOT recorded in the ledger: it performs nothing, and `log`/`executed`
+        # are what heal promotion and the replay's own step count read.
+        self.optional_from = self.executed
 
     async def wait(self, seconds: float) -> None:
         """Deliberate settle, capped like compiled waits — load-bearing on this slow app."""

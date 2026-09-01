@@ -8,6 +8,7 @@ from automation.pipeline import subtask_store as ss
 from automation.pipeline.decompose import Subtask
 from automation.skills import Skill, execute, load_skill, promote_healed_anchors
 from automation.skills.base import _execute_code
+from automation.skills.codegen import lint_code
 
 
 @pytest.fixture
@@ -48,6 +49,9 @@ class StubApi:
 
     async def wait(self, seconds):
         await self._do("wait", seconds)
+
+    async def begin_optional(self):
+        self.optional_from = self.executed
 
     async def goto(self, url):
         await self._do("goto", url)
@@ -432,3 +436,34 @@ async def test_resolve_xpath_hit_gated_by_identity_not_text():
                        'css=[id="ok"]': [_FpNode("div", "x", attrs={"id": "ok"})]})
     _loc2, sel2, _ = await sc._resolve(drifted, step, 500)
     assert sel2 == 'css=[id="ok"]'
+
+
+# ---------------- the declared error branch is optional on the code tier ----------------
+
+
+async def test_a_failure_inside_the_optional_tail_is_not_a_failed_replay(stores):
+    """Tier-1 twin of run_steps' optional handling. The bulk-FPS slice ends "if it shows an
+    error, click cancel"; on a run where the submit is ACCEPTED there is no dialog, so the
+    cancel cannot resolve. That is the success case — the work before it all ran."""
+    code = ("async def run(api):\n"
+            "    await api.click('submit')\n"
+            "    await api.begin_optional()\n"
+            "    await api.click('cancel')\n")
+    assert lint_code(code) == []                       # plain api.* calls, whitelist intact
+    stub = StubApi(fail_at=1)
+    out = await _execute_code(Skill(sid="s", body="code", code=code), page=None,
+                              timeout_ms=1000, api=stub)
+    assert out["failed_at"] is None and out["error"] is None
+    assert out["executed"] == 1
+
+
+async def test_a_failure_BEFORE_the_optional_tail_still_fails(stores):
+    """The waiver covers the branch only — work that broke is still a broken replay."""
+    code = ("async def run(api):\n"
+            "    await api.click('submit')\n"
+            "    await api.begin_optional()\n"
+            "    await api.click('cancel')\n")
+    stub = StubApi(fail_at=0)
+    out = await _execute_code(Skill(sid="s", body="code", code=code), page=None,
+                              timeout_ms=1000, api=stub)
+    assert out["failed_at"] == 0 and "boom" in out["error"]

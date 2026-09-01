@@ -1229,6 +1229,11 @@ class HybridSession:
                                               fallback=getattr(sub, "fallback", False)),
                 record_path=record_path, success_marker=gate.marker,
                 request_offset=watermark,
+                # The slice's own declared cadence ("exactly 5 more clicks"), the same number
+                # save_steps pins the compiled count to. Handing it to the agent's
+                # repeat_click as a BUDGET is what stops a redundant second call from doing
+                # the whole pass again (run 20260901_122209 subtask 15: 16 clicks for 5).
+                repeat_budget=repeat_hint_from_wording(sub.instantiated_prompt),
             )
         except Exception as exc:  # noqa: BLE001 - a crashed segment is a failed segment
             logger.exception("agent segment %s crashed: %s", sid, exc)
@@ -1988,6 +1993,35 @@ def _promote_segment_heals(sid: str, seg: Segment, *, from_template: bool) -> No
         logger.warning("heal promotion failed for segment %s: %s", sid, exc)
 
 
+def _refused_write_step(requests_window: list[dict[str, Any]]) -> int | None:
+    """The agent step whose business write the SERVER refused, or None.
+
+    Marks the boundary between a slice's work and the error branch it declares ("if it
+    shows an error, click cancel"): everything the agent did after this step was closing
+    that dialog. Reuses the write rule's own lenses — business_writes drops infrastructure
+    and page-load traffic, _write_verdict reads the 2xx bodies that refuse — so it can
+    never disagree with the gate that set write_refusal_waived in the first place.
+
+    The LAST refusal wins: an agent that retried was cancelling the final one.
+    """
+    from automation.pipeline.agent_tools import _write_verdict  # lazy (browser stack)
+    latest: int | None = None
+    for r in business_writes(requests_window):
+        step = r.get("step")
+        if not isinstance(step, int):
+            continue
+        status = r.get("status")
+        if r.get("failed") or (isinstance(status, int) and status >= 400):
+            latest = step
+            continue
+        if not (isinstance(status, int) and 200 <= status < 400):
+            continue
+        verdict = _write_verdict(r)
+        if verdict is not None and verdict[0]:
+            latest = step
+    return latest
+
+
 async def _author_segment(
     hs: HybridSession, sub: Subtask, sid: str, context: str, gate: Gate, *,
     completed: list[str], remaining: list[str],
@@ -2046,16 +2080,27 @@ async def _author_segment(
         # failing gets retired so the NEXT run authors a clean replacement.
         sstore.archive_if_failing(sid, threshold=_ARCHIVE_AFTER_FAILURES)
         return seg
+    optional_from: int | None = None
     if seg.gate.get("write_refusal_waived"):
         # Passed only because the slice declares its own error branch (see
         # Gate.allow_write_refusal): this trace ends on that branch — the refusal dialog
-        # and the Cancel that closes it. On a run where the write is ACCEPTED there is no
-        # dialog to cancel, so replaying it would fail and re-author anyway. Author it
-        # live instead; a run whose write IS accepted commits normally.
-        print(f"[*] segment [{sid}]: not cached — its write was refused and the slice "
-              f"declares that as an acceptable ending, so this trace records the error "
-              f"branch, not the work")
-        return seg
+        # and the Cancel that closes it. Refusing to cache the whole segment for that
+        # reason cost the payroll e2e ~400k tokens a run (the bulk-FPS subtask, whose FPS
+        # is always already submitted) AND re-keyed the subtask after it, since sids hash
+        # the start context and a live authoring ends wherever it ends. So cache the WORK
+        # and mark the branch: everything after the refused write compiles `optional`, and
+        # a run whose write IS accepted — no dialog to cancel — skips it instead of
+        # failing (script_compile.compile_recording's `optional_from`).
+        optional_from = _refused_write_step(
+            hs.requests_since(writes_before)
+            if writes_before is not None and hasattr(hs, "requests_since") else [])
+        if optional_from is None:
+            # No refused write we can point at, so we cannot say where the work stops and
+            # the branch starts. Keep the old behaviour rather than guess a boundary.
+            print(f"[*] segment [{sid}]: not cached — its write was refused and the slice "
+                  f"declares that as an acceptable ending, so this trace records the error "
+                  f"branch, not the work")
+            return seg
     # Promote the fresh recording to canonical before compiling from it. A segment that
     # recorded nothing (or only an orphaned stale temp exists) has nothing to commit —
     # never re-compile a previous run's trace under a fresh pass.
@@ -2078,7 +2123,8 @@ async def _author_segment(
                            max_steps=truncate_at, emit_start_goto=False,
                            # "exactly N clicks" wording pins a lone repeat cluster's
                            # count — the recorded count can be short one collapsed retry.
-                           repeat_hint=repeat_hint_from_wording(sub.instantiated_prompt))
+                           repeat_hint=repeat_hint_from_wording(sub.instantiated_prompt),
+                           optional_from=optional_from)
         if not steps:
             # A zero-step script would replay as a hollow no-op pass. Leave NO entry (the
             # recording stays for diagnosis); the next run authors this segment again.
@@ -2261,8 +2307,13 @@ async def _author_segment(
         manifest_fields: dict[str, Any] = dict(
             params=params or dict(sub.values or {}),
             context=context, end_context=end_context,
-            end_title=_pin_end_title(start_title, await hs.current_title(),
-                                     sstore.recording_path(sid)),
+            # An optional tail means the recorded ending is one of TWO endings (the
+            # error branch ran this time; a later run may skip it and stop earlier), so
+            # there is no single title to pin — the same reasoning as a segment that
+            # closed its own page.
+            end_title=(None if any(st.get("optional") for st in steps)
+                       else _pin_end_title(start_title, await hs.current_title(),
+                                           sstore.recording_path(sid))),
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
         if self_noted:

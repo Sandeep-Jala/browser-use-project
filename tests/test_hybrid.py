@@ -85,6 +85,13 @@ class FakeSession:
         self.record_paths = []
         self.events = []              # ordered ("open", url)/("close",)/("replay",)/("agent",)
         self.aux_open_error = None    # set to make open_aux_tab raise
+        self.window = []              # scripted network window (_refused_write_step reads it)
+
+    def network_watermark(self):
+        return 0
+
+    def requests_since(self, _watermark):
+        return list(self.window)
 
     @classmethod
     def make_opener(cls, instance):
@@ -881,7 +888,7 @@ BOUND_SPEC = TaskSpec(key="b1", prompt=BOUND_PROMPT, subtasks=(
 def _fill_steps_stub(steps):
     """A hybrid.save_steps stand-in: pretend the recording compiled to `steps`."""
     def stub(rec, steps_path, max_steps=None, emit_start_goto=False, repeat_hint=None,
-             loop=False):
+             loop=False, optional_from=None):
         steps_path.parent.mkdir(parents=True, exist_ok=True)
         steps_path.write_text(json.dumps(steps))
         return steps
@@ -1796,23 +1803,99 @@ async def test_waived_refusal_is_never_a_failure_reason():
     assert hybrid._check_failure_reason(detail) is None       # but never the reason
 
 
-async def test_waived_refusal_segment_is_not_committed(stores, monkeypatch):
-    """A waived segment passes and the run continues, but its recording ends on the
-    error branch ("click cancel"), so it must not enter the library: replaying that
-    Cancel against a run where the write is ACCEPTED would fail and re-author anyway."""
+def _waived_session(window):
     waived = _seg(True, mode="authored")
     waived.gate = {"kind": "steps",
                    "write_rollup": ['... last refusal: "already submitted"'],
                    "write_refusal_waived": True}
     fake = FakeSession(_runner(), agents=[waived, _seg(True, mode="authored")])
+    fake.window = window
+    return fake
+
+
+async def test_waived_refusal_segment_commits_with_the_branch_marked_optional(
+        stores, monkeypatch):
+    """A waived segment ends on the error branch it declared ("click cancel"). Refusing to
+    cache it for that reason made the payroll e2e's bulk-FPS subtask author live at ~400k
+    tokens EVERY run. The work is cached; the steps after the refused write carry
+    `optional`, so a run whose write IS accepted skips them instead of failing."""
+    body = json.dumps({"status": False, "message": "already submitted"})
+    # Two agent steps: the submit (step 0, whose write the server refused) and the Cancel
+    # that closed the dialog it raised.
+    recording = {"history": [
+        {"state": {"url": "http://app/start", "interacted_element": []},
+         "model_output": {"action": [{"navigate": {"url": "http://app/section"}}]},
+         "result": []},
+        {"state": {"url": "http://app/section", "interacted_element": [
+            {"node_name": "BUTTON", "ax_name": "Cancel", "attributes": {"id": "cancel"},
+             "x_path": "html/body/button"}]},
+         "model_output": {"action": [{"click": {"index": 7}}]},
+         "result": [{"extracted_content": "Clicked button \" Cancel\""}]},
+    ]}
+    fake = _waived_session([_req(0, method="GET"), _req(0, body=body)])
+    fake.recording = recording
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
     result = await _run(fake)
 
-    # The run did not stop: both subtasks ran.
     assert fake.agent_calls == 2
     assert [s["ok"] for s in result.subtasks] == [True, True]
-    # Only the second segment was committed.
+    waived_sid = _sid_for(SPEC.subtasks[0].prompt)
+    assert waived_sid in ss.load_manifest() and ss.has_script(waived_sid)
+    # The code tier is what actually replays a committed entry, so the mark has to be
+    # in the generated skill — not only in the compiled step list it came from.
+    code = ss.code_path(waived_sid).read_text()
+    assert "await api.begin_optional()" in code
+    assert code.index("await api.begin_optional()") < code.index("await api.click(")
+    # No end_title pinned: with the branch skippable the segment has two possible endings.
+    assert ss.load_manifest()[waived_sid].get("end_title") is None
+
+
+async def test_a_waived_refusal_with_no_identifiable_write_is_still_not_committed(
+        stores, monkeypatch):
+    """The fallback. With no refused write to point at there is no boundary between the
+    work and the branch, and guessing one would cache a Cancel as load-bearing."""
+    fake = _waived_session([])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    assert [s["ok"] for s in result.subtasks] == [True, True]
     manifest = ss.load_manifest()
     assert len(manifest) == 1
     waived_sid = _sid_for(SPEC.subtasks[0].prompt)
     assert waived_sid not in manifest and not ss.has_script(waived_sid)
+
+
+# ------------------- where the declared error branch starts -------------------
+
+
+def _req(step, url="https://api/Payroll/FPS", method="POST", status=200, body=None):
+    rec = {"step": step, "method": method, "url": url, "status": status}
+    if body is not None:
+        rec["body"] = body
+    return rec
+
+
+def test_refused_write_step_is_the_agent_step_the_server_said_no_on():
+    body = json.dumps({"status": False,
+                       "message": "Bryan Christie's FPS of this period is already submitted"})
+    window = [_req(0, method="GET"), _req(9, body=body), _req(10, method="GET")]
+    assert hybrid._refused_write_step(window) == 9
+
+
+def test_refused_write_step_ignores_infrastructure_and_page_load_traffic():
+    body = json.dumps({"status": False, "message": "nope"})
+    window = [_req(3, url="https://api/auth/webpush", body=body)]
+    assert hybrid._refused_write_step(window) is None
+    window = [dict(_req(3, body=body), after_page_load=True)]
+    assert hybrid._refused_write_step(window) is None
+
+
+def test_refused_write_step_is_none_when_the_write_was_accepted():
+    window = [_req(9, body=json.dumps({"status": True}))]
+    assert hybrid._refused_write_step(window) is None
+
+
+def test_the_last_refusal_wins():
+    """The agent retried: the branch begins after the refusal it actually cancelled."""
+    body = json.dumps({"status": False, "message": "already submitted"})
+    assert hybrid._refused_write_step([_req(4, body=body), _req(9, body=body)]) == 9

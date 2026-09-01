@@ -1037,22 +1037,32 @@ def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None
                 if s.get("action") == "click" and int(s.get("count", 1)) > 1]
     if not clusters:
         return steps
-    # A repeat_click step is NOT a cluster to be second-guessed: the agent stated its count,
-    # so it is left exactly as recorded. Only clusters _push_step INFERRED from adjacency are
-    # subject to the retry reading below (the Download-toggle bug this dissolve exists for).
-    clusters = [s for s in clusters if not s.get("until_done") and not s.get("stated_count")]
+    # An "until it stops advancing" repeat has no number to reconcile — its whole point is
+    # that the count is discovered at replay time.
+    clusters = [s for s in clusters if not s.get("until_done")]
     if not clusters:
         return steps
     if hint:
+        # The DECLARED number wins, including over a stated_count. A count the agent stated
+        # beats adjacency inference, but not the task's own "exactly N": run 20260901_122209
+        # subtask 15 says "exactly 5 more clicks" and the agent did 16 (three redundant
+        # repeat_click calls, reconciled into one step above). 16 is what happened; 5 is what
+        # was asked for, and the recording is meant to replay the ASK.
         if len(clusters) == 1 and int(clusters[0]["count"]) != int(hint):
             logger.warning("repeat cluster recorded %s clicks but the wording says "
                            "exactly %s — pinning to the wording",
                            clusters[0]["count"], hint)
             clusters[0]["count"] = int(hint)
         return steps
+    # No declared number: a stated count is the agent's own report and stands as recorded.
+    # Only adjacency-INFERRED clusters face the retry reading below (the Download-toggle bug).
+    clusters = [s for s in clusters if not s.get("stated_count")]
+    if not clusters:
+        return steps
     out: list[dict[str, Any]] = []
     for step in steps:
-        if step.get("action") == "click" and int(step.get("count", 1)) > 1:
+        if (step.get("action") == "click" and int(step.get("count", 1)) > 1
+                and not step.get("stated_count") and not step.get("until_done")):
             logger.info("compile: dissolving a %sx repeat on one target — the slice "
                         "wording declares no cadence, so the extra clicks are retries "
                         "(a toggle re-clicked twice would undo itself)",
@@ -1202,7 +1212,7 @@ def _reg_host(url: Any) -> str:
 
 def compile_recording(
     recording_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True,
+    emit_start_goto: bool = True, optional_from: int | None = None,
 ) -> list[dict[str, Any]]:
     """Turn a saved agent history JSON into an ordered list of {action, ...} steps.
 
@@ -1218,6 +1228,15 @@ def compile_recording(
     `emit_start_goto=False` skips the leading goto to the recording's start URL. Mid-flow
     subtask segments need this: on an SPA a reload destroys live form state, and the segment's
     context-keyed lookup already guarantees the page is in its start state when it replays.
+
+    `optional_from` is the agent step whose write the server REFUSED: everything the agent
+    did after it belongs to the error branch the slice declared ("if it shows an error, click
+    cancel"), not to the work. Those steps compile with `optional: True`, so a later run whose
+    write is ACCEPTED — where there is no dialog to cancel — skips them instead of failing the
+    replay. Same agent-step granularity as `max_steps`. Without this the whole segment was
+    refused a cache entry and authored live every run (the payroll e2e's bulk-FPS subtask,
+    ~400k tokens a run, which also re-keyed the subtask after it — sids hash the START
+    CONTEXT, and a live authoring ends wherever it ends).
     """
     data = json.loads(Path(recording_path).read_text())
     steps: list[dict[str, Any]] = []
@@ -1240,7 +1259,11 @@ def compile_recording(
     # helper tab to accounts.google.com; healthy replays then died hunting it). The
     # recording itself stays untouched — only the compiled script skips the step.
     seg_host = _reg_host((history[0].get("state") or {}).get("url") if history else "")
+    # Where the declared error branch starts in the COMPILED list (see `optional_from`).
+    optional_at: int | None = None
     for item_idx, item in enumerate(history):
+        if optional_from is not None and optional_at is None and item_idx > optional_from:
+            optional_at = len(steps)
         # Did THIS item's actions open a tab? The recording knows: state.tabs is captured
         # at each item's START, so growth between this item and the next means something
         # here spawned one. Replay must follow the recording into that tab — a compiled
@@ -1599,10 +1622,27 @@ def compile_recording(
                     # The recording used "until it stops advancing", so the REPLAY must too:
                     # freezing the authoring run's number would under-run a longer list.
                     step["until_done"] = True
-                # Appended directly, never through _push_step: its adjacency fusion is for
-                # clicks the agent issued one at a time, and this step already carries its
-                # own count.
-                steps.append(_attach_fp(step, element))
+                # Not through _push_step (its adjacency rule is for clicks the agent issued
+                # one at a time, and this step carries its own count) — but consecutive
+                # repeats on the SAME target must still reconcile into one step. Run
+                # 20260901_122209 subtask 15 is why: the agent clicked once, then called
+                # repeat_click(times=5) three separate times, and appending each as its own
+                # step cached `click + repeat(5) + repeat(5) + repeat(5)` — 16 clicks for a
+                # slice that says "exactly 5 more". Summing keeps the total HONEST (what the
+                # agent really did); _apply_repeat_hint then lets the task's declared number
+                # correct it.
+                prev = next((st for st in reversed(steps)
+                             if st.get("action") != "wait"), None)
+                if (prev is not None and prev.get("action") == "click"
+                        and prev.get("selectors") == step["selectors"]):
+                    prev["count"] = int(prev.get("count", 1)) + int(step["count"])
+                    prev["repeat_wait_s"] = max(float(prev.get("repeat_wait_s") or 0.0),
+                                                step["repeat_wait_s"])
+                    prev["stated_count"] = True
+                    if step.get("until_done"):
+                        prev["until_done"] = True
+                else:
+                    steps.append(_attach_fp(step, element))
             elif name == "click" and element:
                 element = _with_recovered_text(element,
                                                item.get("state_message") or "")
@@ -1780,6 +1820,12 @@ def compile_recording(
             # `done` is intentionally dropped — Playwright auto-waits on locators.
         if opened_tab:
             _stamp_opens_tab(steps, steps_before)
+    if optional_at is not None:
+        for step in steps[optional_at:]:
+            step["optional"] = True
+        logger.info("compile: %d trailing step(s) marked optional — the slice's declared "
+                    "error branch, skipped by a replay that does not raise it",
+                    len(steps) - optional_at)
     return _collapse_indexed_runs(steps)
 
 
@@ -1840,13 +1886,15 @@ def _atomic_write(path: Path, text: str) -> None:
 def save_steps(
     recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None, *,
     emit_start_goto: bool = True, repeat_hint: int | None = None,
+    optional_from: int | None = None,
 ) -> list[dict[str, Any]]:
     """Compile `recording_path` and write the step list to `steps_path` atomically.
     `repeat_hint` is the slice wording's "exactly N clicks" count (see
     repeat_hint_from_wording) — it pins a lone repeat cluster's count."""
     steps = _apply_repeat_hint(
         compile_recording(recording_path, max_steps=max_steps,
-                          emit_start_goto=emit_start_goto),
+                          emit_start_goto=emit_start_goto,
+                          optional_from=optional_from),
         repeat_hint)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
@@ -4047,6 +4095,14 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 await page.wait_for_timeout(int(step.get("seconds", 0) * 1000))
             executed += 1
         except Exception as exc:  # noqa: BLE001 - report where the script broke (app changed?)
+            if step.get("optional"):
+                # The slice's declared error branch did not arise this run (no refusal
+                # dialog to cancel), so the steps that close it have nothing to act on.
+                # That is the SUCCESS case, not a broken script. Optional steps are only
+                # ever the trailing tail, so stopping here loses no work.
+                logger.info("script step %d was optional and did not apply (%s); the "
+                            "declared error branch was not raised this run", idx, exc)
+                break
             logger.exception("script execution broke at step %d: %s", idx, exc)
             return {"executed": executed, "failed_at": idx,
                     "error": f"{type(exc).__name__}: {exc}", "log": log,

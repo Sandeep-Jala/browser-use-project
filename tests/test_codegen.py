@@ -195,3 +195,23 @@ def test_plain_click_emission_unchanged_without_count():
     code, _ = transpile("sid10", steps)
     assert "await api.click('ok')" in code
     assert "repeat_click" not in code
+
+
+def test_the_optional_tail_is_marked_once_and_stays_inside_the_whitelist():
+    """The declared error branch transpiles to a single begin_optional mark before the
+    first optional step — not a flag on every call — and the result still lints."""
+    steps = [
+        {"action": "click", "selectors": ["css=#submit"]},
+        {"action": "click", "selectors": ["css=#cancel"], "optional": True},
+        {"action": "wait", "seconds": 1.0, "optional": True},
+    ]
+    code, _anchors = transpile("sid", steps)
+    assert code.count("await api.begin_optional()") == 1
+    body = [ln.strip() for ln in code.splitlines() if ln.strip().startswith("await api.")]
+    assert body[1] == "await api.begin_optional()"
+    assert lint_code(code) == []
+
+
+def test_no_optional_steps_emits_no_mark():
+    code, _ = transpile("sid", [{"action": "click", "selectors": ["css=#submit"]}])
+    assert "begin_optional" not in code

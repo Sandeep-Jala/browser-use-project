@@ -247,6 +247,22 @@ async def test_field_that_never_takes_warns_the_agent_with_the_real_value():
     assert "reload the page" in res.extracted_content
     # Two repair rounds were attempted before giving up.
     assert len(session.types) == 1 + agent_tools._FILL_REPAIR_ROUNDS
+    # ...and the receipt carries the STAMP, not just the warning prose: a value the page
+    # refused is a phantom action, and the compiler drops phantoms by their metadata
+    # (script_compile's `no_fill` gate) so that rewording this message can never change
+    # what replays. Without it, run 20260901_110833's subtask 13 baked a fill the page had
+    # rejected into its library entry and re-authored itself at ~140k tokens every run.
+    assert (res.metadata or {}).get("no_fill") is True
+
+
+async def test_a_fill_that_took_carries_no_refusal_stamp():
+    """The stamp must mean exactly "the page refused this value" — a normal fill (and a
+    repaired one) stays compilable."""
+    session = _FakeSession(_FakeField("3200"))
+    res = await _type(session)
+
+    assert "WARNING" not in (res.extracted_content or "")
+    assert (res.metadata or {}).get("no_fill") is None
 
 
 async def test_unresolvable_element_falls_back_to_browser_use_clear():

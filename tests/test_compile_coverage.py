@@ -2404,3 +2404,141 @@ def test_substituted_anchors_skips_expect_text_when_the_token_only_scopes_a_row(
     assert out is not None
     assert out["employee-check"].get("expect_text") is None
     assert out["employee-row"]["expect_text"] == "Preston Alexander"
+
+
+# ---------------- a fill the page REJECTED at record time is a phantom too ----------------
+
+
+def _money_field(name="cost"):
+    return {"node_name": "INPUT", "ax_name": None,
+            "attributes": {"name": name, "placeholder": name.title(), "type": "number"},
+            "x_path": f"html/body/form/div/input[@name='{name}']"}
+
+
+def test_a_fill_whose_value_did_not_take_is_never_compiled(tmp_path):
+    """Run 20260901_110833 subtask 13. The agent typed 200 into the expenses dialog's money
+    field, the tool's own read-back answered "the field still reads '', not '200' — the
+    value did NOT take", and the agent recovered by re-typing into the field that really
+    was there (same slot, different rendering). Compile kept the REJECTED fill, so every
+    replay re-ran it and died on `fill did not take: field still reads '', expected '200'`
+    — authoring the segment again at ~140k tokens, forever. A value the page refused is a
+    phantom exactly like a no_click probe or a refused paste."""
+    history = [
+        _item({"input": {"index": 41897, "text": "200", "clear": True}},
+              result=[{"extracted_content":
+                       "Typed '200' (popup input — Enter suppressed). WARNING: the field "
+                       "still reads '', not '200' — the value did NOT take.",
+                       "metadata": {"auto_enter": False, "no_fill": True}}],
+              element=_money_field("amount")),
+        _item({"input": {"index": 42109, "text": "200", "clear": True}},
+              result=[{"extracted_content": "Typed '200'",
+                       "metadata": {"auto_enter": False}}],
+              element=_money_field("cost")),
+    ]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["fill"], steps
+    assert "cost" in json.dumps(steps[0]["selectors"])
+
+
+def test_a_fill_that_took_still_compiles(tmp_path):
+    """Fail open: the stamp is what drops a fill, never the warning text — recordings made
+    before the stamp existed keep compiling exactly as they ran."""
+    history = [_item({"input": {"index": 42109, "text": "200", "clear": True}},
+                     result=[{"extracted_content": "Typed '200'",
+                              "metadata": {"auto_enter": False}}],
+                     element=_money_field("cost"))]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert [s["action"] for s in steps] == ["fill"]
+
+
+# ------------------- the declared error branch compiles as OPTIONAL -------------------
+
+
+async def test_steps_after_the_refused_write_are_marked_optional(tmp_path):
+    """A slice that declares its own error branch ("if it shows an error, click cancel")
+    ends its recording on that branch. Refusing to cache it made the payroll e2e's bulk-FPS
+    subtask author live at ~400k tokens EVERY run — and, because it then finished in a
+    different place each time, re-keyed the subtask after it too. The work is cached; the
+    branch is marked so a replay that meets no error dialog skips it instead of failing."""
+    history = [
+        _item({"click": {"index": 1}}, element=_money_field("submit")),   # the work
+        _item({"click": {"index": 2}}, element=_money_field("cancel")),   # the branch
+    ]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False,
+                              optional_from=0)
+    assert [s.get("optional") for s in steps] == [None, True], steps
+
+
+async def test_without_optional_from_nothing_is_marked(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_money_field("submit")),
+               _item({"click": {"index": 2}}, element=_money_field("cancel"))]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+    assert not any("optional" in s for s in steps)
+
+
+async def test_an_optional_step_that_fails_does_not_fail_the_replay(tmp_path):
+    """Tier 0. The optional tail is always trailing, so a failure there ends the run
+    cleanly — `failed_at` stays None and the segment's gate decides the outcome."""
+    class _Page:
+        url = "http://app/x"
+
+        async def wait_for_timeout(self, _ms):
+            return None
+
+    steps = [{"action": "wait", "seconds": 0},
+             {"action": "click", "selectors": ["css=#gone"], "optional": True}]
+    out = await sc.run_steps(_Page(), steps, timeout_ms=200)
+    assert out["failed_at"] is None and out["error"] is None
+    assert out["executed"] == 1
+
+
+# ---- redundant repeat_click calls must reconcile, not stack (2026-09-01) ----
+# Run 20260901_122209 subtask 15 ("exactly 5 more clicks") clicked SIXTEEN times. The agent
+# clicked once manually then called repeat_click(times=5) three separate times — its evals
+# each said the previous repeat had succeeded, then it re-formed the same goal. Compile
+# appended each as its own step (the branch deliberately bypasses _push_step), so the cached
+# skill was click + repeat(5) + repeat(5) + repeat(5) and replayed 16 clicks forever.
+
+
+def test_redundant_repeat_calls_fuse_into_one_step(tmp_path):
+    history = [_item({"click": {"index": 1}}, element=_btn())] + [_repeat_item(5)] * 3
+    steps = sc.compile_recording(str(_write(tmp_path, history)), emit_start_goto=False)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert len(clicks) == 1, f"three repeats + a click must reconcile, got {len(clicks)} steps"
+    assert clicks[0]["count"] == 16          # the honest total of what the agent did
+    assert clicks[0]["stated_count"] is True
+
+
+def test_the_declared_count_outranks_the_agents_observation(tmp_path):
+    """"exactly 5 more clicks" is the USER's number; 16 is what the agent happened to do.
+    The declaration wins — a stated count beats adjacency inference, but not the task."""
+    out = tmp_path / "s.json"
+    history = [_item({"click": {"index": 1}}, element=_btn())] + [_repeat_item(5)] * 3
+    steps = sc.save_steps(str(_write(tmp_path, history)), out,
+                          emit_start_goto=False, repeat_hint=5)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert len(clicks) == 1 and clicks[0]["count"] == 5, clicks
+
+
+def test_a_repeat_on_a_different_control_does_not_fuse(tmp_path):
+    """Only the SAME target reconciles: two different controls stay two steps."""
+    history = [_repeat_item(3, text="Save & Next"),
+               _item({"repeat_click": {"index": 2, "times": 4}},
+                     element=_named_btn("Next"),
+                     result=[{"metadata": {"repeat": {"count": 4, "until_done": False,
+                                                      "wait_s": 0.4}}}])]
+    steps = sc.compile_recording(str(_write(tmp_path, history)), emit_start_goto=False)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert [c["count"] for c in clicks] == [3, 4], clicks
+
+
+def test_a_stated_count_survives_a_dissolve_aimed_at_its_neighbour():
+    """The dissolve loop walks every step, so a stated count sharing a recording with an
+    adjacency-INFERRED cluster must not be swept up with it."""
+    steps = [{"action": "click", "selectors": ["xpath=/a"], "count": 5,
+              "repeat_wait_s": 0.4, "stated_count": True},
+             {"action": "click", "selectors": ["xpath=/b"], "count": 3,
+              "repeat_wait_s": 1.0}]
+    out = [s for s in sc._apply_repeat_hint(steps, None) if s["action"] == "click"]
+    assert [s.get("count", 1) for s in out] == [5, 1], out
+

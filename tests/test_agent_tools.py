@@ -1837,3 +1837,96 @@ async def test_still_advancing_at_the_cap_is_a_failure_not_a_finished_list(monke
     assert res.error and "safety cap" in res.error
     assert res.metadata == {"no_click": True}
 
+
+# ---- the declared budget stops a redundant repeat (2026-09-01) ----
+# Run 20260901_122209 subtask 15 ("exactly 5 more clicks"): the agent clicked Save & Next
+# once by hand, then called repeat_click(times=5) THREE times — each eval saying the previous
+# repeat had succeeded, then re-forming the same goal — for 16 clicks and 26 payroll writes
+# where the task wanted 11. The prompt already told it to call repeat_click ONCE, so the
+# budget is enforced rather than advised.
+
+
+def _budget(monkeypatch, n, verdicts=None):
+    _ready(monkeypatch, verdicts if verdicts is not None else [(True, "")] * 40)
+    monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {})
+    monkeypatch.setattr(agent_tools, "_REPEAT_BUDGET", n)
+
+
+def _save_next(name="Save & Next"):
+    node = _FakeDomNode(name, attributes={"id": "btnSave"})
+    node.ax_node = type("_Ax", (), {"name": name})()
+    return node
+
+
+async def test_the_receipt_names_the_control(monkeypatch):
+    """It read node.ax_name — which does not exist on a live node — and so reported
+    "Clicked element 1063 5 times" for a button called Save & Next."""
+    _budget(monkeypatch, None)
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _save_next()})
+    session.event_bus.dispatch = lambda _e: _FakeEvent(None)
+
+    res = await fn(index=4, times=3, browser_session=session)
+
+    assert "Save & Next" in res.extracted_content
+    assert "element 4" not in res.extracted_content
+
+
+async def test_a_second_repeat_is_refused_once_the_budget_is_spent(monkeypatch):
+    _budget(monkeypatch, 5)
+    fn, _pm = _registered_action("repeat_click")
+    node = _save_next()
+    session = _FakeClickSession({4: node})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+
+    first = await fn(index=4, times=5, browser_session=session)
+    assert first.error is None and len(clicks) == 5
+    assert first.metadata["repeat"]["count"] == 5
+
+    second = await fn(index=4, times=5, browser_session=session)
+    assert second.error and "COMPLETE" in second.error
+    assert second.metadata == {"no_click": True}      # never compiles
+    assert len(clicks) == 5, "the refused call must not click at all"
+
+
+async def test_a_manual_click_counts_against_the_budget(monkeypatch):
+    """The agent clicked Save & Next once before repeating; a budget that ignored plain
+    clicks would still overshoot by one."""
+    _budget(monkeypatch, 5)
+    node = _save_next()
+    agent_tools._note_clicks(node, 1)                  # what the `click` override records
+
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: node})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+
+    res = await fn(index=4, times=5, browser_session=session)
+
+    assert len(clicks) == 4, "clamped to the 4 remaining of 5"
+    assert res.metadata["repeat"]["count"] == 4
+
+
+async def test_no_declared_budget_leaves_the_tool_unconstrained(monkeypatch):
+    _budget(monkeypatch, None)
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _save_next()})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+
+    for _ in range(2):
+        res = await fn(index=4, times=3, browser_session=session)
+        assert res.error is None
+    assert len(clicks) == 6                            # unconstrained, as before
+    assert "6 click(s) on it in this step" in res.extracted_content
+
+
+def test_the_ledger_is_per_segment(monkeypatch):
+    monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {"id=btnSave": 5})
+    agent_tools.set_live_network(object())
+    try:
+        assert agent_tools._CLICK_LEDGER == {}, "a new segment starts from zero"
+    finally:
+        agent_tools.clear_live_network()
+

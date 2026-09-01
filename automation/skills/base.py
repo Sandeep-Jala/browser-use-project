@@ -223,6 +223,18 @@ async def _execute_code(skill: Skill, page: Page, timeout_ms: int,
     try:
         await fn(api, **skill.params)
     except Exception as exc:  # noqa: BLE001 - report exactly which call broke
+        optional_from = getattr(api, "optional_from", None)
+        if optional_from is not None and api.executed >= optional_from:
+            # The failure is inside the slice's DECLARED error branch (api.begin_optional
+            # marks where it starts). On a run that does not raise that branch there is
+            # nothing for its closing steps to act on — which is the success case, not a
+            # broken replay. The tail is always trailing, so the work all ran. Tier-0 twin:
+            # script_compile.run_steps' `optional` handling.
+            logger.info("code skill %s: the declared error branch did not apply this run "
+                        "(%s); %d work call(s) completed", skill.sid, exc, api.executed)
+            return {"executed": api.executed, "failed_at": None, "error": None,
+                    "log": api.log,
+                    "extracted": dict(getattr(api, "extracted", None) or {})}
         logger.exception("code skill %s broke at call %d: %s", skill.sid, api.executed, exc)
         # Partial extractions are honest diagnostic data even on a failed run. getattr:
         # `api` is an injection seam and test doubles may be leaner than SkillApi.

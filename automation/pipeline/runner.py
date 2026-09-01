@@ -366,6 +366,7 @@ class Runner:
         self, agent_task: str, session: Any, collectors: list[Collector], *,
         max_steps: int = 25, record_path: Path | None = None,
         success_marker: str | None = None, request_offset: int = 0,
+        repeat_budget: int | None = None,
     ) -> dict[str, Any]:
         """Run ONE agent execution against an already-started session with already-running
         collectors. Owns NO lifecycle: the caller starts/stops the session, the Playwright
@@ -631,6 +632,10 @@ class Runner:
         network_collector = next((c for c in collectors if c.name == "network"), None)
         if network_collector is not None:
             agent_tools.set_live_network(network_collector)
+        # The segment's declared repeat count ("exactly 5 more clicks"), which caps
+        # repeat_click's total for one control. set_live_network above clears the ledger, so
+        # this must follow it.
+        agent_tools.set_repeat_budget(repeat_budget)
 
         try:
             history = await agent.run(max_steps=max_steps, on_step_start=_track_step)
@@ -641,6 +646,7 @@ class Runner:
             raise
         finally:
             agent_tools.clear_live_network()
+            agent_tools.set_repeat_budget(None)
             if hitl_active:
                 try:
                     signal.signal(signal.SIGINT, prev_sigint)
