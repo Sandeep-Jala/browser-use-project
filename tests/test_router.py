@@ -50,7 +50,7 @@ CTX = "/books/clients/*/inputs/sales"
 
 def _seed_canonical(sid="canon1", prompt=CANON_PROMPT, params=None, context=CTX):
     ss.code_path(sid).write_text("async def run(api):\n    await api.wait(1.0)\n")
-    ss.update_manifest(sid, prompt, context=context,
+    ss.update_manifest(sid, prompt, create=True, context=context,
                        params=params if params is not None else {"customer": "Suresh Gopi"})
     return sid
 

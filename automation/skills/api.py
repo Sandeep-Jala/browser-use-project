@@ -64,6 +64,8 @@ class SkillApi:
         self.executed = 0                      # completed api calls (the ledger position)
         self.extracted: dict[str, str] = {}    # extract verb's output ({label: text})
         self._last_click: dict[str, Any] | None = None   # for flyout-reopen recovery
+        # (fill step, ledger index just after it) — the commit rung of click()
+        self._last_fill: tuple[dict[str, Any], int] | None = None
 
     # ------------------------------- internals -------------------------------
 
@@ -75,6 +77,7 @@ class SkillApi:
         param value naming the target — into the step so _resolve verifies every
         acted-on candidate against it. Fills/selects/extracts leave it behind: their
         value is what gets typed/picked, not the target's name."""
+        self._acting()
         anchor = self.anchors.get(handle)
         if not anchor:
             raise KeyError(f"unknown anchor handle {handle!r} "
@@ -92,6 +95,21 @@ class SkillApi:
             step["expect_text"] = anchor["expect_text"]
         return step
 
+    def _acting(self) -> None:
+        """This verb is the segment TOUCHING the page: close the network collector's
+        page-load window so the app's boot traffic and the segment's own writes stay
+        told apart (agent_tools.note_interaction).
+
+        Every handle verb reaches this through _step_for; the handful that resolve without
+        an anchor call it themselves. It must run BEFORE the verb dispatches — a save
+        replayed straight after a navigation has to be judged, not written off as the
+        page's own load traffic."""
+        try:
+            from automation.pipeline.agent_tools import note_interaction
+            note_interaction()
+        except Exception as exc:  # noqa: BLE001 - attribution never breaks a replay
+            logger.debug("note_interaction unavailable: %s", exc)
+
     def _record(self, action: str, handle: str | None, used: str,
                 healed: dict[str, Any] | None) -> None:
         entry: dict[str, Any] = {"step": self.executed, "action": action, "used": used}
@@ -102,10 +120,29 @@ class SkillApi:
         self.log.append(entry)
         self.executed += 1
 
-    def _done(self, action: str) -> None:
+    def _done(self, action: str, **extra: Any) -> None:
         """Ledger entry for verbs with no element resolution (press/wait/goto/type)."""
-        self.log.append({"step": self.executed, "action": action, "used": ""})
+        self.log.append({"step": self.executed, "action": action, "used": "", **extra})
         self.executed += 1
+
+    def _pending_commit(self) -> tuple[dict[str, Any], list[str]] | None:
+        """The fill (and the keys pressed after it) whose EFFECT the click about to be
+        recovered reads, or None.
+
+        The tier-0 twin (script_compile._preceding_commit) scans a step LIST; a skill is
+        Python, so the same question is answered from the call ledger: the last fill, plus
+        every `press` since it, provided nothing but waits and presses came in between."""
+        if self._last_fill is None:
+            return None
+        step, at = self._last_fill
+        presses: list[str] = []
+        for entry in self.log[at:]:
+            if entry.get("action") == "press":
+                if entry.get("keys"):
+                    presses.append(str(entry["keys"]))
+            elif entry.get("action") != "wait":
+                return None
+        return step, presses
 
     async def _run_interrupts(self) -> bool:
         """Run the registered reflexes once; True if any claims to have cleared the way."""
@@ -155,22 +192,47 @@ class SkillApi:
         except Exception as exc:  # noqa: BLE001 - recovery ladder before the failure is final
             if await self._run_interrupts():
                 sel, healed = await _click_with_retry(self.page, step, _REOPEN_MS)
-            elif self._last_click is not None:
-                # Flyout reopen (run_steps parity): the target may live in a menu the app
-                # re-render closed; only re-clicking its opener can bring it back.
-                logger.info("click %r unreachable (%s); re-clicking predecessor to reopen "
-                            "its flyout, then retrying once", handle, str(exc)[:120])
-                try:
-                    await _click_with_retry(self.page, self._last_click, _REOPEN_MS)
-                    await self.page.wait_for_timeout(_SETTLE_MS)
-                    sel, healed = await _click_with_retry(self.page, step, _REOPEN_MS)
-                except Exception:  # noqa: BLE001 - surface the ORIGINAL failure
-                    raise exc from None
             else:
-                raise
+                sel, healed = await self._recover_click(handle, step, exc)
         self._last_click = step
         self._record("click", handle, sel, healed)
         await self.page.wait_for_timeout(_SETTLE_MS)
+
+    async def _recover_click(self, handle: str, step: dict[str, Any],
+                             exc: Exception) -> tuple[str, dict[str, Any] | None]:
+        """Re-drive whatever PRODUCED the target, then retry it once. run_steps parity —
+        see script_compile._click_with_flyout_recovery for why each rung exists.
+
+        COMMIT rung first: when the target is a row in a list a fill filtered, re-clicking
+        a menu opener cannot bring it back, and the fill is the only step that can (run
+        20260828_144426 subtask 0). FLYOUT rung second: a submenu item exists only while
+        its parent flyout is open, and any re-render closes it. If neither helps, the
+        ORIGINAL failure is what gets raised."""
+        commit = None if step.get("opens_tab") else self._pending_commit()
+        if commit is not None:
+            fill_step, presses = commit
+            logger.info("click %r unreachable (%s); re-issuing the fill that produced "
+                        "its list (%r), then retrying once",
+                        handle, str(exc)[:120], str(fill_step.get("value"))[:40])
+            try:
+                await _fill_with_retry(self.page, fill_step, _REOPEN_MS)
+                for keys in presses:
+                    await self.page.keyboard.press(keys)
+                await self.page.wait_for_timeout(_SETTLE_MS)
+                return await _click_with_retry(self.page, step, _REOPEN_MS)
+            except Exception as inner:  # noqa: BLE001 - fall through to the flyout rung
+                logger.info("commit re-issue did not bring %r back (%s)",
+                            handle, str(inner)[:120])
+        if self._last_click is not None:
+            logger.info("click %r unreachable (%s); re-clicking predecessor to reopen "
+                        "its flyout, then retrying once", handle, str(exc)[:120])
+            try:
+                await _click_with_retry(self.page, self._last_click, _REOPEN_MS)
+                await self.page.wait_for_timeout(_SETTLE_MS)
+                return await _click_with_retry(self.page, step, _REOPEN_MS)
+            except Exception:  # noqa: BLE001 - surface the ORIGINAL failure
+                raise exc from None
+        raise exc
 
     async def _await_repeat_ready(self, step: dict[str, Any], handle: str) -> None:
         """Poll until one of the step's selectors resolves visible+enabled again."""
@@ -220,12 +282,55 @@ class SkillApi:
                     await self.page.wait_for_timeout(int(min(float(wait_s), 3.0) * 1000))
                 await self._await_repeat_ready(cached or step, handle)
 
+    async def repeat_until_done(self, handle: str, wait_s: float = 0.0,
+                                cap: int = 200) -> int:
+        """Click the anchored element until it stops advancing, and return how many landed.
+
+        The counted twin above replays a number; this replays an INTENT. A slice worded
+        "click Next for all of the remaining employees" has no number at authoring time, and
+        freezing the authoring run's count would silently under-run a longer list — so the
+        recording stores the intent and the replay re-discovers the end. The readiness poll
+        is the stop signal: the control going away, disabled, or hidden IS the end of the
+        list. Reaching `cap` means it was still advancing, which raises rather than passing
+        an unfinished run off as complete."""
+        step = self._step_for(handle, expect=True)
+        cached: dict[str, Any] | None = None
+        done = 0
+        while done < cap:
+            try:
+                sel, healed = await _click_with_retry(
+                    self.page, cached or step, self.timeout_ms)
+            except Exception:  # noqa: BLE001 - cached selector went stale; full ladder once
+                if cached is None:
+                    raise
+                cached = None
+                sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
+            if cached is None and not sel.endswith("(hidden dispatch)"):
+                cached = {**step, "selectors": [sel]}
+            self._last_click = step
+            self._record("click", handle, sel, healed)
+            done += 1
+            await self.page.wait_for_timeout(_SETTLE_MS)
+            if wait_s:
+                await self.page.wait_for_timeout(int(min(float(wait_s), 3.0) * 1000))
+            try:
+                await self._await_repeat_ready(cached or step, handle)
+            except RuntimeError:
+                # The control stopped coming back — that is the end of the list, and the
+                # whole point of this verb, so it is a clean finish rather than a failure.
+                logger.info("↻ %s: stopped advancing after %d click(s)", handle, done)
+                return done
+        raise RuntimeError(
+            f"repeat_until_done: {handle!r} was still advancing after {cap} clicks — "
+            f"refusing to report an unfinished run as complete")
+
     async def click_indexed(self, handle: str, start: int, count: int) -> None:
         """Click id-indexed grid rows start..start+count-1 via the anchor's selector
         template (`{n}` placeholder) — the durable form of a virtualized-grid run
         whose row-id prefixes regenerate per data load. Each index wheel-scrolls into
         view when the pane hasn't rendered it yet. Positional by intent: the Nth row
         is clicked whoever occupies it, so no name guard applies."""
+        self._acting()
         anchor = self.anchors.get(handle) or {}
         template = str(anchor.get("selector_template") or "")
         if "{n}" not in template:
@@ -251,6 +356,7 @@ class SkillApi:
                 raise
             sel, healed = await _fill_with_retry(self.page, step, self.timeout_ms)
         self._record("fill", handle, sel, healed)
+        self._last_fill = (step, self.executed)
         await self.page.wait_for_timeout(_SETTLE_MS)
 
     async def select(self, handle: str, label: Any) -> None:
@@ -283,6 +389,7 @@ class SkillApi:
         type lands in whatever currently has focus. If the menu is closed, the opener
         recorded by the previous click re-opens it, both before the pick and once more
         as the final recovery ladder."""
+        self._acting()
         text = str(label)
         # expect_text: the first-filtered-option fallback must still be NAMED the label —
         # if the filter never applied, option-0 is an arbitrary option, not the value.
@@ -330,13 +437,16 @@ class SkillApi:
 
     async def type_text(self, text: Any) -> None:
         """Type into the FOCUSED element (an open dropdown's filter owns focus)."""
+        self._acting()
         await self.page.keyboard.type(str(text), delay=30)
         self._done("type")
         await self.page.wait_for_timeout(_SETTLE_MS)
 
     async def press(self, keys: str) -> None:
+        self._acting()
         await self.page.keyboard.press(keys)
-        self._done("press")
+        # keys ride the ledger so _pending_commit can replay the commit
+        self._done("press", keys=keys)
 
     async def wait(self, seconds: float) -> None:
         """Deliberate settle, capped like compiled waits — load-bearing on this slow app."""
@@ -354,6 +464,7 @@ class SkillApi:
         used (token match, visible-first, scrollIntoView, direct handler click, scrolling
         between rounds). THE verb for hover-revealed/0-size controls, where selector +
         pointer replay is structurally unstable."""
+        self._acting()
         name = await _find_click(self.page, str(label))
         self._record("find_click", None, f"find_click:{name}", None)
         await self.page.wait_for_timeout(_SETTLE_MS)

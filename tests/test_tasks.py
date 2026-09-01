@@ -818,3 +818,28 @@ def test_subtask_probe_does_not_change_identity():
     a = tasks_mod._spec_from_entry("t", base)
     b = tasks_mod._spec_from_entry("t", with_probe)
     assert ss.task_id(a.prompt) == ss.task_id(b.prompt)
+
+
+def test_subtask_allow_write_refusal_parses_and_rejects_non_bool(tmp_path):
+    """A slice that declares its own error branch waives the window write rule; the
+    declaration is author-written data, so a typo must be loud (same contract as kind)."""
+    p = tmp_path / "t.yaml"
+    p.write_text(
+        "fps_task:\n"
+        "  subtasks:\n"
+        "    - prompt: 'click Submit; if it shows an error, click cancel'\n"
+        "      allow_write_refusal: true\n"
+        "    - prompt: 'then go to the next page'\n"
+    )
+    subs = load_tasks(p)["fps_task"].subtasks
+    assert subs[0].allow_write_refusal is True
+    assert subs[1].allow_write_refusal is False
+
+    p.write_text(
+        "fps_task:\n"
+        "  subtasks:\n"
+        "    - prompt: 'click Submit'\n"
+        "      allow_write_refusal: yes-please\n"
+    )
+    with pytest.raises(ValueError, match="allow_write_refusal must be true or false"):
+        load_tasks(p)

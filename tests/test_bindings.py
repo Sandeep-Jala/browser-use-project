@@ -231,7 +231,7 @@ async def test_takeover_of_failed_bound_replay_learns_this_runs_values(
     })
     ss.steps_path(sid).write_text(json.dumps([{"action": "find_click",
                                                "text": "{{bound_1}}"}]))
-    ss.update_manifest(sid, consumer_prompt, params={"bound_1": "PR/X/DR017"},
+    ss.update_manifest(sid, consumer_prompt, create=True, params={"bound_1": "PR/X/DR017"},
                        bindings={"bound_1": {"kind": "extract", "label": "ref_no"}},
                        context=ctx)
 
@@ -315,7 +315,7 @@ def test_load_skill_resolves_bindings_fresh_and_refuses_stale(stores):
     ss.LIBRARY_DIR.mkdir(exist_ok=True)
     adapt.save_template(ss.template_path(sid), template)
     ss.steps_path(sid).write_text(json.dumps(template["steps"]))
-    ss.update_manifest(sid, prompt, params=template["params"], context="/section")
+    ss.update_manifest(sid, prompt, create=True, params=template["params"], context="/section")
     sub = SimpleNamespace(instantiated_prompt=prompt, values={})
 
     skill = skills.load_skill(sid, sub, run_resolver=lambda spec: "PR/X/DR018")
@@ -344,7 +344,7 @@ class _CapturingSession(FakeSession):
         super().__init__(*args, **kwargs)
         self.skills_seen = {}
 
-    async def replay_segment(self, sub, sid, context, skill, gate):
+    async def replay_segment(self, sub, sid, context, skill, gate, branch=False):
         self.skills_seen[sid] = skill
         return await super().replay_segment(sub, sid, context, skill, gate)
 
@@ -425,7 +425,7 @@ async def test_bound_entry_bypasses_noted_data_wording_net(stores, monkeypatch):
     })
     ss.steps_path(sid).write_text(json.dumps([{"action": "find_click",
                                                "text": "{{bound_1}}"}]))
-    ss.update_manifest(sid, consumer_prompt, params={"bound_1": "PR/X/DR017"},
+    ss.update_manifest(sid, consumer_prompt, create=True, params={"bound_1": "PR/X/DR017"},
                        bindings={"bound_1": {"kind": "extract", "label": "ref_no"}},
                        context=ctx)
 
@@ -668,3 +668,58 @@ def test_drop_unattributable_fills_removes_only_the_invented_values():
         "Paul", "HOOTON", "A", None]
     # Nothing to drop is a no-op that returns the list unchanged.
     assert hybrid._drop_unattributable_fills(steps, []) == (steps, [])
+
+
+# ---- a row gate's employee name is DATA the binder must see (2026-08-28) ----
+# A checkbox with no name of its own is anchored by its ROW's contents:
+#   css=[role="row"]:has-text("Flynn Grant") div[data-automationid="DetailsRowCheck"]
+# That name is this run's generated employee, so it must be flagged as runtime data and bound
+# — otherwise the entry commits with one run's employee baked in and replays tick whichever
+# employee sits in that row.
+#
+# _NAME_IN_SEL gained a second alternative for `:has-text(...)`, and its reader kept reading
+# group(1) only — which is None when the SECOND alternative matches. A None then reached
+# `value.strip()` in _findings_sourced_values, the commit block's `except Exception` swallowed
+# the AttributeError, and run 20260828_131821's subtasks 6-9 passed their gates while saving
+# NOTHING. Testing the regex alone did not catch it; this tests the reader.
+
+_ROW_GATE = ('css=[role="row"]:has-text("Flynn Grant") '
+             'div[data-automationid="DetailsRowCheck"]')
+
+
+def test_a_row_gate_name_is_extracted_by_the_reader():
+    steps = [{"action": "click", "selectors": [_ROW_GATE]}]
+    values = [v for v, kind in hybrid._step_value_candidates(steps)]
+    assert values == ["Flynn Grant"], values
+    assert all(isinstance(v, str) for v in values)   # never None
+
+
+def test_a_row_gate_name_is_flagged_as_runtime_data():
+    steps = [{"action": "click", "selectors": [_ROW_GATE]}]
+    flagged = hybrid._findings_sourced_values(
+        steps,
+        "tick the checkbox on that employee's row",          # the wording names no employee
+        ["identity_block = Flynn Grant 43 Leicester Road AYLE CA9 9AE"])
+    assert flagged == ["Flynn Grant"], flagged
+
+
+def test_a_row_gate_binds_against_the_identity_extract():
+    """The whole point: bound to the producer's extract, it resolves fresh each run."""
+    steps = [{"action": "click", "selectors": [_ROW_GATE]}]
+    bound = _bind_runtime_values(
+        steps, ["Flynn Grant"],
+        {"identity_block": "Flynn Grant\n43 Leicester Road\nAYLE\nCA9 9AE"}, [])
+    assert bound is not None, "an identity line must be bindable"
+    new_steps, params, bindings = bound
+    assert "{{bound_1}}" in new_steps[0]["selectors"][0]
+    assert params["bound_1"] == "Flynn Grant"
+    assert bindings["bound_1"]["kind"]
+
+
+def test_other_selector_shapes_still_read_cleanly():
+    """The first alternative and the no-match case must be unaffected."""
+    steps = [{"action": "click", "selectors": ['role=option[name="Payments"]']},
+             {"action": "click", "selectors": ['css=[aria-label="Save"]',
+                                               "xpath=/html/body/div[2]/div"]}]
+    assert [v for v, _k in hybrid._step_value_candidates(steps)] == ["Payments"]
+

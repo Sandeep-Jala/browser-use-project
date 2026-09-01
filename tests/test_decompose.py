@@ -341,142 +341,8 @@ async def test_fallback_blob_never_takes_loop_kind(library):
 # ------------------------------- node kinds (action | judge) -------------------------------
 
 
-def test_node_kind_heuristic():
-    # Verification wording -> judge (cognitive: always LLM, never cached).
-    assert decompose.node_kind("verify the CC field matches", None) == "judge"
-    assert decompose.node_kind("Check that the mail is not sent", None) == "judge"
-    # "remember that mail" is not producer wording (_PRODUCES_NOTED_RE wants a
-    # determiner it can bind a value to: "remember THE mail"), so the judge net holds it.
-    assert decompose.node_kind("remember that mail", None) == "judge"
-    # ...but bare NOTING is an action now, not a judge: nothing here is compared, and a
-    # replayed extract step re-reads the value live. See
-    # test_producer_wording_is_an_action_not_a_judge. Add any verification verb and both
-    # go back to judge (test_verification_wording_still_judges).
-    assert decompose.node_kind("note the currently selected option", None) == "action"
-    assert decompose.node_kind("capture the names of both users", None) == "action"
-    assert decompose.node_kind("Confirm that the dropdown updates", None) == "judge"
-    assert decompose.node_kind("make sure the panel opens", None) == "judge"
-    assert decompose.node_kind("see if the icon works", None) == "judge"
-    # Record types and action wording never classify as judge: "credit note" is a noun,
-    # "check the option" is a click on a checkbox.
-    assert decompose.node_kind("add credit note,select a customer and click save",
-                               None) == "action"
-    assert decompose.node_kind('check the option "no sharing" and submit', None) == "action"
-    assert decompose.node_kind("go to inputs section,select sales", None) == "action"
-    # The disambiguated RTI period pick: "period"/"dropdown"/"top bar" must not drift
-    # into the judge net — a deterministic UI pick should stay cacheable.
-    assert decompose.node_kind("using the period dropdown in the top bar, set the period "
-                               "to May-26, then click Save & Next", None) == "action"
-    # A marker-owning subtask is ALWAYS action — its network gate is machine ground truth.
-    assert decompose.node_kind("verify and save the record", "Invoices") == "action"
-    # An aux-tab subtask is action even with observational wording: its replayed extract
-    # step re-reads the live DOM, so the observation stays fresh without the LLM.
-    assert decompose.node_kind("note the title of the top result", None,
-                               tab_url="https://duckduckgo.com") == "action"
-    # An explicit declaration wins over the heuristic.
-    assert decompose.node_kind("go to the reviews section", None, declared="judge") == "judge"
-    assert decompose.node_kind("verify it worked", None, declared="action") == "action"
-    assert decompose.node_kind("note the top result", None, declared="judge",
-                               tab_url="https://duckduckgo.com") == "judge"
 
 
-# The two RTI employee loops in the ORIGINAL wording (now carried by
-# payroll_rti_process_old / payroll_food_limited_e2e_rti): imperative actions with the
-# verification folded inside. Judge framing made the agent declare them done after ONE
-# Save & Next (the observed wrong-employee bug) — they must classify "loop". Their
-# "check that" clause used to be load-bearing: the 07-29 reword dropped it and the pass
-# silently became a cacheable fixed-click action.
-LOOP_OWEN = ("Process the existing employees one at a time by clicking Save & Next, and "
-             "after each click check that the next employee has loaded, if the Save & "
-             "Next button is disabled, Move on to the next employee. stopping as soon as "
-             "{{employee}} is the employee shown")
-LOOP_DAVID = ("Continue clicking Save & Next one employee at a time in the same way, and "
-              "after each click check that the next employee has loaded, if the Save and "
-              "next is disabled move on to the next employee, until {{employee}} is the "
-              "employee shown")
-
-# The same two loops in the 2026-08-05 imperative rewrite (live payroll_rti_process
-# wording, verbatim templates): NO judge vocabulary anywhere. The judge-first gate
-# demoted them to cacheable actions, and the frozen Save & Next replay saved the
-# stop-target employee — they must classify "loop" on repetition + stop cues alone.
-LOOP_ALAN = (
-    "Now process the existing employees one at a time by repeating the following steps "
-    "for each employee: first read the name of the employee currently shown; if the "
-    "employee shown is {{employee}}, stop repeating and do not click Save & Next again; "
-    "otherwise, if the error '{{error_message}}' is shown, click Add Payment, set Amount "
-    "to {{amount}}, and click Save & Next; if Save & Next is disabled for this employee, "
-    "do not click it and instead select the next employee in the list directly; in all "
-    "other cases click Save & Next and wait until the next employee has fully loaded "
-    "before doing anything else. Keep repeating those steps until {{employee}} is the "
-    "employee shown")
-LOOP_BRUCE = (
-    "After saving, continue processing employees one at a time by repeating exactly the "
-    "same steps as before: read the name of the employee currently shown; if the "
-    "employee shown is {{employee}}, stop repeating and do not click Save & Next again; "
-    "otherwise handle the minimum wage error and a disabled Save & Next the same way as "
-    "before, and in all other cases click Save & Next and wait for the next employee to "
-    "load. Keep repeating until {{employee}} is the employee shown")
-
-
-def test_node_kind_loop_detection():
-    # Judge phrase + iteration cues, with the judge phrase NOT the head directive -> loop.
-    assert decompose.node_kind(LOOP_OWEN, None) == "loop"
-    assert decompose.node_kind(LOOP_DAVID, None) == "loop"
-    # A LEADING judge directive stays judge even when WHAT it checks iterates.
-    assert decompose.node_kind(
-        "Check that entries do not repeat across pages and each page loads",
-        None) == "judge"
-    assert decompose.node_kind("verify that each filter narrows the results",
-                               None) == "judge"
-    # Cue-free verification stays judge; cue-free iteration stays action.
-    assert decompose.node_kind("verify the CC field matches", None) == "judge"
-    assert decompose.node_kind(
-        "Then go to Payroll & RTI, using the period dropdown in the top bar, change the "
-        "period to the next month, and click Save & Next 3 times", None) == "action"
-    # Judge-free loops: repetition cue + stop cue is a loop signature with NO judge
-    # phrase (the 2026-08-05 rewrite; a frozen replay of it saved the stop-target
-    # employee when this classified action).
-    assert decompose.node_kind(LOOP_ALAN, None) == "loop"
-    assert decompose.node_kind(LOOP_BRUCE, None) == "loop"
-    # Either cue alone is everyday action filler, not a loop: a fixed click count with
-    # "after each click ... stopping", and a bare "wait until X loads".
-    assert decompose.node_kind(
-        "change the date to the next month ({{date}}), and click Save & Next exactly "
-        "{{times}} times, waiting for the screen to update after each click and "
-        "stopping after the third click", None) == "action"
-    assert decompose.node_kind(
-        "click Save & Next and wait until the next employee has fully loaded",
-        None) == "action"
-    # The 2026-08-11 counter rewrite of the e2e's employee passes rides on this:
-    # "exactly N clicks ... after each click" has neither a repeat cue ("for each"
-    # requires adjacency) nor a stop cue, so both slices stay recordable actions.
-    assert decompose.node_kind(
-        "Click Save & Next for the next 5 employees: exactly 5 clicks, waiting for "
-        "the next employee to fully load after each click.", None) == "action"
-    assert decompose.node_kind(
-        "Then click Save & Next for the next 14 employees in the same way: exactly "
-        "14 more clicks, waiting for the next employee to fully load after each "
-        "click.", None) == "action"
-    # A MULTI-STEP iteration reads the same to the classifier as a single-click one, and
-    # the "rest of the employees" phrasing carries neither cue — run 20260824_165824 filled
-    # employee 1's three portal dialogs, clicked Next once, and closed the tab on employee
-    # 2's freshly loaded empty form, exactly as the wording said.
-    assert decompose.node_kind(
-        "click the + button next to payment, enter 4000 in the amount field, click Save. "
-        "Click Next for rest of the employees. Close this tab.", None) == "action"
-    assert decompose.node_kind(
-        "Now do this for each employee in the numbered list on the left, starting with "
-        "the one already open: click the + button next to payment, enter 4000 in the "
-        "amount field, click Save. Then click Next to load the following employee and "
-        "repeat all of the above for them, until every employee in that list has been "
-        "done. Then close this tab.", None) == "loop"
-    # Marker precedence is unchanged: machine ground truth caches safely.
-    assert decompose.node_kind(LOOP_OWEN, "Payroll") == "action"
-    assert decompose.node_kind(LOOP_ALAN, "Payroll") == "action"
-    # Explicit declarations still win in both directions.
-    assert decompose.node_kind("go to the reviews section", None,
-                               declared="loop") == "loop"
-    assert decompose.node_kind(LOOP_OWEN, None, declared="judge") == "judge"
 
 
 def test_conditional_guard_wording():
@@ -557,19 +423,6 @@ JUDGE_REPLY = json.dumps({"subtasks": [
 ]})
 
 
-@pytest.mark.asyncio
-async def test_judge_kind_assigned_and_survives_the_cache(library):
-    subs = await decompose.get_decomposition(JUDGE_PROMPT, llm=StubLLM(JUDGE_REPLY),
-                                             marker=None)
-    assert [s.kind for s in subs] == ["action", "judge"]
-    cached = ss.load_decomposition(ss.task_id(JUDGE_PROMPT))
-    assert [d["kind"] for d in cached["subtasks"]] == ["action", "judge"]
-    # Tier-2 rebuild from the cache preserves the kinds.
-    again = await decompose.get_decomposition(JUDGE_PROMPT, llm=None, marker=None)
-    assert [s.kind for s in again] == ["action", "judge"]
-
-
-@pytest.mark.asyncio
 async def test_marker_overrides_judge_wording_on_the_save_subtask(library):
     # With a parent marker and no declared save step, the LAST subtask becomes the save
     # owner — and a marker-owning node is action even with verification wording.
@@ -579,37 +432,6 @@ async def test_marker_overrides_judge_wording_on_the_save_subtask(library):
     assert [s.kind for s in subs] == ["action", "action"]
 
 
-@pytest.mark.asyncio
-async def test_fallback_is_judge_for_markerless_verification_task(library):
-    subs = await decompose.get_decomposition(
-        "verify that the report shows the review", llm=None, marker=None)
-    assert len(subs) == 1 and subs[0].kind == "judge"
-
-
-@pytest.mark.asyncio
-async def test_cached_kind_rederived_from_wording(library):
-    """A cached decomposition carries the CLASSIFIER'S old verdict, not an author's
-    declaration: tier 2 re-derives kinds from wording so a classifier fix reaches every
-    already-cached task without --redecompose (the live case: the RTI employee loops sat
-    in the cache as "judge" and kept running as one-shot observations)."""
-    prompt = "go to the section. " + LOOP_OWEN.replace("{{employee}}", "Owen Millar")
-    tid = ss.task_id(prompt)
-    ss.save_decomposition(tid, {
-        "parent_prompt": " ".join(prompt.split()),
-        "source": "llm",
-        "created": "2026-07-27T00:00:00",
-        "subtasks": [
-            {"template_prompt": "go to the section.", "values": {}, "marker": None,
-             "postcondition": None, "kind": "judge", "tab_url": None},
-            {"template_prompt": LOOP_OWEN, "values": {"employee": "Owen Millar"},
-             "marker": None, "postcondition": None, "kind": "judge", "tab_url": None},
-        ],
-    })
-    subs = await decompose.get_decomposition(prompt, llm=None, marker=None)
-    assert [s.kind for s in subs] == ["action", "loop"]
-
-
-@pytest.mark.asyncio
 async def test_spec_declared_kind_still_wins(library):
     """Tier 1 is author-maintained: an explicit yaml `kind` is a real declaration and is
     NOT re-derived — only cached (derived) kinds are advisory."""
@@ -798,54 +620,10 @@ def test_the_paste_consumer_slice_still_consumes():
     assert decompose.node_kind(consumer, None) == "action"
 
 
-def test_verification_wording_still_judges():
-    """The line the producer rule must not cross: a COMPARISON is what a recording cannot
-    replay, so anything that verifies stays a judge — including a slice that notes a value
-    AND checks it."""
-    assert decompose.node_kind("verify the CC field matches", None) == "judge"
-    assert decompose.node_kind(
-        "note the currently selected option and confirm it is Account Manager",
-        None) == "judge"
-    assert decompose.node_kind(
-        "capture the balance and check that it equals the invoice total", None) == "judge"
-    assert decompose.node_kind("Check that the mail is not sent", None) == "judge"
-    # ...and the registry's own verification slice, which must not have moved.
-    assert decompose.node_kind(
-        "Now go to Data Request, and on the top row (S.No. 1, the newest request) click "
-        "the ref. no. link to open the Payroll Review panel, click Verify all.",
-        None) == "judge"
 
 
-def test_producer_wording_still_loses_to_loop_and_marker():
-    """Precedence is unchanged: iteration and machine ground truth both outrank it."""
-    assert decompose.node_kind(
-        "note the employee shown, click Save & Next, and keep repeating until the last "
-        "employee is reached", None) == "loop"
-    assert decompose.node_kind(_OTP_SLICE, "Payroll") == "action"
-    assert decompose.node_kind(_OTP_SLICE, None, declared="judge") == "judge"
 
 
-# ---------------- exhaustion wording: "for all of the REMAINING x" ----------------
-# Run 20260827_091313 subtask 8. "Then click Next for all of the remaining employees,
-# waiting for the next employee to fully load after each click and doing nothing else on
-# any of them. Then click submit, and then close this tab." classified ACTION: it carries
-# no repeat cue ("for each"/"repeat"/"keep …ing"/"at a time") and NO stop cue at all. The
-# only thing that matched was "each" — from "after each click" — in _LOOP_CUE_RE, which
-# only the judge branch consults. Eleven Next clicks compiled to one.
-#
-# "remaining" (and "the rest") after an iteration preposition IS the stop condition: the
-# set depletes, so the phrase carries both cues at once. Deliberately keyed on "remaining"
-# rather than on the quantifier, so the documented "Click Next for rest of the employees"
-# ruling in test_node_kind_loop_detection is untouched.
-
-
-def test_exhausting_a_remaining_set_is_a_loop():
-    assert decompose.node_kind(
-        "Then click Next for all of the remaining employees, waiting for the next "
-        "employee to fully load after each click and doing nothing else on any of them. "
-        "Then click submit, and then close this tab.", None) == "loop"
-    assert decompose.node_kind(
-        "step through the remaining employees doing nothing else", None) == "loop"
 
 
 def test_remaining_alone_is_not_an_iteration_cue():
@@ -859,3 +637,71 @@ def test_a_marker_still_outranks_exhaustion_wording():
     """Machine ground truth caches safely regardless of wording (node_kind's marker rule)."""
     assert decompose.node_kind(
         "click Next for all of the remaining employees", "Payroll") == "action"
+
+
+# ---------------- kind is DECLARED, never inferred (2026-08-28) ----------------
+# Four regex nets used to read the prompt: _JUDGE_RE ("verify", "check that", even "note"),
+# a leading "If", producer phrasing, and _NOTED_DATA_RE ("the noted ..."). Each could
+# silently stop a segment being recorded — "tick the Select Employee checkbox ... and click
+# Verify" was held out of the library because the BUTTON is named Verify. These tests pin
+# the ABSENCE of that inference, which is the guarantee now.
+
+
+def test_verification_wording_no_longer_makes_a_judge():
+    for wording in (
+        "Verify that the totals match the invoice",
+        "Check that entries do not repeat across pages",
+        "Make sure the balance is zero",
+        "note and remember the OTP shown in the dialog",
+        "tick the Select Employee checkbox and click Verify",
+        "confirm the employee was saved",
+    ):
+        assert decompose.node_kind(wording, None) == "action", wording
+
+
+def test_repeat_wording_no_longer_makes_a_loop():
+    for wording in (
+        "Click Save & Next one at a time until every employee is done",
+        "keep clicking Next until the last row is shown",
+        "click Next for all of the remaining employees",
+        "repeat for each employee in the list",
+    ):
+        assert decompose.node_kind(wording, None) == "action", wording
+
+
+def test_a_declared_kind_is_the_only_thing_that_counts():
+    assert decompose.node_kind("anything at all", None, "judge") == "judge"
+    assert decompose.node_kind("Verify the totals", None, "action") == "action"
+    # 'loop' was removed; tasks.py rejects it on load, and node_kind treats any
+    # unrecognised value as undeclared rather than guessing.
+    assert decompose.node_kind("click Next until done", None, "loop") == "action"
+    assert decompose.node_kind("Verify the totals", None, "Judge") == "action"
+
+
+def test_marker_and_tab_url_no_longer_need_to_force_action():
+    """They used to short-circuit the wording nets; action is simply the default now."""
+    assert decompose.node_kind("Verify the save", "/Invoices") == "action"
+    assert decompose.node_kind("note the top result", None, None, "https://example.com") == "action"
+
+
+
+@pytest.mark.asyncio
+async def test_spec_declared_write_waiver_reaches_subtasks_and_cache_drops_it(library):
+    """Tier 1 threads a slice's declared write-rule waiver onto its Subtask; the saved
+    cache deliberately does NOT carry it (same re-attach-from-spec contract as verify
+    and probe — a stale cache must never resurrect a superseded waiver)."""
+    prompt = ("go to the payroll module. "
+              "click Submit; if it shows an error, click cancel.")
+    spec = TaskSpec(key="k", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the payroll module."),
+        SubtaskDecl(prompt="click Submit; if it shows an error, click cancel.",
+                    allow_write_refusal=True),
+    ))
+    subs = await decompose.get_decomposition(prompt, llm=None, spec=spec)
+    assert subs[0].allow_write_refusal is False
+    assert subs[1].allow_write_refusal is True
+
+    cached = ss.load_decomposition(ss.task_id(prompt))
+    assert cached and all("allow_write_refusal" not in d for d in cached["subtasks"])
+    rebuilt = decompose._build_subtasks(cached["subtasks"], None, trust_kind=False)
+    assert all(s.allow_write_refusal is False for s in rebuilt)

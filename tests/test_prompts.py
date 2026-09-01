@@ -99,22 +99,15 @@ def test_scoped_prompt_defaults_omit_findings_and_observe():
     assert "FILE DOWNLOAD" not in p
 
 
-def test_scoped_prompt_loop_block():
-    """The loop node's repeat-until contract: action framing (the judge observation
-    block stays OUT), one iteration at a time, no jumping ahead, and a generic
-    done-condition — without it, observation framing made the agent declare the
-    employees loop done after a single Save & Next."""
-    p = scoped_subtask_prompt(
-        "process employees one at a time until Owen Millar is shown", [], [], loop=True)
-    assert "LOOP step" in p
-    assert "ONE iteration at a time" in p
-    assert "NEVER jump ahead" in p
-    assert "DONE CONDITION" in p and "stop condition holds" in p
-    assert "MANY iterations" in p
-    assert "final observed state" in p
-    assert "OBSERVATION/VERIFICATION" not in p
-    # And the block stays out of every non-loop prompt.
-    assert "LOOP step" not in scoped_subtask_prompt("go to Estimates", [], [])
+def test_repeat_capability_is_stated_once_for_every_step():
+    """The per-slice LOOP block went with the `loop` kind (2026-08-28). Repetition is now a
+    TOOL the agent always has, so the guidance is one general capability statement in the
+    system prompt rather than a block injected when wording looked loop-shaped."""
+    assert "repeat_click" in SPEED_OPTIMIZATION_PROMPT
+    assert "times=0" in SPEED_OPTIMIZATION_PROMPT       # the until-it-stops mode
+    # ...and no slice-scoped loop framing survives.
+    p = scoped_subtask_prompt("do the thing", [], [])
+    assert "LOOP step" not in p
 
 
 def test_scoped_prompt_conditional_block():

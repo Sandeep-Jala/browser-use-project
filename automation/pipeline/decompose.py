@@ -132,66 +132,29 @@ _VERIFIES_RE = re.compile(
 
 def node_kind(template_prompt: str, marker: str | None,
               declared: str | None = None, tab_url: str | None = None) -> str:
-    """Resolve a subtask's node kind: "action" (replayable), "judge" (cognitive, always
-    live), or "loop" (repeat-until).
+    """A subtask's node kind, from its DECLARATION only: "action" (replayable, the default)
+    or "judge" (a verification, always live and never cached).
 
-    Loops are CACHED as of 2026-08-25 (user decision). What a loop's entry stores is the
-    iteration count its authoring agent stopped at; the user's position is that a
-    recording replays in the setting it was made in, so that count holds. Kind still
-    matters for loops — they keep the extended step budget when they author, they compile
-    with adjacent same-target clicks counted as ITERATIONS rather than dropped as retries
-    (script_compile._push_step), and they stay out of SEMANTIC ROUTING, where a count
-    borrowed from another wording's recording would carry no such guarantee.
+    Nothing here reads the prompt. Until 2026-08-28 four regex nets inferred kind and
+    cacheability from wording — `_JUDGE_RE` ("verify", "check that", even "note"),
+    `_NOTED_DATA_RE` ("the noted ..."), a leading "If", and producer phrasing — and each
+    could silently stop a segment being recorded. That cost real runs: "tick the Select
+    Employee checkbox ... and click Verify" is a click sequence, not a verification, and it
+    was held out of the library because the BUTTON is named Verify; a slice saying "the noted
+    employee's name" re-authored every run at full LLM cost. The user's decision is that a
+    verification is DECLARED (`kind: judge` in tasks.yaml, validated in tasks.py) and
+    everything else is an action that records. Wording decides nothing.
 
-    An explicit declaration (spec/cache) wins; a marker-owning subtask is ALWAYS action —
-    its network gate is machine ground truth, so caching it is safe regardless of wording;
-    an aux-tab subtask (tab_url) is action too: its wording is usually observational
-    ("note the top result"), but its replay is not hollow — the compiled extract step
-    re-reads the live DOM every run, so the observation stays fresh without the LLM;
-    otherwise verification wording makes it a judge node — unless iteration cues say the
-    verification is folded INTO a repeated action ("Save & Next ... check that ... until X
-    is shown"): that is a loop node. A loop must ACT (observation framing made the agent
-    declare the loop done after one iteration). Loop wording needs no judge phrase, though:
-    an imperative rewrite
-    ("keep repeating ... until X is shown") carries none, and routing it through the
-    judge gate demoted it to a cacheable action whose frozen Save & Next replay saved
-    the stop-target employee (2026-08-05) — so a repetition cue PLUS a stop cue is a
-    loop signature on its own. A false positive here only costs caching (the segment
-    authors every run); a false negative costs correctness (hollow replay / frozen
-    iteration count), so the wording net is cast deliberately wide.
+    `kind: loop` went at the same time. It existed so the compiler would read adjacent
+    same-target clicks as iterations rather than slow-app retries — a guess the live
+    `repeat_click` tool makes unnecessary by stating its own count (see
+    agent_tools.repeat_click and script_compile's repeat_click compile branch).
+
+    `marker` and `tab_url` are still accepted so the call sites need no change; they used to
+    force "action", which is now simply the default.
     """
-    if declared in ("action", "judge", "loop"):
-        return declared
-    if marker or tab_url:
-        return "action"
-    if _JUDGE_RE.search(template_prompt):
-        produces = (produces_noted_data(template_prompt)
-                    and not _VERIFIES_RE.search(template_prompt))
-        # The leading-judge guard holds a slice at judge when the head directive IS the
-        # verification ("Check that entries do not repeat across pages"). A leading
-        # PRODUCER is not that: "note the employee shown, click Save & Next, and keep
-        # repeating until ..." heads an ACTION that iterates, so its loop cues still win.
-        if _LOOP_CUE_RE.search(template_prompt) \
-                and (produces or not _LEADING_JUDGE_RE.match(template_prompt)):
-            return "loop"
-        # PRODUCER wording is not verification. "note and remember the OTP" tells the step
-        # to CAPTURE a value later steps consume, and its replay is not hollow for exactly
-        # the reason the tab_url branch above is an action: the compiled extract step
-        # re-reads the live DOM every run, so the observation stays fresh with no LLM.
-        # That carve-out was only ever this rule scoped to a foreign origin, and scoping it
-        # that way made the SAME wording cacheable on fakenamegenerator and uncacheable
-        # in-app — run 20260824_165824 paid 176s and 140k tokens for an OTP observation a
-        # replayed extract would have re-read for free. A slice that also VERIFIES stays a
-        # judge: a comparison is the thing a recording cannot make.
-        if produces:
-            return "action"
-        return "judge"
-    iterates = (_LOOP_REPEAT_RE.search(template_prompt)
-                and _LOOP_STOP_RE.search(template_prompt)) \
-        or _LOOP_EXHAUST_RE.search(template_prompt)
-    if iterates and not _LEADING_JUDGE_RE.match(template_prompt):
-        return "loop"
-    return "action"
+    return declared if declared in ("action", "judge") else "action"
+
 
 
 # Wording that CONSUMES data noted by an EARLIER subtask ("using the noted generated name
@@ -260,6 +223,11 @@ _PRODUCES_NOTED_RE = re.compile(
 )
 
 
+# UNUSED BY THE PIPELINE since 2026-08-28. Kind and cacheability are declaration-only now
+# (see node_kind): nothing reads the prompt to decide them. These predicates and their
+# regexes are kept only because their direct tests still pin the wording rulings they took
+# many runs to get right — no production code path calls them. Safe to delete with those
+# tests; do not wire them back into a gate.
 def produces_noted_data(template_prompt: str) -> bool:
     """True when the subtask's wording is the NOTING instruction — it captures a value
     for later subtasks to consume.
@@ -290,6 +258,11 @@ _NOTED_UNAMBIGUOUS_RE = re.compile(
 )
 
 
+# UNUSED BY THE PIPELINE since 2026-08-28. Kind and cacheability are declaration-only now
+# (see node_kind): nothing reads the prompt to decide them. These predicates and their
+# regexes are kept only because their direct tests still pin the wording rulings they took
+# many runs to get right — no production code path calls them. Safe to delete with those
+# tests; do not wire them back into a gate.
 def consumes_noted_data(template_prompt: str) -> bool:
     """True when the subtask's wording says it USES data noted by an earlier subtask.
 
@@ -322,6 +295,12 @@ def consumes_noted_data(template_prompt: str) -> bool:
 _CONDITIONAL_RE = re.compile(r"^\s*(?:(?:and|then|now)[,\s]+)*if\b", re.IGNORECASE)
 
 
+# KIND and CACHEABILITY stay declaration-only (see node_kind): nothing here decides whether
+# a slice records or commits. What this predicate decides is narrower and is live again —
+# hybrid's `is_branch`, which tells replay_segment that a slice's whole recording is the TRUE
+# branch of an "If ..." guard, so a replay that resolves NOTHING means the condition was not
+# raised rather than that the segment failed. Wording is the fallback for a slice that
+# declares no `probe:`; a declared probe answers the same question earlier and cheaper.
 def is_conditional_guard(template_prompt: str) -> bool:
     """True when the subtask's wording is a conditional branch guard (leading "If ...")."""
     return bool(_CONDITIONAL_RE.match(template_prompt))
@@ -357,6 +336,12 @@ class Subtask:
     # in for the agent's live judgment of whether the branch condition is raised, which
     # is what lets the branch replay/commit like an action (see run_hybrid_task).
     probe: Any | None = None
+    # Declared exemption from the window write rule (checks.window_write_rollup) — tier-1
+    # only, never cached (_as_cache drops it, same contract as verify/probe). A slice whose
+    # wording declares its own error branch ("click Submit. if it shows an error, click
+    # cancel") ends legitimately on a REFUSED write; the rule reads traffic, never prose,
+    # so the author declares the exemption instead of the code inferring it.
+    allow_write_refusal: bool = False
 
     @property
     def instantiated_prompt(self) -> str:
@@ -424,6 +409,7 @@ def _build_subtasks(raw: list[dict[str, Any]], marker: str | None,
             tab_url=d.get("tab_url"),
             verify=d.get("verify") or None,
             probe=d.get("probe"),
+            allow_write_refusal=bool(d.get("allow_write_refusal", False)),
         )
         for i, d in enumerate(raw)
     ]
@@ -446,9 +432,9 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
         "source": source,
         "created": datetime.now().isoformat(timespec="seconds"),
         "subtasks": [
-            # Deliberately no "verify" and no "probe": declared checks/probes re-attach
-            # from the spec on every load, so a stale cache can never resurrect
-            # superseded ones.
+            # Deliberately no "verify", no "probe" and no "allow_write_refusal":
+            # declared checks/probes/waivers re-attach from the spec on every load, so a
+            # stale cache can never resurrect superseded ones.
             {"template_prompt": s.template_prompt, "values": s.values,
              "marker": s.marker, "postcondition": s.postcondition, "kind": s.kind,
              "tab_url": s.tab_url}
@@ -680,7 +666,8 @@ async def get_decomposition(
             {"template_prompt": d.prompt, "values": dict(d.values or {}),
              "marker": d.marker, "postcondition": d.postcondition,
              "kind": getattr(d, "kind", None), "tab_url": getattr(d, "tab_url", None),
-             "verify": getattr(d, "verify", None), "probe": getattr(d, "probe", None)}
+             "verify": getattr(d, "verify", None), "probe": getattr(d, "probe", None),
+             "allow_write_refusal": getattr(d, "allow_write_refusal", False)}
             for d in declared
         ]
         problem = _validate(raw, prompt)

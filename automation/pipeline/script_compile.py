@@ -857,15 +857,14 @@ def _name_conflict(prev: dict[str, Any], step: dict[str, Any]) -> bool:
     return bool(a and b and a != b)
 
 
-def _push_step(steps: list[dict[str, Any]], step: dict[str, Any], *,
-               count_adjacent: bool = False) -> None:
+def _push_step(steps: list[dict[str, Any]], step: dict[str, Any]) -> None:
     """Append a step, distinguishing slow-app retries from intentional repeats.
 
-    `count_adjacent` inverts the adjacent-click rule for a LOOP recording: there, two
-    clicks on the same target back to back are two ITERATIONS, not the agent re-clicking
-    a control the slow app had not registered. Without it a loop that stepped through
-    eleven employees without pausing compiles to a single click, and the cached entry
-    silently stops after one.
+    There used to be a `count_adjacent` flag here, set for a `kind: loop` recording, that
+    read back-to-back same-target clicks as ITERATIONS rather than retries. Both it and the
+    loop kind went on 2026-08-28: an intentional repeat is now stated by the agent through
+    the `repeat_click` tool, whose step carries its own count and is appended directly (see
+    compile_recording's repeat_click branch), so nothing has to be inferred from adjacency.
 
     An ADJACENT click on the same target (no recorded wait between) is the agent
     retrying a click the slow app hadn't registered yet ("+ Invoice" clicked twice) —
@@ -893,7 +892,7 @@ def _push_step(steps: list[dict[str, Any]], step: dict[str, Any], *,
                 steps[prev_idx] = step  # same field written again → keep the final value
                 return
             waits_between = steps[prev_idx + 1:]   # only waits, by prev_idx construction
-            if not waits_between and not count_adjacent:
+            if not waits_between:
                 return  # adjacent retry → the first click already fired
             prev["count"] = int(prev.get("count", 1)) + 1
             wait_s = max((float(w.get("seconds") or 0) for w in waits_between), default=0.0)
@@ -1013,8 +1012,8 @@ def repeat_hint_from_wording(prompt: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None, *,
-                       loop: bool = False) -> list[dict[str, Any]]:
+def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None
+                       ) -> list[dict[str, Any]]:
     """Reconcile recorded repeat clusters with the slice WORDING.
 
     Wording that pins a count ("exactly 5 clicks") keeps its single cluster and has the
@@ -1038,12 +1037,11 @@ def _apply_repeat_hint(steps: list[dict[str, Any]], hint: int | None, *,
                 if s.get("action") == "click" and int(s.get("count", 1)) > 1]
     if not clusters:
         return steps
-    if loop and not hint:
-        # A LOOP node's repeated clicks ARE its iterations — that count is the whole
-        # cached artifact (node_kind: "the authoring run's iteration count is what a loop
-        # entry stores"). Dissolving it made kind="loop" compile byte-identically to
-        # kind="action" and silently stop after one pass. The retry reading below is only
-        # ever right for an action node, which is where the toggle bug lived.
+    # A repeat_click step is NOT a cluster to be second-guessed: the agent stated its count,
+    # so it is left exactly as recorded. Only clusters _push_step INFERRED from adjacency are
+    # subject to the retry reading below (the Download-toggle bug this dissolve exists for).
+    clusters = [s for s in clusters if not s.get("until_done") and not s.get("stated_count")]
+    if not clusters:
         return steps
     if hint:
         if len(clusters) == 1 and int(clusters[0]["count"]) != int(hint):
@@ -1204,7 +1202,7 @@ def _reg_host(url: Any) -> str:
 
 def compile_recording(
     recording_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True, loop: bool = False,
+    emit_start_goto: bool = True,
 ) -> list[dict[str, Any]]:
     """Turn a saved agent history JSON into an ordered list of {action, ...} steps.
 
@@ -1212,9 +1210,10 @@ def compile_recording(
     the create-write fired (see ground_truth["write_step"]), so an agent that flailed AFTER
     the record was actually saved never gets its post-save junk into the script.
 
-    `loop=True` compiles a LOOP node's recording: repeated clicks on one target are its
-    iterations, so adjacent ones accumulate into `count` instead of being dropped as
-    slow-app retries (see _push_step).
+    A repeated click is no longer inferred from adjacency: the agent states it through the
+    `repeat_click` tool, whose metadata compiles to one click step carrying its own `count`
+    (or `until_done`). The `loop=True` flag that used to invert _push_step's adjacency rule
+    went with the `kind: loop` node on 2026-08-28.
 
     `emit_start_goto=False` skips the leading goto to the recording's start URL. Mid-flow
     subtask segments need this: on an SPA a reload destroys live form state, and the segment's
@@ -1371,7 +1370,7 @@ def compile_recording(
                             # way the query matched.
                             step["expect_scattered"] = True
                         _push_step(steps, _attach_fp(step, element),
-                                   count_adjacent=loop)
+                                   )
                     else:
                         # No anchorable identity was captured. Recording the tool's TEXT
                         # SEARCH instead is what put find_click('Net to gross') — 36
@@ -1573,6 +1572,37 @@ def compile_recording(
                     logger.warning(
                         "compile: dropping recorded paste at step %d — the target carries "
                         "no element identity, so it cannot be anchored", item_idx)
+            elif name == "repeat_click":
+                # One counted tool call replaces N adjacent clicks, so the count is STATED
+                # rather than inferred from adjacency. That is the whole point of the tool:
+                # _push_step's adjacency rule can neither drop these as slow-app retries nor
+                # need `kind: loop` to know they were iterations. A shortfall or a refusal
+                # stamps no_click instead and never reaches here.
+                md = (results[i].get("metadata")
+                      if i < len(results) and isinstance(results[i], dict) else None)
+                rep = md.get("repeat") if isinstance(md, dict) else None
+                if not isinstance(rep, dict):
+                    continue
+                sels = _selectors(element, shadow_contained=in_shadow, label=sm_label) if element else []
+                if not sels:
+                    logger.warning(
+                        "compile: dropping recorded repeat_click at step %d — the target "
+                        "carries no element identity, so it cannot be anchored", item_idx)
+                    continue
+                step = {"action": "click", "selectors": sels,
+                        "count": max(1, int(rep.get("count") or 1)),
+                        "repeat_wait_s": float(rep.get("wait_s") or 0.0),
+                        # The agent STATED this count; _apply_repeat_hint must not dissolve
+                        # it the way it dissolves an adjacency-inferred cluster.
+                        "stated_count": True}
+                if rep.get("until_done"):
+                    # The recording used "until it stops advancing", so the REPLAY must too:
+                    # freezing the authoring run's number would under-run a longer list.
+                    step["until_done"] = True
+                # Appended directly, never through _push_step: its adjacency fusion is for
+                # clicks the agent issued one at a time, and this step already carries its
+                # own count.
+                steps.append(_attach_fp(step, element))
             elif name == "click" and element:
                 element = _with_recovered_text(element,
                                                item.get("state_message") or "")
@@ -1603,7 +1633,7 @@ def compile_recording(
                         # what was recorded, whichever selector resolved it (see _resolve).
                         step["expect_text"] = label
                     _push_step(steps, _attach_fp(step, element),
-                               count_adjacent=loop)
+                               )
             elif name == "click":
                 # No identity from either channel, so there is nothing to anchor. Dropping
                 # is the historical behaviour and stays (making it `unanchorable` would
@@ -1809,15 +1839,15 @@ def _atomic_write(path: Path, text: str) -> None:
 
 def save_steps(
     recording_path: str | Path, steps_path: str | Path, max_steps: int | None = None, *,
-    emit_start_goto: bool = True, repeat_hint: int | None = None, loop: bool = False,
+    emit_start_goto: bool = True, repeat_hint: int | None = None,
 ) -> list[dict[str, Any]]:
     """Compile `recording_path` and write the step list to `steps_path` atomically.
     `repeat_hint` is the slice wording's "exactly N clicks" count (see
     repeat_hint_from_wording) — it pins a lone repeat cluster's count."""
     steps = _apply_repeat_hint(
         compile_recording(recording_path, max_steps=max_steps,
-                          emit_start_goto=emit_start_goto, loop=loop),
-        repeat_hint, loop=loop)
+                          emit_start_goto=emit_start_goto),
+        repeat_hint)
     _atomic_write(Path(steps_path), json.dumps(steps, indent=2))
     return steps
 
@@ -2476,6 +2506,9 @@ CALLOUT_SCROLL_PIN_JS = (_CALLOUT_SCROLL_PIN_TEMPLATE % json.dumps(CALLOUT_SCROL
 # After an interaction, give the slow React app a beat to open a menu / commit react-select
 # state / re-render before the next locator query, so replay doesn't outrun the UI.
 _SETTLE_MS = 400
+# Runaway bound for an "until it stops advancing" replay (repeat_click times=0). Reaching it
+# means the control never stopped, which is reported as a failure rather than a finished run.
+_UNTIL_DONE_CAP = 200
 # Budget for probing a non-final candidate selector: it should fail fast so a stale anchor falls
 # through to the durable fallback instead of eating the whole timeout.
 _PROBE_MS = 2500
@@ -3678,11 +3711,41 @@ async def _extract_value(page: Page, step: dict[str, Any], timeout_ms: int
 _REOPEN_MS = 8000
 
 
+def _preceding_commit(steps: list[dict[str, Any]], idx: int
+                      ) -> tuple[dict[str, Any], list[str]] | None:
+    """The fill (and the keys pressed after it) whose EFFECT the click at `idx` reads, or
+    None when no fill produced this target.
+
+    Only waits and presses may sit between: a click/select/scroll in the gap means the list
+    under the target came from that action, not from the fill, and the predecessor-click
+    rung owns it. A value still carrying an unresolved `{{noted:...}}` token is refused —
+    that token resolves from the live extract ledger at step-execution time, which this
+    recovery cannot reach, so re-typing it would write the token into the field.
+    """
+    presses: list[str] = []
+    for j in range(idx - 1, -1, -1):
+        action = steps[j].get("action")
+        if action == "press":
+            keys = str(steps[j].get("keys") or "")
+            if keys:
+                presses.insert(0, keys)
+            continue
+        if action == "wait":
+            continue
+        if action == "fill":
+            if _NOTED_TOKEN.search(str(steps[j].get("value") or "")):
+                return None
+            return steps[j], presses
+        return None
+    return None
+
+
 async def _click_with_flyout_recovery(
     page: Page, steps: list[dict[str, Any]], idx: int, timeout_ms: int
 ) -> tuple[str, dict[str, Any] | None, Page]:
-    """Click step `idx`, and if its target is unreachable, re-click the nearest PREVIOUS click
-    step once, then retry the target.
+    """Click step `idx`, and if its target is unreachable, re-drive whatever PRODUCED it —
+    the fill+keys that filtered the list, else the nearest previous click — then retry the
+    target once.
 
     This is the replay-engine version of the FLYOUT SUBMENUS recovery the agent prompt documents:
     submenu items (e.g. Sales under Inputs) exist only while their parent flyout is open, and any
@@ -3690,11 +3753,39 @@ async def _click_with_flyout_recovery(
     and this step's probe; re-probing the target alone (what _click_with_retry does) can never
     bring it back — only re-clicking its opener can. If the recovery also fails, the ORIGINAL
     error is raised so the report shows the real failure.
+
+    The COMMIT rung above it exists because that click rung answers the wrong question when
+    the target is a row in a FILTERED list. Run 20260828_144426 subtask 0: a slow app dropped
+    the `fill(search, "FOOD LIMITED") + Enter` commit (the search request was never issued),
+    the grid stayed unfiltered, and the ladder re-clicked `payroll` — a link inside a flyout
+    that had long since closed, so every rung failed while the step that actually produced
+    the list was never re-run. A fill is idempotent in a way a click is not (re-typing a
+    value writes the same value), and this rung only ever fires after the target failed all
+    its candidates AND all its retries — the page did not advance, so re-driving the
+    transition that failed to take is not a second submission of a successful one. The
+    `opens_tab` guard is the same one the click rung carries.
     """
     step = steps[idx]
     try:
         return await _click_and_follow(page, step, timeout_ms)
     except Exception as exc:  # noqa: BLE001
+        commit = None if step.get("opens_tab") else _preceding_commit(steps, idx)
+        if commit is not None:
+            fill_step, presses = commit
+            logger.info("click step %d unreachable (%s); re-issuing the fill that "
+                        "produced its list (%r), then retrying the target once",
+                        idx, str(exc)[:120], str(fill_step.get("value"))[:40])
+            try:
+                await _fill_with_retry(page, fill_step, _REOPEN_MS)
+                for keys in presses:
+                    await page.keyboard.press(keys)
+                await page.wait_for_timeout(_SETTLE_MS)
+                sel, healed = await _click_with_retry(page, step, _REOPEN_MS)
+                logger.info("↺ commit re-issue succeeded for step %d (%s)", idx, sel)
+                return sel, healed, page
+            except Exception as inner:  # noqa: BLE001 - fall through to the click rung
+                logger.info("commit re-issue did not bring step %d back (%s)",
+                            idx, str(inner)[:120])
         prev = next((steps[j] for j in range(idx - 1, -1, -1)
                      if steps[j].get("action") == "click"), None)
         if prev is None:
@@ -3793,6 +3884,18 @@ def _resolved_step(step: dict[str, Any], extracted: dict[str, str]) -> dict[str,
     return step
 
 
+def _note_interaction() -> None:
+    """Close the network collector's page-load window (agent_tools.note_interaction).
+
+    Lazy + best-effort by design: this module stays importable without the agent stack,
+    and outside a live run there is no collector to tell."""
+    try:
+        from automation.pipeline.agent_tools import note_interaction
+        note_interaction()
+    except Exception as exc:  # noqa: BLE001 - attribution must never break a replay
+        logger.debug("note_interaction unavailable: %s", exc)
+
+
 async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 15000) -> dict[str, Any]:
     """Execute compiled steps over a Playwright page. Returns {executed, failed_at, error, log}.
 
@@ -3809,8 +3912,42 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
     for idx, step in enumerate(steps):
         try:
             action = step["action"]
+            if action != "goto":
+                # This step is the segment TOUCHING the page, so anything the app posts
+                # from here on is attributable to it — see agent_tools.note_interaction.
+                # Before dispatch, not after: a step that saves right after a navigation
+                # must have its own write judged, not written off as page-load traffic.
+                _note_interaction()
             if action == "goto":
                 await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
+            elif action == "click" and step.get("until_done"):
+                # Recorded as "until it stops advancing": clicking until the target stops
+                # resolving IS the stop condition, so a longer list than the authoring run
+                # saw is walked to its own end instead of stopping at a frozen number.
+                done = 0
+                while done < _UNTIL_DONE_CAP:
+                    try:
+                        sel, healed, page = await _click_with_flyout_recovery(
+                            page, steps, idx, timeout_ms)
+                    except Exception as exc:  # noqa: BLE001 - target gone = list finished
+                        if not done:
+                            raise
+                        logger.info("↻ step %d: stopped advancing after %d click(s) (%s)",
+                                    idx, done, exc)
+                        break
+                    done += 1
+                    entry = {"step": idx, "action": action, "used": sel, "repeat": done}
+                    if healed:
+                        entry["healed"] = healed
+                    log.append(entry)
+                    await page.wait_for_timeout(_SETTLE_MS)
+                    if step.get("repeat_wait_s"):
+                        await page.wait_for_timeout(
+                            int(min(float(step["repeat_wait_s"]), 3.0) * 1000))
+                else:
+                    raise RuntimeError(
+                        f"step {idx}: still advancing after {_UNTIL_DONE_CAP} clicks — "
+                        f"refusing to report an unfinished run as complete")
             elif action == "click":
                 # Tier-0 parity for compiled repeats: N clicks with the recorded wait
                 # between (the tier-1 verb adds the readiness poll on top).

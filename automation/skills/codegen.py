@@ -141,7 +141,12 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
             handle = _handle_for(step, used)
             anchors[handle] = _anchor(step)
             count = int(step.get("count", 1))
-            if count > 1:
+            if step.get("until_done"):
+                # Recorded as "until it stops advancing" (repeat_click times=0): replay the
+                # INTENT, not the authoring run's number, or a longer list under-runs.
+                lines.append(f"    await api.repeat_until_done({handle!r}, "
+                             f"{float(step.get('repeat_wait_s', 0.0))!r})")
+            elif count > 1:
                 # A recorded "exactly N clicks" cadence: one faithful repeat verb, the
                 # recorded inter-click wait as its floor (api adds the readiness poll).
                 lines.append(f"    await api.repeat_click({handle!r}, {count}, "

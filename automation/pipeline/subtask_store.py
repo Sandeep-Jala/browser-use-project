@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("framework.subtask_store")
 
 LIBRARY_DIR = Path("library")
 LIBRARY_MANIFEST = LIBRARY_DIR / "manifest.json"
@@ -208,9 +211,19 @@ def save_alias(alias_sid: str, data: dict[str, Any]) -> None:
 
 
 def has_script(sid: str) -> bool:
-    """True when the entry has an executable body. Tier-1 code is the normal case; a steps
-    file exists only for entries the transpiler couldn't express (see codegen)."""
-    return code_path(sid).exists() or steps_path(sid).exists()
+    """True when the entry is REGISTERED and has an executable body. Tier-1 code is the
+    normal case; a steps file exists only for entries the transpiler couldn't express (see
+    codegen).
+
+    The manifest check is what makes a refused commit stick. A body on disk with no manifest
+    entry is an ORPHAN — the segment ran, its recording was compiled, and then a commit
+    guard rejected it (an unbindable runtime value, an unanchorable step). Run
+    20260828_124929 replayed such an orphan: the provenance guard had refused the Data
+    Request recording because it baked in a previous run's employee name, but the steps file
+    it left behind still answered True here, so the rejected script replayed anyway — ticking
+    the wrong employee and reporting ok=True. A guard that leaves its own bypass on disk is
+    not a guard."""
+    return (code_path(sid).exists() or steps_path(sid).exists()) and sid in load_manifest()
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -255,11 +268,27 @@ def load_manifest() -> dict[str, Any]:
         return {}
 
 
-def update_manifest(sid: str, template_prompt: str, **fields: Any) -> None:
+def update_manifest(sid: str, template_prompt: str, *, create: bool = False,
+                    **fields: Any) -> None:
     """Record/refresh a library entry in manifest.json (atomic write). Called only on
-    author/archive — per-run counters go in the entry's meta file, not here."""
+    author/archive — per-run counters go in the entry's meta file, not here.
+
+    `create=True` is required to REGISTER a new entry; without it an update to an
+    unregistered sid is dropped. Only the commit path may register, because only it has the
+    full entry (context, start_url, steps, params, bindings). The post-replay learners —
+    healed-selector promotion, end-title pinning — carry ONE field each, and before
+    2026-08-28 they would happily conjure an entry out of that single field: run
+    20260828_124929 ended up with a manifest entry holding nothing but an `end_title`
+    learned from a leftover tab, which then became the expected end state for every later
+    run of that subtask. A learner may refine a registered entry; it may not invent one."""
     data = load_manifest()
-    entry = data.get(sid, {})
+    entry = data.get(sid)
+    if entry is None:
+        if not create:
+            logger.debug("update_manifest: %s is not registered; dropping %s",
+                         sid, sorted(fields))
+            return
+        entry = {}
     entry.setdefault("template_prompt", " ".join(template_prompt.split()))
     entry.setdefault("created", datetime.now().isoformat(timespec="seconds"))
     entry.update(fields)

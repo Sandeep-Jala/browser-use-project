@@ -1745,3 +1745,95 @@ async def test_a_named_click_stamps_no_row(monkeypatch):
 
     assert not probed
     assert not ((res.metadata or {}).get("interacted_element") or {}).get("row")
+
+
+# ---------------- repeat_click: the live counter tool (2026-08-28) ----------------
+# Repetition had no first-class expression: the agent issued N clicks and the COMPILER
+# guessed from adjacency whether they were iterations or slow-app retries — a guess keyed on
+# `kind: loop`, itself inferred from wording. One counted call states the fact instead.
+
+
+def _ready(monkeypatch, verdicts):
+    """Script the between-clicks readiness probe. Each entry is (ready, why).
+
+    Also stubs ClickElementEvent: browser-use validates a real DOM node on construction, and
+    what is under test here is the COUNTING — how many clicks the tool issues and what it
+    reports — not browser-use's event model."""
+    seq = list(verdicts)
+
+    async def fake(_session, _node):
+        return seq.pop(0) if seq else (False, "the control left the page")
+    monkeypatch.setattr(agent_tools, "_repeat_ready", fake)
+    monkeypatch.setattr(agent_tools, "_REPEAT_SETTLE_S", 0)
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda **kw: object())
+
+
+async def test_counted_mode_clicks_exactly_n_times(monkeypatch):
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Save & Next")})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+    _ready(monkeypatch, [(True, "")] * 10)
+
+    res = await fn(index=4, times=6, browser_session=session)
+
+    assert len(clicks) == 6                          # exactly, not 5 and not 7
+    assert res.metadata["repeat"] == {"count": 6, "until_done": False,
+                                      "wait_s": agent_tools._REPEAT_SETTLE_S}
+    assert "6 of 6" in res.extracted_content
+
+
+async def test_until_done_stops_when_the_control_stops_advancing(monkeypatch):
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Next")})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+    # ready after clicks 1 and 2, gone after the third — a three-row list.
+    _ready(monkeypatch, [(True, ""), (True, ""), (False, "the control became disabled")])
+
+    res = await fn(index=4, times=0, browser_session=session)
+
+    assert len(clicks) == 3
+    assert res.metadata["repeat"]["until_done"] is True
+    assert res.metadata["repeat"]["count"] == 3      # the REAL number, reported
+    assert "stopped advancing" in res.extracted_content
+
+
+async def test_a_shortfall_is_an_error_and_never_compiles(monkeypatch):
+    """Asked for 6, the control died after 2. The clicks that landed are real, but a wrong
+    count must never become a cached step — so it rides the error channel with no_click."""
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Save & Next")})
+    session.event_bus.dispatch = lambda _e: _FakeEvent(None)
+    _ready(monkeypatch, [(True, ""), (False, "the control left the page")])
+
+    res = await fn(index=4, times=6, browser_session=session)
+
+    assert res.error and "only 2 of the 6" in res.error
+    assert res.metadata == {"no_click": True}
+    assert "repeat" not in (res.metadata or {})
+
+
+async def test_a_bad_index_refuses_without_clicking(monkeypatch):
+    _ready(monkeypatch, [])
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({})
+    res = await fn(index=99, times=3, browser_session=session)
+    assert res.error and "not available" in res.error
+    assert res.metadata == {"no_click": True}
+
+
+async def test_still_advancing_at_the_cap_is_a_failure_not_a_finished_list(monkeypatch):
+    """The until-done cap is a runaway bound. Reaching it means the list never ended, which
+    must not be reported as a complete run."""
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Next")})
+    session.event_bus.dispatch = lambda _e: _FakeEvent(None)
+    monkeypatch.setattr(agent_tools, "_REPEAT_HARD_CAP", 4)
+    _ready(monkeypatch, [(True, "")] * 10)
+
+    res = await fn(index=4, times=0, browser_session=session)
+
+    assert res.error and "safety cap" in res.error
+    assert res.metadata == {"no_click": True}
+

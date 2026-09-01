@@ -120,6 +120,21 @@ misclick: recovering costs go_back plus re-locating, and acting
 on the wrong element can corrupt the workflow entirely.
 
 ───────────────────────────────────────────────────────────
+REPEATING ONE CONTROL — use repeat_click, don't count yourself
+───────────────────────────────────────────────────────────
+When a step repeats ONE control (Save & Next through a run of
+employees, Next through the remaining rows), call repeat_click
+ONCE instead of clicking N times:
+  • repeat_click(index, times=N) for a stated number.
+  • repeat_click(index, times=0) when the task says "all the
+    remaining ..." and names no number — it clicks until the
+    control stops advancing and reports how many landed.
+It waits for the control to be clickable again between clicks,
+so a slow load delays the cadence instead of eating a click,
+and it cannot lose count the way a manual tally can. Read its
+receipt: it tells you exactly how many clicks landed.
+
+───────────────────────────────────────────────────────────
 SETTLE AFTER NAVIGATION — one wait, then re-look
 ───────────────────────────────────────────────────────────
 This app renders slowly. After a click that navigates or should
@@ -646,7 +661,6 @@ def scoped_subtask_prompt(
     downloads_file: bool = False,
     findings: list[str] | None = None,
     observe: bool = False,
-    loop: bool = False,
     conditional: bool = False,
     aux_tab: str | None = None,
 ) -> str:
@@ -667,11 +681,7 @@ def scoped_subtask_prompt(
     verify_download, never the receipt. `findings` are
     the observations earlier segments recorded ("prompt: outcome" lines) — the data a
     verify step compares against. `observe` marks a judge node: its done message must
-    carry the observed facts, because later segments receive it as a finding. `loop` marks
-    a loop node: the step repeats an action until its stated stop condition holds, so the
-    prompt carries the repeat-until contract and its generic done-condition (without it,
-    observation framing made the agent declare a loop done after one iteration).
-    `conditional` marks a branch-guard node (leading-"If" wording): when the stated
+    carry the observed facts, because later segments receive it as a finding. `conditional` marks a branch-guard node (leading-"If" wording): when the stated
     condition does not hold on the page, the correct outcome is an immediate no-op
     success — without saying so, the generic "done with success=true when the end state
     was not reached is a failed run" footer made the agent hunt for controls matching
@@ -780,19 +790,6 @@ def scoped_subtask_prompt(
             "outcome and fail the step over it. Later steps receive your message as "
             "recorded fact, so a bare 'done' or 'verified' without the observed values "
             "is a FAILED step."
-        )
-    if loop:
-        lines.append(
-            "\nThis is a LOOP step: it REPEATS an action until the stop condition stated "
-            "in YOUR ONLY JOB holds. Perform ONE iteration at a time; after EVERY "
-            "iteration read the page and check the stop condition against what is "
-            "actually shown. If it does not hold yet, do the next iteration. Do NOT stop "
-            "early, and NEVER jump ahead (e.g. clicking a row, name, or list entry) to "
-            "force the end state — only the repeated action itself may advance it. DONE "
-            "CONDITION: this step is complete ONLY when the stop condition holds on the "
-            "page. Reaching it may take MANY iterations — a long repetition is expected, "
-            "not a sign of being stuck. Your done message must state the final observed "
-            "state (the value/name shown when you stopped)."
         )
     if conditional:
         lines.append(

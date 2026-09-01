@@ -414,6 +414,31 @@ def test_rollup_accepted_final_write_passes():
     assert ck.receipt_rollup(hist, [])[0] is True
 
 
+def test_rollup_refused_final_write_waived_by_declaration():
+    """The declared allow_write_refusal waiver reaches the RECEIPT side of the same
+    judgment: a slice that declares its own error branch ends on a refused write, and
+    both write-acceptance rules must stand down for it — not just the network one."""
+    hist = _Hist(
+        _Item(_R(metadata={"write_outcome": {"fired": True, "accepted": False,
+                                             "t0": 0.0}})),
+        _Item(_R(is_done=True)),
+    )
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": json.dumps({"status": False, "message": "already submitted"})}]
+    assert ck.receipt_rollup(hist, window, allow_write_refusal=True) == (True, [])
+
+
+def test_rollup_waiver_does_not_excuse_a_refused_final_ACTION():
+    """The waiver is about WRITES. A tool that refused to click or fill is a different
+    failure and still contradicts a success claim."""
+    hist = _Hist(
+        _Item(_R(error="no_click: the element is detached", metadata={"no_click": True})),
+        _Item(_R(is_done=True)),
+    )
+    ok, reasons = ck.receipt_rollup(hist, [], allow_write_refusal=True)
+    assert ok is False and "REFUSED" in reasons[0]
+
+
 # ------------------------------- window_write_rollup -------------------------------
 
 
@@ -490,3 +515,69 @@ def test_save_cue_matches_stems_and_ignores_plain_reads():
     assert ck.save_cue("click Submit and wait") is True
     assert ck.save_cue("go to the section and read the employee name") is False
     assert ck.save_cue(None) is False
+
+
+# ----------------------- page attribution (the boot-traffic rule) -----------------------
+# Run 20260901_093026 seg 3: the subtask said "go to Pay Forecast, refresh, pick the
+# employee" — it writes nothing. The reload's own boot POST
+# (Addons/MSTeams/Subscribe -> 200 {"status": false, "message": "Outlook/Microsoft
+# authentication not found for current user."}) was the window's only business write, so
+# the rule read the APP's page-load traffic as the SEGMENT's failed save and stopped the
+# run. A write the page issued while loading, before the segment touched it, is not the
+# segment's work — the collector stamps `after_page_load` and business_writes drops it.
+
+
+def _boot(**extra):
+    return _write(url="https://x/api/Addons/MSTeams/Subscribe", after_page_load=True,
+                  **extra)
+
+
+def test_page_load_write_is_not_the_segments_work():
+    body = json.dumps({"status": False,
+                       "message": "Outlook/Microsoft authentication not found"})
+    assert ck.business_writes([_boot(body=body)]) == []
+    assert ck.window_write_rollup([_boot(body=body)]) == (True, [])
+
+
+def test_page_load_write_does_not_waive_a_real_refusal():
+    """The mirror hole: boot traffic must not VOUCH for the segment either. An accepted
+    subscribe on load says nothing about the save the segment then made."""
+    body = json.dumps({"status": False, "message": "already submitted"})
+    ok, reasons = ck.window_write_rollup([_boot(), _write(body=body)])
+    assert ok is False
+    assert "already submitted" in reasons[0]
+
+
+def test_write_after_an_interaction_is_still_judged():
+    body = json.dumps({"status": False, "message": "already submitted"})
+    ok, reasons = ck.window_write_rollup([_write(body=body, after_page_load=False)])
+    assert ok is False and "already submitted" in reasons[0]
+
+
+def test_unstamped_records_are_judged_exactly_as_before():
+    """Fail open: recordings and paths that never stamped the flag keep today's verdict —
+    an additive gate must not go blind on traffic it cannot attribute."""
+    body = json.dumps({"status": False, "message": "already submitted"})
+    ok, _ = ck.window_write_rollup([_write(body=body)])
+    assert ok is False
+
+
+async def test_write_accepted_check_ignores_page_load_traffic():
+    """Same attribution for the declared check: a `write_accepted` names the save the
+    SEGMENT was asked to make, and a write the page fired on load is not it."""
+    [res] = await ck.evaluate_checks(
+        None, [_write(url="https://x/api/Addons/Subscribe", after_page_load=True)],
+        one("write_accepted", "Subscribe"), poll=False)
+    assert res["ok"] is False
+
+
+async def test_page_load_write_cannot_waive_a_contradicting_receipt():
+    """receipt_rollup's escape hatch reads the window through the same lens — boot
+    traffic must not stand in for the save the agent's own receipt says never landed."""
+    hist = _Hist(
+        _Item(_R(metadata={"write_outcome": {"fired": True, "accepted": False,
+                                             "t0": 0.0}})),
+        _Item(_R(is_done=True)),
+    )
+    ok, reasons = ck.receipt_rollup(hist, [_write(after_page_load=True)])
+    assert ok is False and reasons

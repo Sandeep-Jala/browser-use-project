@@ -262,7 +262,7 @@ async def _replay_once(monkeypatch, *, titles, seg_ok=True):
 
     # Wipe the pin the authoring run left, to stand in for every entry committed before
     # this feature existed.
-    ss.update_manifest(sid, prompt, end_title=None)
+    ss.update_manifest(sid, prompt, create=True, end_title=None)
 
     # A failed replay hands over to the agent, so keep one queued for that path.
     # executed=1 on the failing replay makes the takeover DIRTY, so the agent path cannot

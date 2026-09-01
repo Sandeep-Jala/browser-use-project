@@ -315,6 +315,74 @@ def match_template(
     return matches[0][0]
 
 
+def _has_text_scopes(selector: str) -> list[tuple[int, int]]:
+    """The (start, just-past-the-close-paren) span of every `:has-text(...)` in `selector`.
+    Quote- and nesting-aware, because a row's text can itself contain parentheses."""
+    spans: list[tuple[int, int]] = []
+    marker, i = ":has-text(", 0
+    while (j := selector.find(marker, i)) >= 0:
+        k, depth, quote = j + len(marker), 1, ""
+        while k < len(selector) and depth:
+            c = selector[k]
+            if quote:
+                if c == "\\":
+                    k += 1
+                elif c == quote:
+                    quote = ""
+            elif c in "\"'":
+                quote = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            k += 1
+        spans.append((j, k))
+        i = k
+    return spans
+
+
+def _token_names_the_target(raw_selectors: list[str], token: str) -> bool:
+    """Does `{{token}}` identify the element these selectors ACT ON, rather than only the
+    row they are scoped to?
+
+    The single-token stamp below reads a click's lone parameter as "the element NAMED
+    <value>" and makes _resolve verify the landed element against it. That is right when
+    the token names the target (`role=link[name="{{business}}"]` — the FOOD LIMITED /
+    FUNFOOD LIMITED wrong-row bug it was built for) and WRONG when the token sits in a
+    `:has-text(...)` ROW SCOPE with a descendant part after it: there the value names the
+    row and the target is deliberately anonymous. Run 20260828_153xxx died exactly there —
+    `[role="row"]:has-text("Preston Alexander") div[data-automationid="DetailsRowCheck"]`
+    resolved to the ONE correct checkbox and the stamp then rejected it, because a Fluent
+    DetailsRowCheck div carries no readable name at all. The scope is already the wrong-row
+    guard (see script_compile._is_row_scoped, which denies that selector family the
+    ambiguity concession for the same reason), so no name gate is owed on top of it.
+
+    One occurrence anywhere that names the target is enough to keep the stamp: a candidate
+    ladder that mixes `... :has-text("{{x}}") button` with `role=link[name="{{x}}"]` still
+    needs the gate for the second candidate's sake.
+    """
+    needle = "{{%s}}" % token
+    for sel in raw_selectors:
+        scopes = _has_text_scopes(sel)
+        start = 0
+        while (p := sel.find(needle, start)) >= 0:
+            start = p + len(needle)
+            in_row_scope = False
+            for a, b in scopes:
+                if not a < p < b:
+                    continue
+                tail = sel[b:]
+                # A descendant part after the scope means the target lives INSIDE the
+                # matched row. A chained pseudo-class (`:visible`) still targets the row.
+                if tail.strip() and (tail[:1].isspace()
+                                     or tail.lstrip()[:1] in (">", "+", "~")):
+                    in_row_scope = True
+                    break
+            if not in_row_scope:
+                return True
+    return False
+
+
 def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[str, Any]] | None:
     """Fill a template's {{param}} tokens from `values` (defaults fill the gaps).
 
@@ -353,7 +421,8 @@ def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[s
             new_step["selectors"] = [_sub(s, escape=True) for s in new_step["selectors"]]
             if new_step.get("action") == "click" and len(token_names) == 1:
                 (name,) = token_names
-                if name in merged:
+                if name in merged and _token_names_the_target(
+                        step.get("selectors") or [], name):
                     # This click means "the element NAMED <value>" — selector fallbacks
                     # (positional xpaths, stale hrefs) resolve confidently to the WRONG
                     # row when the value changed (observed live: business FOOD LIMITED

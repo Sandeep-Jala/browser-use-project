@@ -79,6 +79,7 @@ class FakeSession:
         self.started = datetime.now()
         self.collectors = []
         self.replay_calls = 0
+        self.replay_branch = []      # `branch` flag each replay was given
         self.agent_calls = 0
         self.findings_seen = []
         self.record_paths = []
@@ -116,9 +117,10 @@ class FakeSession:
         self.events.append(("probe", check.arg))
         return self.probes.pop(0)
 
-    async def replay_segment(self, sub, sid, context, skill, gate):
+    async def replay_segment(self, sub, sid, context, skill, gate, branch=False):
         self.events.append(("replay",))
         self.replay_calls += 1
+        self.replay_branch.append(branch)
         seg = self.replays.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
         seg.prompt = sub.instantiated_prompt
@@ -167,7 +169,7 @@ def _runner():
 def _seed_entry(sid, steps=None):
     ss.steps_path(sid).parent.mkdir(parents=True, exist_ok=True)
     ss.steps_path(sid).write_text(json.dumps(steps or [{"action": "wait", "seconds": 1.0}]))
-    ss.update_manifest(sid, "prompt", context="/x")
+    ss.update_manifest(sid, "prompt", create=True, context="/x")
 
 
 def _sid_for(sub_prompt, context="/section"):
@@ -288,12 +290,15 @@ async def test_entry_is_retired_only_after_repeated_clean_failures(stores, monke
 
 
 async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
-    """A verification subtask must run live even when a (legacy, hollow) library entry
-    exists for it, and nothing of it may be recorded or committed."""
+    """A DECLARED verification subtask must run live even when a (legacy, hollow) library
+    entry exists for it, and nothing of it may be recorded or committed.
+
+    `kind: judge` is the declaration — since 2026-08-28 the wording is not read at all, so
+    this slice would be an ordinary recorded action without it."""
     prompt = "go to the section. verify the CC field matches the noted mail"
     spec = TaskSpec(key="j", prompt=prompt, subtasks=(
         SubtaskDecl(prompt="go to the section."),
-        SubtaskDecl(prompt="verify the CC field matches the noted mail"),
+        SubtaskDecl(prompt="verify the CC field matches the noted mail", kind="judge"),
     ))
     ctx = ss.normalize_context("http://app/section")
     judge_sid = ss.subtask_id(spec.subtasks[1].prompt, ctx)
@@ -315,94 +320,10 @@ async def test_judge_node_never_replays_never_commits(stores, monkeypatch):
     assert json.loads(ss.steps_path(judge_sid).read_text()) == hollow
 
 
-async def test_loop_node_records_commits_and_replays(stores, monkeypatch):
-    """Loops CACHE (user decision 2026-08-25), reversing the older never-cached rule.
-
-    What the entry stores is the iteration count the authoring agent stopped at; the
-    user's position is that a recording replays in the setting it was made in, so that
-    count holds. Overshoot stays honest for free — repeat_click's readiness poll raises
-    when the control runs out early. An UNDER-run stops quietly at the cached count; no
-    guard was built for that, by decision."""
-    loop_line = ("process the employees one at a time by clicking Save and Next, and "
-                 "after each click check that the next employee has loaded, stopping "
-                 "as soon as Owen Millar is the employee shown")
-    prompt = "go to the section. " + loop_line
-    spec = TaskSpec(key="l", prompt=prompt, subtasks=(
-        SubtaskDecl(prompt="go to the section."),
-        SubtaskDecl(prompt=loop_line),
-    ))
-    ctx = ss.normalize_context("http://app/section")
-    loop_sid = ss.subtask_id(loop_line, ctx)
-    cached = [{"action": "click", "selectors": ["css=#save-next"], "count": 5}]
-    _seed_entry(loop_sid, cached)
-
-    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")],
-                       replays=[_seg(True)])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
-
-    assert result.is_successful is True
-    # The loop REPLAYED its entry instead of running the agent — and still reports as a
-    # loop, which it did not before replay_segment carried the kind through.
-    assert [s["kind"] for s in result.subtasks] == ["action", "loop"]
-    assert fake.replay_calls == 1
-    assert result.subtasks[1]["mode"] == "replay"
-    assert result.subtasks[1]["skip_reason"] is None
 
 
-async def test_a_loop_that_authors_gets_a_recording_path(stores, monkeypatch):
-    """The other half: a loop with no entry must RECORD. `commit=False` used to null the
-    record path, so loop segments wrote no history at all — nothing to cache even if the
-    commit gate opened."""
-    loop_line = ("process the employees one at a time by clicking Save and Next, and "
-                 "after each click check that the next employee has loaded, stopping "
-                 "as soon as Owen Millar is the employee shown")
-    prompt = "go to the section. " + loop_line
-    spec = TaskSpec(key="l2", prompt=prompt, subtasks=(
-        SubtaskDecl(prompt="go to the section."),
-        SubtaskDecl(prompt=loop_line),
-    ))
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub(
-        [{"action": "click", "selectors": ["css=#save-next"], "count": 5}]))
-    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
-                                          _seg(True, mode="authored")])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
-
-    assert result.is_successful is True
-    assert fake.record_paths[1] is not None       # it recorded
-    ctx = ss.normalize_context("http://app/section")
-    assert ss.subtask_id(loop_line, ctx) in ss.load_manifest()   # ...and committed
 
 
-async def test_conditional_guard_never_replays_never_commits(stores, monkeypatch):
-    """A leading-"If" branch guard must run live even when a library entry exists (a
-    TRUE-branch recording would replay its branch unconditionally on every run), and a
-    TRUE-branch run must never commit one."""
-    cond_line = ("If you see an error about the minimum wage rate, click Add Payment, "
-                 "set Amount to 5000, and click Save and Next")
-    prompt = "go to the section. " + cond_line
-    spec = TaskSpec(key="c", prompt=prompt, subtasks=(
-        SubtaskDecl(prompt="go to the section."),
-        SubtaskDecl(prompt=cond_line),
-    ))
-    ctx = ss.normalize_context("http://app/section")
-    cond_sid = ss.subtask_id(cond_line, ctx)
-    branch = [{"action": "click", "selector": "#add-payment"}]   # the TRUE branch, baked
-    _seed_entry(cond_sid, branch)
-
-    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
-                                          _seg(True, mode="authored")])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
-
-    assert result.is_successful is True
-    assert fake.replay_calls == 0 and fake.agent_calls == 2
-    # Conditionality is a routing predicate, not a node kind: the segment stays "action".
-    assert [s["kind"] for s in result.subtasks] == ["action", "action"]
-    assert fake.record_paths[1] is None
-    assert not ss.recording_path(cond_sid).exists()
-    assert json.loads(ss.steps_path(cond_sid).read_text()) == branch
 
 
 async def test_repin_after_dead_main_page_realigns_recording_focus():
@@ -923,37 +844,6 @@ NOTED_SPEC = TaskSpec(
 )
 
 
-async def test_noted_data_consumer_never_replays_and_retires_entry(stores, monkeypatch):
-    """A subtask that USES data noted by an earlier segment must not replay its cached
-    recording (it would type the AUTHORING run's stale values — the observed Add Employee
-    bug): the stale entry is retired and the agent runs the segment with this run's fresh
-    findings. The fresh recording IS taken now (the provenance guard decides commit), but
-    with nothing bindable in it the guard refuses and nothing enters the library."""
-    ctx = ss.normalize_context("http://app/section")
-    consumer_sid = ss.subtask_id(NOTED_SPEC.subtasks[1].prompt, ctx)
-    _seed_entry(consumer_sid)   # concrete values baked by a previous authoring run
-
-    fake = FakeSession(_runner(), agents=[
-        _seg(True, mode="authored", finding="generated_name = Kerris McKay"),
-        _seg(True, mode="authored"),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), NOTED_PROMPT, spec=NOTED_SPEC)
-
-    assert result.is_successful is True
-    assert fake.replay_calls == 0 and fake.agent_calls == 2
-    # The consumer agent received the producer's fresh observation.
-    assert fake.findings_seen[1] == [
-        "open the generator and note the generated identity.: "
-        "generated_name = Kerris McKay"]
-    # Stale entry retired; the guard-refused fresh recording committed nothing.
-    assert not ss.has_script(consumer_sid)
-    assert consumer_sid not in ss.load_manifest()
-    assert list((ss.LIBRARY_DIR / "archive").glob(f"{consumer_sid}.steps.*.json"))
-    # The consumer DID record (to the temp path) — commit is the guard's call now.
-    assert fake.record_paths[1] is not None
-    assert result.subtasks[1]["mode"] == "authored"
-    assert result.subtasks[1]["skip_reason"] == "dynamic"
 
 
 async def test_noted_consumer_replays_when_nothing_was_noted_this_run(stores, monkeypatch):
@@ -998,54 +888,6 @@ def _fill_steps_stub(steps):
     return stub
 
 
-async def test_consumer_with_structured_source_commits_bindings_then_replays(
-        stores, monkeypatch):
-    """The 2026-07-24 runtime-bindings reversal, completed: a consumer segment whose
-    runtime values ALL bind to a structured source (an extract label this run captured)
-    commits WITH bindings — and the next run replays it zero-LLM, resolving the bound
-    value from its OWN fresh data instead of the authoring run's literal."""
-    ctx = ss.normalize_context("http://app/section")
-    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
-        {"action": "fill", "selectors": ["css=#name"], "value": "Kerris McKay"},
-        {"action": "click", "selectors": ['text="Save"']},
-    ]))
-
-    fake = FakeSession(_runner(), agents=[
-        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
-             extracted={"generated_name": "Kerris McKay"}),
-        _seg(True, mode="authored"),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
-                                   spec=BOUND_SPEC)
-
-    assert result.is_successful is True
-    entry = ss.load_manifest()[consumer_sid]
-    assert entry["bindings"] == {"bound_1": {"kind": "extract",
-                                             "label": "generated_name"}}
-    assert entry["params"] == {"bound_1": "Kerris McKay"}
-    assert entry["start_url"] == "http://app/section"
-    # The committed template carries the token, not the authoring literal (the tier-1
-    # transpiler may consume steps.json into a code skill; the template is canonical).
-    tmpl = json.loads(ss.template_path(consumer_sid).read_text())
-    assert tmpl["steps"][0]["value"] == "{{bound_1}}"
-    assert result.subtasks[1]["skip_reason"] == "dynamic"
-
-    # Next run: the producer's fresh extract resolves the binding -> zero-LLM replay.
-    fake2 = FakeSession(_runner(), replays=[
-        _seg(True, finding="generated_name = Struan Boyd",
-             extracted={"generated_name": "Struan Boyd"}),
-        _seg(True),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake2))
-    result2 = await run_hybrid_task(fake2.runner or _runner(), BOUND_PROMPT,
-                                    spec=BOUND_SPEC)
-
-    assert result2.is_successful is True
-    assert fake2.replay_calls == 2 and fake2.agent_calls == 0
-    assert result2.subtasks[1]["mode"] == "replay"
-    assert result2.subtasks[1]["skip_reason"] is None
 
 
 async def test_pasted_otp_binds_where_six_one_character_fills_could_not(
@@ -1100,95 +942,10 @@ async def test_pasted_otp_binds_where_six_one_character_fills_could_not(
     assert result2.subtasks[1]["mode"] == "replay"
 
 
-async def test_six_one_character_fills_are_still_refused(stores, monkeypatch, capsys):
-    """The regression guard for the OTHER half of that diagnosis: without a paste there is
-    still nothing to bind, and the segment must keep authoring rather than cache six digits
-    that were only ever valid for one run."""
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub(
-        [{"action": "fill",
-          "selectors": [f'css=[aria-label="Please enter OTP character {n}"]'],
-          "value": d}
-         for n, d in enumerate("502956", start=1)]))
-    fake = FakeSession(_runner(), agents=[
-        _seg(True, mode="authored", finding="otp = 502956",
-             extracted={"otp": "502956\nSelect Employee"}),
-        _seg(True, mode="authored"),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT, spec=BOUND_SPEC)
-
-    ctx = ss.normalize_context("http://app/section")
-    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
-    assert consumer_sid not in ss.load_manifest()
-    assert "no bindable runtime value" in capsys.readouterr().out
 
 
-async def test_consumer_commit_drops_a_typed_value_that_has_no_provenance(
-        stores, monkeypatch, capsys):
-    """A typed value that is neither prompt-sourced nor bindable is DROPPED from the
-    recording, and the rest of the segment commits (user-approved 2026-08-24, replacing
-    the blanket refusal).
-
-    Baking such a literal stays forbidden — that is the DR021/DR022 wrong-record class,
-    and it is unrecoverable: the authoring run's value keeps saving fine, so the replay
-    never fails and archive_if_failing never retires it. Dropping the step is the
-    self-correcting alternative. An optional field simply stays empty (the Add Employee
-    County case: fakenamegenerator supplies no county, so the agent invents one and that
-    one value refused the whole commit on every run). A field that turns out to be
-    REQUIRED makes the save fail, and two consecutive failures archive the entry so the
-    next run authors a clean replacement."""
-    ctx = ss.normalize_context("http://app/section")
-    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
-        {"action": "fill", "selectors": ["css=#name"], "value": "Kerris McKay"},
-        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
-        {"action": "click", "selectors": ['text="Save"']},
-    ]))
-
-    fake = FakeSession(_runner(), agents=[
-        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
-             extracted={"generated_name": "Kerris McKay"}),
-        _seg(True, mode="authored"),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
-                                   spec=BOUND_SPEC)
-
-    assert result.is_successful is True
-    entry = ss.load_manifest()[consumer_sid]
-    assert entry["bindings"] == {"bound_1": {"kind": "extract",
-                                             "label": "generated_name"}}
-    # The invented county is gone; the bindable value survives as its token.
-    tmpl = json.loads(ss.template_path(consumer_sid).read_text())
-    values = [st.get("value") for st in tmpl["steps"] if st.get("action") == "fill"]
-    assert values == ["{{bound_1}}"]
-    assert "Merseyside" not in json.dumps(tmpl)
-    assert "dropped unattributable typed value(s) Merseyside" in capsys.readouterr().out
 
 
-async def test_consumer_commit_still_refused_when_nothing_binds(stores, monkeypatch):
-    """Dropping the unattributable values must not turn a segment with NO runtime
-    provenance at all into a cacheable one: with nothing left to bind, a consumer
-    recording keeps the pre-bindings behaviour and authors fresh every run."""
-    ctx = ss.normalize_context("http://app/section")
-    consumer_sid = ss.subtask_id(BOUND_SPEC.subtasks[1].prompt, ctx)
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
-        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
-        {"action": "click", "selectors": ['text="Save"']},
-    ]))
-
-    fake = FakeSession(_runner(), agents=[
-        _seg(True, mode="authored", finding="generated_name = Kerris McKay",
-             extracted={"generated_name": "Kerris McKay"}),
-        _seg(True, mode="authored"),
-    ])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), BOUND_PROMPT,
-                                   spec=BOUND_SPEC)
-
-    assert result.is_successful is True
-    assert consumer_sid not in ss.load_manifest()
-    assert not ss.has_script(consumer_sid)
 
 
 async def test_identity_fork_detected_when_wording_recorded_elsewhere(
@@ -1200,7 +957,7 @@ async def test_identity_fork_detected_when_wording_recorded_elsewhere(
     ss.steps_path(other_sid).parent.mkdir(parents=True, exist_ok=True)
     ss.steps_path(other_sid).write_text(
         json.dumps([{"action": "wait", "seconds": 1.0}]))
-    ss.update_manifest(other_sid, SPEC.subtasks[0].prompt, context="/other",
+    ss.update_manifest(other_sid, SPEC.subtasks[0].prompt, create=True, context="/other",
                        start_url="http://app/other")
 
     fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
@@ -1422,20 +1179,14 @@ def test_segment_step_budget_marker_headroom():
                                     postcondition={"url_contains": "x"}), 25) == 25
 
 
-def test_segment_step_budget_loop_headroom():
-    """A loop segment's one budget must cover EVERY iteration, and an iteration is not
-    one click: run 20260824_165824 measured 10 agent steps to fill one employee's three
-    portal dialogs, against a 12-employee list. Judge and action nodes stay flat; marker
-    and loop headroom stack."""
-    from automation.pipeline.hybrid import segment_step_budget
-
-    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") == 145
-    assert segment_step_budget(Gate(kind="steps"), 25, kind="judge") == 25
-    assert segment_step_budget(Gate(kind="marker", marker="Payroll"), 25,
-                               kind="loop") == 155
-    # 12 employees x the measured 10 steps each, with the base left over for setup and
-    # recovery — the shape the old 60-step ceiling starved.
-    assert segment_step_budget(Gate(kind="steps"), 25, kind="loop") >= 12 * 10
+def test_step_budget_has_no_loop_headroom_any_more():
+    """The +120 loop budget existed because a 12-iteration slice cost 12 agent steps. One
+    repeat_click call costs one, so the headroom went with the `loop` kind (2026-08-28) —
+    and the ceiling is a runaway guard again for every segment."""
+    assert hybrid.segment_step_budget(Gate(kind="steps"), 25) == 25
+    assert hybrid.segment_step_budget(Gate(kind="steps"), 25, "judge") == 25
+    # A marker gate still gets its own headroom; that is measured, not wording-derived.
+    assert hybrid.segment_step_budget(Gate(kind="marker", marker="/Invoices"), 25) > 25
 
 
 # ------------------------------- unit: gates -------------------------------
@@ -1857,25 +1608,6 @@ _NOTING_SPEC = TaskSpec(
 )
 
 
-async def test_noting_segment_without_an_extract_refuses_the_commit(stores, monkeypatch,
-                                                                    capsys):
-    """Prose-only noting must not cache. Its replay would report nothing, the run's
-    findings would go quiet, and the consumer gate — which keys on bool(findings) — would
-    let every downstream consumer replay THIS run's stale values instead."""
-    monkeypatch.setattr(hybrid, "save_steps", _fill_steps_stub([
-        {"action": "click", "selectors": ["xpath=/html/body/button"]},
-    ]))
-    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored"),
-                                          _seg(True, mode="authored")])
-    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
-    result = await run_hybrid_task(fake.runner or _runner(), PROMPT, spec=_NOTING_SPEC,
-                                   marker="Invoices")
-
-    assert result.is_successful is True          # the run itself is fine
-    noting_sid = ss.subtask_id(_NOTING_SPEC.subtasks[0].prompt,
-                               ss.normalize_context("http://app/start"))
-    assert noting_sid not in ss.load_manifest()  # the noting segment cached nothing
-    assert "NOTES a value" in capsys.readouterr().out
 
 
 async def test_noting_segment_with_an_extract_commits(stores, monkeypatch):
@@ -1896,3 +1628,191 @@ async def test_noting_segment_with_an_extract_commits(stores, monkeypatch):
     assert committed, "a noting slice WITH an extract step must be cacheable"
     assert any("note the reference number" in e["template_prompt"]
                for e in committed.values())
+
+
+
+# --------------------- conditional branch: tolerant replay ---------------------
+# A conditional slice ("If a popup appears, tick X and click Process") records the TRUE
+# branch on the run where the popup showed. Its recording IS the branch — there is nothing
+# else in it — so the FIRST recorded action doubles as the condition's own test: if that
+# element is not on the page, the condition is not raised and the whole branch is a no-op.
+# Failing AFTER something acted is different: the branch WAS raised and we could not finish
+# it, which is a real failure and must stay one.
+
+def _branch_sub(prompt=_PROBE_COND_LINE):
+    return Subtask(index=1, template_prompt=prompt, values={})
+
+
+async def _replay_with(monkeypatch, outcome, *, branch, prompt=_PROBE_COND_LINE):
+    hs = hybrid.HybridSession(_runner())
+    hs.runner.config.reveal_hidden_controls = False
+    hs._main_page = SimpleNamespace()
+
+    async def fake_eval(js):
+        return None
+
+    hs._main_page.evaluate = fake_eval
+    hs.current_page = lambda: hs._main_page
+
+    async def fake_execute(skill, page, *a, **k):
+        return outcome
+
+    async def fake_adopt(sub):
+        return None
+
+    monkeypatch.setattr(hybrid.skills, "execute", fake_execute)
+    monkeypatch.setattr(hs, "adopt_announced_tab", fake_adopt)
+    monkeypatch.setattr(hs, "network_watermark", lambda: 0)
+    monkeypatch.setattr(hs, "downloads_watermark", lambda: 0)
+    monkeypatch.setattr(hs, "requests_since", lambda m: [])
+    monkeypatch.setattr(hs, "downloads_since", lambda m: [])
+    return await hs.replay_segment(_branch_sub(prompt), "sid", "/ctx",
+                                   SimpleNamespace(body="steps", steps=[], sid="sid"),
+                                   Gate(kind="steps"), branch=branch)
+
+
+async def test_branch_replay_passes_when_nothing_acted(monkeypatch):
+    """No popup: the first recorded click resolves nothing, so the branch never applied."""
+    seg = await _replay_with(monkeypatch, {
+        "executed": 0, "failed_at": 0, "log": [],
+        "error": 'no unique candidate matched: css=[id=process] -> no match'},
+        branch=True)
+    assert seg.ok is True
+    assert seg.skip_reason == "branch_absent"
+    assert seg.steps_executed == 0
+    assert seg.error is None
+    assert seg.gate["raised"] is False
+
+
+async def test_branch_replay_still_fails_once_a_step_acted(monkeypatch):
+    """Popup WAS there (the tick landed) but Process could not be clicked — a real failure:
+    the branch was raised and left half-done, which must not be waved through."""
+    seg = await _replay_with(monkeypatch, {
+        "executed": 1, "failed_at": 1,
+        "log": [{"step": 0, "action": "click", "used": "css=[id=dontshow]"}],
+        "error": 'no unique candidate matched: css=[id=process] -> no match'},
+        branch=True)
+    assert seg.ok is False
+    assert seg.skip_reason is None
+    assert "no unique candidate" in seg.error
+
+
+async def test_non_branch_replay_never_gets_the_concession(monkeypatch):
+    """An ordinary action slice failing on its first step is still a failure — the
+    concession is only sound where the recording is a conditional branch."""
+    seg = await _replay_with(monkeypatch, {
+        "executed": 0, "failed_at": 0, "log": [],
+        "error": 'no unique candidate matched: css=[id=save] -> no match'},
+        branch=False, prompt="Click Save.")
+    assert seg.ok is False
+    assert seg.skip_reason is None
+
+
+async def test_unprobed_conditional_replays_with_the_branch_concession(stores, monkeypatch):
+    """The wiring: a conditional slice that declares NO probe still caches and replays —
+    the user's requirement is that the branch is always saved as a recording — but it
+    replays with branch=True, so a run without the popup resolves as "not raised" instead
+    of failing. Wording is what identifies it (decompose.is_conditional_guard)."""
+    prompt = "go to the section. " + _PROBE_COND_LINE
+    spec = TaskSpec(key="p", prompt=prompt, subtasks=(
+        SubtaskDecl(prompt="go to the section."),
+        SubtaskDecl(prompt=_PROBE_COND_LINE),
+    ))
+    ctx = ss.normalize_context("http://app/section")
+    _seed_entry(ss.subtask_id(_PROBE_COND_LINE, ctx),
+                [{"action": "click", "selector": "#process"}])
+
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")],
+                       replays=[_seg(True, executed=1)])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.is_successful is True
+    assert fake.replay_calls == 1
+    assert fake.replay_branch == [True]          # the concession was granted
+
+
+async def test_ordinary_slice_replays_without_the_branch_concession(stores, monkeypatch):
+    """An action slice must never get it: its first step failing is a real failure."""
+    prompt = "Click Save."
+    spec = TaskSpec(key="p", prompt=prompt,
+                    subtasks=(SubtaskDecl(prompt="Click Save."),))
+    ctx = ss.normalize_context("http://app/section")
+    _seed_entry(ss.subtask_id("Click Save.", ctx),
+                [{"action": "click", "selector": "#save"}])
+
+    fake = FakeSession(_runner(), replays=[_seg(True, executed=1)])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert fake.replay_calls == 1
+    assert fake.replay_branch == [False]
+
+
+# --------------------- declared allow_write_refusal waiver ---------------------
+# A slice whose own wording declares an error branch ("click Submit. if it shows an
+# error, click cancel") ends legitimately on a REFUSED write. The window write rule
+# cannot know that — it judges traffic and never reads prose, which is exactly what
+# makes it hold for undeclared tasks — so the task author declares the exemption.
+
+async def test_declared_waiver_passes_a_refused_only_window():
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": '{"status": false, "message": "already submitted"}'}]
+    gate = Gate(kind="steps", allow_write_refusal=True)
+    ok, detail = await evaluate_gate(gate, steps_ok=True, page=None,
+                                     requests_window=window)
+    assert ok is True
+    # Reported, never swallowed: the run's report still carries the server's refusal.
+    assert "already submitted" in detail["write_rollup"][0]
+
+
+async def test_declared_waiver_is_scoped_to_the_write_rule():
+    """The waiver exempts the write rule and nothing else — a segment whose steps
+    failed still fails."""
+    gate = Gate(kind="steps", allow_write_refusal=True)
+    ok, _ = await evaluate_gate(gate, steps_ok=False, page=None, requests_window=[])
+    assert ok is False
+
+
+def test_segment_gate_carries_the_declared_waiver():
+    waived = Subtask(index=0, template_prompt="click Submit; if it errors click cancel",
+                     allow_write_refusal=True)
+    assert segment_gate(waived, None, "/x").allow_write_refusal is True
+    plain = Subtask(index=0, template_prompt="click Submit")
+    assert segment_gate(plain, None, "/x").allow_write_refusal is False
+
+
+async def test_waived_refusal_is_never_a_failure_reason():
+    """A waived refusal is evidence in the report, never a verdict. When a waived
+    segment fails for some other reason (its steps did not complete), the refusal it was
+    explicitly told to tolerate must not be handed back as the explanation."""
+    window = [{"method": "POST", "url": "http://api/Years/27/FPS", "status": 200,
+               "body": '{"status": false, "message": "already submitted"}'}]
+    gate = Gate(kind="steps", allow_write_refusal=True)
+    ok, detail = await evaluate_gate(gate, steps_ok=False, page=None,
+                                     requests_window=window)
+    assert ok is False                      # the steps floor failed
+    assert "already submitted" in detail["write_rollup"][0]   # still reported
+    assert hybrid._check_failure_reason(detail) is None       # but never the reason
+
+
+async def test_waived_refusal_segment_is_not_committed(stores, monkeypatch):
+    """A waived segment passes and the run continues, but its recording ends on the
+    error branch ("click cancel"), so it must not enter the library: replaying that
+    Cancel against a run where the write is ACCEPTED would fail and re-author anyway."""
+    waived = _seg(True, mode="authored")
+    waived.gate = {"kind": "steps",
+                   "write_rollup": ['... last refusal: "already submitted"'],
+                   "write_refusal_waived": True}
+    fake = FakeSession(_runner(), agents=[waived, _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    # The run did not stop: both subtasks ran.
+    assert fake.agent_calls == 2
+    assert [s["ok"] for s in result.subtasks] == [True, True]
+    # Only the second segment was committed.
+    manifest = ss.load_manifest()
+    assert len(manifest) == 1
+    waived_sid = _sid_for(SPEC.subtasks[0].prompt)
+    assert waived_sid not in manifest and not ss.has_script(waived_sid)

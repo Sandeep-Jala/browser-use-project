@@ -1933,50 +1933,8 @@ def test_the_label_reader_ignores_elements_edges_and_icon_glyphs():
     assert _sm_preceding_label("Interactive elements:\n\tName\n\t*[9]<select />", 9) == "Name"
 
 
-def test_a_loop_recording_counts_adjacent_clicks_as_iterations(tmp_path):
-    """Loops cache as of 2026-08-25, and what they cache is the iteration COUNT. But
-    _push_step drops back-to-back clicks on one target as slow-app retries, so an eleven
-    employee walk that the agent ran without pausing would have compiled to a SINGLE click
-    and the cached entry would stop after one. On a loop recording, adjacency is iteration."""
-    nxt = {"node_name": "BUTTON", "attributes": {"id": "next"}, "ax_name": "Next"}
-    history = [_item({"click": {"index": 7}}, element=nxt) for _ in range(11)]
-
-    as_action = compile_recording(_write(tmp_path, history), emit_start_goto=False)
-    assert [s.get("count", 1) for s in as_action] == [1]     # retries collapse
-
-    as_loop = compile_recording(_write(tmp_path, history), emit_start_goto=False, loop=True)
-    assert len(as_loop) == 1
-    assert as_loop[0]["count"] == 11                          # ...iterations accumulate
 
 
-def test_a_loops_wait_separated_clicks_count_the_same_either_way(tmp_path):
-    """The pre-existing cadence rule is untouched: clicks separated by a recorded wait
-    already accumulated, loop or not."""
-    nxt = {"node_name": "BUTTON", "attributes": {"id": "next"}, "ax_name": "Next"}
-    history = []
-    for _ in range(3):
-        history.append(_item({"click": {"index": 7}}, element=nxt))
-        history.append(_item({"wait": {"seconds": 1}}))
-
-    for loop in (False, True):
-        steps = compile_recording(_write(tmp_path, history), emit_start_goto=False,
-                                  loop=loop)
-        clicks = [s for s in steps if s["action"] == "click"]
-        assert clicks[0]["count"] == 3, (loop, steps)
-
-
-# ------- relabelled control at one position + the loop node's dissolved count -------
-# Run 20260827_091313 subtask 8 ("click Next for all of the remaining employees … then
-# click submit"): the app renders Submit at the SAME DOM position as Next — it swaps the
-# button's label on the last employee. Recorded faithfully (11x ax_name="Next", then
-# ax_name="Submit", all at .../div[2]/button[2]), the compiler lost both facts:
-#   A. _push_step keys repeats on `selectors` ALONE, so the Submit was absorbed as an
-#      11th "Next" iteration and its identity discarded.
-#   B. save_steps never forwarded `loop` to _apply_repeat_hint, so the cluster dissolved
-#      to one click whatever the node kind — kind=loop compiled byte-identically to
-#      kind=action, voiding the loop contract (the authoring run's iteration count IS the
-#      cached artifact).
-# Net: 11 Next + 1 Submit compiled to a single click stamped expect_text="Next".
 
 
 def _named_btn(text):
@@ -2018,41 +1976,9 @@ def test_nameless_repeat_clicks_at_one_position_still_fuse(tmp_path):
     assert len(clicks) == 1 and clicks[0]["count"] == 3
 
 
-def test_a_loop_nodes_repeat_cluster_survives_an_unnumbered_slice(tmp_path):
-    """A loop node's iteration count is its cached artifact — the dissolve must not
-    reach it. Only an ACTION node's undeclared repeat is a retry."""
-    history = []
-    for _ in range(4):
-        history.append(_item({"click": {"index": 1}}, element=_btn("Next")))
-        history.append(_item({"wait": {"seconds": 1}}))
-
-    from automation.pipeline.script_compile import save_steps
-    steps = save_steps(_write(tmp_path, history), tmp_path / "steps.json",
-                       emit_start_goto=False, repeat_hint=None, loop=True)
-
-    assert steps[0]["count"] == 4, f"loop count dissolved: {steps}"
-    assert steps[0]["repeat_wait_s"] == 1.0
 
 
-def test_an_action_nodes_unnumbered_repeat_still_dissolves(tmp_path):
-    """The toggle guard (Download menu, 2026-08-24) must survive the loop carve-out."""
-    history = []
-    for _ in range(4):
-        history.append(_item({"click": {"index": 1}}, element=_btn("Download")))
-        history.append(_item({"wait": {"seconds": 1}}))
 
-    from automation.pipeline.script_compile import save_steps
-    steps = save_steps(_write(tmp_path, history), tmp_path / "steps.json",
-                       emit_start_goto=False, repeat_hint=None, loop=False)
-
-    assert "count" not in steps[0]
-
-
-# --- the combobox opener (entry aa3a76b7c82dcf8b, run 20260827_112618) ----------------
-# select_dropdown opens the widget INSIDE the tool, so a trace that used it holds no click
-# on the box. The type+pick pair compile synthesizes only works on an OPEN menu, and
-# api.select_option's fallback ("re-click the previous click") re-clicked the envelope icon
-# that opens the Send Email panel. The pick could never work.
 
 _OPTION_EL = {"node_name": "DIV", "ax_name": "no-reply",
               "attributes": {"id": "react-select-18-option-1", "class": "rs-option"}}
@@ -2366,3 +2292,115 @@ def test_a_purely_utility_class_is_not_an_anchor():
     # Denied _resolve's first-visible concession: a class names a KIND, not one control.
     assert _is_class_scoped("css=button.ms-Panel-closeButton")
     assert not _is_class_scoped('css=[id="mailbtn"]')
+
+
+# ------------- the counter tool replaces the loop flag (2026-08-28) -------------
+# A repeat used to be INFERRED from adjacency, which needed `kind: loop` to tell an
+# iteration from a slow-app retry — inferred in turn from the prompt's wording. The agent
+# now states the repeat through the repeat_click tool, so the count is a fact on the step.
+
+
+def _repeat_item(count, until_done=False, text="Save & Next"):
+    return _item({"repeat_click": {"index": 1, "times": 0 if until_done else count}},
+                 element=_btn(text),
+                 result=[{"metadata": {"repeat": {"count": count,
+                                                  "until_done": until_done,
+                                                  "wait_s": 0.4}}}])
+
+
+def test_a_stated_repeat_compiles_to_one_counted_click(tmp_path):
+    steps = sc.compile_recording(str(_write(tmp_path, [_repeat_item(11)])),
+                                 emit_start_goto=False)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert len(clicks) == 1
+    assert clicks[0]["count"] == 11
+    assert clicks[0]["stated_count"] is True
+
+
+def test_a_stated_repeat_survives_the_unnumbered_dissolve(tmp_path):
+    """_apply_repeat_hint dissolves an adjacency-INFERRED cluster when no wording pins it
+    (the Download-toggle bug). A stated count is not a guess and must be left alone — this
+    is what removes the "exactly N clicks" wording workaround."""
+    out = tmp_path / "s.json"
+    steps = sc.save_steps(str(_write(tmp_path, [_repeat_item(11)])), out,
+                          emit_start_goto=False, repeat_hint=None)
+    assert [x for x in steps if x["action"] == "click"][0]["count"] == 11
+
+
+def test_until_done_records_the_intent_not_the_number(tmp_path):
+    """times=0 means "until it stops advancing". Freezing the authoring run's count would
+    under-run a longer list, so the step carries the intent and the replay re-discovers
+    the end."""
+    steps = sc.compile_recording(str(_write(tmp_path, [_repeat_item(11, until_done=True)])),
+                                 emit_start_goto=False)
+    click = [x for x in steps if x["action"] == "click"][0]
+    assert click["until_done"] is True and click["count"] == 11
+
+
+def test_a_refused_repeat_never_becomes_a_step(tmp_path):
+    """No `repeat` metadata (the tool stamps no_click on a shortfall or refusal) means no
+    step — a wrong count must never be cached."""
+    item = _item({"repeat_click": {"index": 1, "times": 6}}, element=_btn(),
+                 result=[{"metadata": {"no_click": True}}])
+    steps = sc.compile_recording(str(_write(tmp_path, [item])), emit_start_goto=False)
+    assert [x for x in steps if x["action"] == "click"] == []
+
+
+def test_adjacent_clicks_are_still_read_as_retries(tmp_path):
+    """The retry rule is unchanged and no longer has a loop-flag escape hatch: two
+    back-to-back clicks on one target are one click, because the agent would have used
+    repeat_click had it meant two."""
+    history = [_item({"click": {"index": 1}}, element=_btn()) for _ in range(2)]
+    steps = sc.compile_recording(str(_write(tmp_path, history)), emit_start_goto=False)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert len(clicks) == 1 and "count" not in clicks[0]
+
+
+
+def test_instantiate_skips_expect_text_when_the_token_only_scopes_a_row():
+    """A bound value inside a `:has-text(...)` ROW SCOPE names the ROW, not the target.
+
+    Run 20260828_153xxx, subtask 6 (a0d5426d4f0855c0): the row-scoped candidate
+    `[role="row"]:has-text("Preston Alexander") div[data-automationid="DetailsRowCheck"]`
+    resolved to exactly ONE visible element — the right checkbox — and the single-token
+    stamp then rejected it ("none named 'Preston Alexander'"), because a Fluent
+    DetailsRowCheck div has no text, no aria-label and no associated label. The scope IS
+    the wrong-row guard here; stamping a name gate on top of it vetoes its own answer.
+    """
+    from automation.pipeline.adapt import instantiate
+
+    template = {
+        "params": {"employee": "WI Person"},
+        "steps": [
+            # row scope + descendant: the value names the ROW, the click hits the checkbox
+            {"action": "click", "selectors": [
+                'css=[role="row"]:has-text("{{employee}}") div[data-automationid="DetailsRowCheck"]',
+                'css=[data-automationid="DetailsRowCheck"]']},
+            # no descendant part: the click IS the row, so the value does name the target
+            {"action": "click", "selectors": ['css=[role="row"]:has-text("{{employee}}")']},
+            # scoped in one candidate, but another names the target outright
+            {"action": "click", "selectors": [
+                'css=[role="row"]:has-text("{{employee}}") button',
+                'role=link[name="{{employee}}"]']},
+        ],
+    }
+    steps = instantiate(template, {"employee": "Preston Alexander"})
+    assert steps[0].get("expect_text") is None            # scope-only -> no name gate
+    assert steps[1]["expect_text"] == "Preston Alexander"  # the row itself is the target
+    assert steps[2]["expect_text"] == "Preston Alexander"  # a candidate names the target
+
+
+def test_substituted_anchors_skips_expect_text_when_the_token_only_scopes_a_row():
+    """The tier-1 twin of the stamp carries the same rule (skills.base)."""
+    from automation.skills.base import _substituted_anchors
+
+    anchors = {
+        "employee-check": {"selectors": [
+            'css=[role="row"]:has-text("{{employee}}") div[data-automationid="DetailsRowCheck"]',
+            'css=[data-automationid="DetailsRowCheck"]']},
+        "employee-row": {"selectors": ['css=[role="row"]:has-text("{{employee}}")']},
+    }
+    out = _substituted_anchors(anchors, {"employee": "Preston Alexander"})
+    assert out is not None
+    assert out["employee-check"].get("expect_text") is None
+    assert out["employee-row"]["expect_text"] == "Preston Alexander"

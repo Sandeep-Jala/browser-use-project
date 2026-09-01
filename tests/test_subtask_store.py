@@ -103,7 +103,7 @@ def test_is_absolute_http_url(url, ok):
 
 
 def test_update_and_load_manifest_roundtrip(library):
-    ss.update_manifest("sid1", "select {{business}} business",
+    ss.update_manifest("sid1", "select {{business}} business", create=True,
                        params={"business": "290 CREW LIMITED"}, context="/bookkeeping")
     entry = ss.load_manifest()["sid1"]
     assert entry["template_prompt"] == "select {{business}} business"
@@ -125,7 +125,7 @@ def test_bump_meta_counts_and_success_resets_failures(library):
 
 def test_archive_if_failing_thresholds(library):
     ss.steps_path("sid1").write_text("[]")
-    ss.update_manifest("sid1", "prompt")
+    ss.update_manifest("sid1", "prompt", create=True)
     ss.bump_meta("sid1", fail_count=1)
     assert ss.archive_if_failing("sid1", threshold=2) is False
     assert ss.has_script("sid1")
@@ -141,7 +141,7 @@ def test_archive_entry_moves_files_and_drops_registry(library):
     ss.steps_path(sid).write_text('[{"action": "click"}]')
     ss.template_path(sid).write_text('{"params": {}}')
     ss.recording_path(sid).write_text('{"history": []}')
-    ss.update_manifest(sid, "prompt")
+    ss.update_manifest(sid, "prompt", create=True)
     ss.bump_meta(sid, fail_count=3)
 
     moved = ss.archive_entry(sid)
@@ -178,3 +178,39 @@ def test_corrupt_decomposition_is_none(library):
     ss.decomposition_path("bad").write_text("{not json")
     assert ss.load_decomposition("bad") is None
     assert ss.all_decompositions() == {}
+
+
+# ------- a body on disk is not a cached entry; a learner may not invent one -------
+# Run 20260828_124929: a run died between save_steps and update_manifest, leaving a steps
+# file with no manifest entry. has_script said True, so the un-committed script replayed —
+# ticking a previous run's employee and reporting ok=True. The end-title learner then
+# conjured a manifest entry out of its single field, whose `end_title` was a leftover OTP
+# portal tab's, making a wrong page the expected end state of an unrelated subtask.
+
+
+def test_an_unregistered_body_is_not_replayable(tmp_path, monkeypatch):
+    monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path)
+    monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "manifest.json")
+    ss.steps_path("orphan").write_text("[]")
+
+    assert ss.has_script("orphan") is False, "an orphan body must never replay"
+
+    ss.update_manifest("orphan", "do the thing", create=True, context="/x", steps=1)
+    assert ss.has_script("orphan") is True
+
+
+def test_a_learner_cannot_register_an_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path)
+    monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "manifest.json")
+
+    # exactly the end-title learner's call: one field, no create
+    ss.update_manifest("ghost", "do the thing", end_title="Employee Approval Request")
+    assert "ghost" not in ss.load_manifest()
+
+    # ...but it may refine an entry the commit path registered
+    ss.update_manifest("ghost", "do the thing", create=True, context="/x", steps=2)
+    ss.update_manifest("ghost", "do the thing", end_title="Invoices - App")
+    entry = ss.load_manifest()["ghost"]
+    assert entry["end_title"] == "Invoices - App"
+    assert entry["context"] == "/x"       # the registered fields survive the refinement
+

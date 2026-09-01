@@ -25,7 +25,7 @@ a hollow pass). "loop" nodes repeat an action until a stated stop condition hold
 Next ... until X is shown"): they get ACTION framing plus an extended step budget — judge's
 observation framing made the agent declare a loop done after one iteration — but are just
 as uncacheable, because the iteration count is live page state. A leading-"If" conditional
-guard (decompose.is_conditional_guard) also always runs live and uncommitted: a recording
+guard (a slice that declares a `probe:`) also always runs live and uncommitted: a recording
 could only capture ONE branch. Observations flow FORWARD: each completed segment's finding
 (its distilled final result) is handed to every later agent segment, so a note-then-verify
 task can compare against what was actually observed instead of guessing. A segment that CONSUMES such
@@ -60,9 +60,8 @@ from automation.pipeline.checks import (business_writes, evaluate_checks,
                                         receipt_rollup, save_cue,
                                         window_write_rollup)
 from automation.pipeline.decompose import (Subtask, announces_new_tab,
-                                           consumes_noted_data, downloads_file,
-                                           get_decomposition, is_conditional_guard,
-                                           produces_noted_data)
+                                           downloads_file, get_decomposition,
+                                           is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
 from automation.pipeline.script_compile import (CALLOUT_SCROLL_PIN_JS, REVEAL_CSS_JS,
@@ -145,6 +144,8 @@ class Gate:
     end_title: str | None = None    # recorded end document title, demote-only (see
                                     # _recording_end_title); rides on any base kind
     checks: tuple = ()              # declared verify checks (tuple of checks.Check)
+    # Declared exemption from the window write rule — see Subtask.allow_write_refusal.
+    allow_write_refusal: bool = False
 
 
 # The normalized forms of "no location": normalize_context("about:blank") == "blank" and
@@ -166,9 +167,11 @@ def _is_degenerate_url(url: Any) -> bool:
 
 def segment_gate(sub: Subtask, entry: dict[str, Any] | None, context: str) -> Gate:
     """Resolve the gate for a subtask (see _base_gate for the kind precedence), then
-    attach the subtask's declared verify checks — they apply to every kind."""
+    attach the subtask's declared verify checks — they apply to every kind — and its
+    declared write-rule waiver."""
     gate = _base_gate(sub, entry, context)
     gate.checks = tuple(getattr(sub, "verify", None) or ())
+    gate.allow_write_refusal = bool(getattr(sub, "allow_write_refusal", False))
     return gate
 
 
@@ -276,7 +279,6 @@ _MARKER_EXTRA_STEPS = 10
 # 60-step ceiling. This is a CEILING, not a target: a loop that converges early still
 # stops early, and the only cost of the headroom is how far a genuinely runaway loop gets
 # before the wall (~21k tokens/step in that run).
-_LOOP_EXTRA_STEPS = 120
 
 
 # Extra agent steps for the whole-prompt FALLBACK blob: one segment must cover the entire
@@ -292,7 +294,6 @@ def segment_step_budget(gate: Gate, base: int, kind: str = "action",
     iteration), plus whole-task headroom for a fallback blob (the segment IS the task)."""
     return (int(base)
             + (_MARKER_EXTRA_STEPS if gate.kind == "marker" else 0)
-            + (_LOOP_EXTRA_STEPS if kind == "loop" else 0)
             + (_FALLBACK_EXTRA_STEPS if fallback else 0))
 
 
@@ -334,8 +335,9 @@ async def evaluate_gate(
     """Evaluate a segment gate: the base kind (see _evaluate_base_gate), then the
     receipt roll-up verdict (computed by the agent call site, None on replay), then the
     window write rule (window_write_rollup — every segment, agent or replay, declared
-    or ad-hoc: fired-but-never-accepted business writes fail the segment), then any
-    declared verify checks. Roll-up, write rule, and checks are demote-only — they can
+    or ad-hoc: fired-but-never-accepted business writes fail the segment, unless the
+    subtask declared allow_write_refusal, which records the refusal without failing),
+    then any declared verify checks. Roll-up, write rule, and checks are demote-only — they can
     fail a segment the base gate passed but never resurrect a failed one; checks on a
     failed base still get their single honest evaluation so the detail lands in the
     report (the same convention the settle window applies to a failed-steps
@@ -378,8 +380,18 @@ async def evaluate_gate(
             ok = ok and matched
     wr_ok, wr_reasons = window_write_rollup(requests_window)
     if not wr_ok:
+        # Recorded either way — the report keeps the server's refusal verbatim. The
+        # declared waiver only stops it FAILING the segment (see Gate.allow_write_refusal):
+        # a slice that declares its own error branch ends legitimately on a refusal.
         detail["write_rollup"] = wr_reasons
-        ok = False
+        if gate.allow_write_refusal:
+            # Evidence, not a verdict: _check_failure_reason skips a waived rollup so a
+            # refusal the slice was told to tolerate can never be handed back as the
+            # explanation for some OTHER failure, and _author_segment reads this flag to
+            # refuse the commit (the recording ends on the error branch).
+            detail["write_refusal_waived"] = True
+        else:
+            ok = False
     if prompt_text and save_cue(prompt_text) and not business_writes(requests_window):
         detail["write_warning"] = (
             "wording implies a save but no write request was observed — this app may "
@@ -408,7 +420,7 @@ def _check_failure_reason(detail: dict[str, Any]) -> str | None:
                 f'"{title.get("expected")}", found "{title.get("reached")}" — the '
                 f"segment's actions did not take effect")
     wrollup = detail.get("write_rollup") or []
-    if wrollup:
+    if wrollup and not detail.get("write_refusal_waived"):
         return str(wrollup[0])
     rollup = detail.get("rollup") or []
     if rollup:
@@ -1089,8 +1101,19 @@ class HybridSession:
 
     async def replay_segment(
         self, sub: Subtask, sid: str, context: str, skill: skills.Skill, gate: Gate,
+        branch: bool = False,
     ) -> Segment:
-        """Replay a library skill on the live page. No LLM."""
+        """Replay a library skill on the live page. No LLM.
+
+        `branch` marks a CONDITIONAL slice, whose entire recording is the TRUE branch of an
+        "If X, do Y" guard. Such a recording is made on the run where the popup appeared and
+        replayed on runs where it may not; the first recorded action therefore doubles as the
+        condition's own test. If NOTHING acted before the failure, the branch was never
+        raised and the segment is a no-op that passes — the alternative (what happened
+        before) is that every popup-free run fails the segment and pays for an agent
+        takeover. Once any step HAS acted the concession is off: the branch was raised and
+        left half-done, which is a real failure and still reported as one.
+        """
         started = datetime.now()
         watermark = self.network_watermark()
         dl_mark = self.downloads_watermark()
@@ -1132,6 +1155,21 @@ class HybridSession:
         # this path (the OTP slice consumes noted data, and its prose-only code refuses the
         # commit), which is exactly why the trap is worth closing before it can open.
         await self.adopt_announced_tab(sub)
+        if branch and outcome.get("error") and not any(
+                e.get("used") for e in (outcome.get("log") or [])):
+            # Nothing resolved an element, so the guard's own first control was absent:
+            # the condition is not raised. `used` is the tier-agnostic witness — both
+            # run_steps and SkillApi._record stamp the winning selector there, while the
+            # element-free verbs (wait/press/goto/type) leave it "".
+            seg.ok = True
+            seg.skip_reason = "branch_absent"
+            seg.steps_executed = 0
+            seg.gate = {"kind": "branch", "ok": True, "raised": False,
+                        "check": str(outcome.get("error"))[:200]}
+            seg.duration_seconds = (datetime.now() - started).total_seconds()
+            logger.info("branch guard %s: first action found nothing -> condition not "
+                        "raised; moving on (no agent, no failure)", sid)
+            return seg
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         seg.replay = outcome
@@ -1178,8 +1216,8 @@ class HybridSession:
             expected_end=_describe_expected_end(gate),
             owns_save=gate.kind == "marker",
             downloads_file=gate.kind == "download",
-            findings=findings, observe=kind == "judge", loop=kind == "loop",
-            conditional=is_conditional_guard(sub.template_prompt),
+            findings=findings, observe=kind == "judge",
+            conditional=getattr(sub, "probe", None) is not None,
             aux_tab=getattr(sub, "tab_url", None))
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
                       context=context, mode="authored", kind=kind)
@@ -1221,7 +1259,8 @@ class HybridSession:
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         steps_ok = bool(history.is_successful())
-        rollup = (receipt_rollup(history, self.requests_since(watermark))
+        rollup = (receipt_rollup(history, self.requests_since(watermark),
+                                 allow_write_refusal=gate.allow_write_refusal)
                   if _rollup_applies(gate) else None)
         seg.ok, seg.gate = await evaluate_gate(
             gate, steps_ok=steps_ok, page=self.current_page(),
@@ -1285,7 +1324,13 @@ def _history_extracts(history: Any) -> dict[str, str]:
 
 
 # Quoted name=/text= values inside compiled selectors — the names a click acts on.
-_NAME_IN_SEL = re.compile(r'(?:name|text)="([^"]+)"')
+# A click's target name as it appears INSIDE a selector. `:has-text("...")` is in here for
+# the row-gate case: a checkbox with no name of its own is anchored by the row's contents
+# (`[role="row"]:has-text("Russell Boyle") …`), and that name is run DATA — the employee this
+# run generated. Without this branch the binder never saw it, so the entry committed with the
+# authoring run's employee baked in and three position-keyed fallbacks behind it, and a
+# replay ticked whichever employee happened to sit in that row.
+_NAME_IN_SEL = re.compile(r'(?:name|text)="([^"]+)"|:has-text\("([^"]+)"\)')
 
 
 def _findings_sourced_values(steps: list[dict[str, Any]], prompt: str,
@@ -1347,7 +1392,14 @@ def _step_value_candidates(steps: list[dict[str, Any]]) -> list[tuple[str, str]]
         elif action == "find_click":
             out.append((str(step.get("text") or ""), "click"))
         elif action == "click":
-            names = [m.group(1) for s in step.get("selectors") or []
+            # BOTH groups: _NAME_IN_SEL has two alternatives (`name=`/`text="…"` and
+            # `:has-text("…")`), so group(1) is None whenever the second one matched.
+            # Reading group(1) alone put a None in this list, `value.strip()` below raised,
+            # and the commit block's `except Exception` swallowed it — run 20260828_131821's
+            # subtasks 6-9 passed their gates and silently saved nothing. str(... or "") is
+            # the same coercion every other branch here already applies.
+            names = [str(m.group(1) or m.group(2) or "")
+                     for s in step.get("selectors") or []
                      for m in _NAME_IN_SEL.finditer(s)]
             if step.get("expect_text"):
                 names.append(str(step["expect_text"]))
@@ -1828,9 +1880,20 @@ def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | 
     Pinned conservatively — this is an ADDITIVE gate, and a false-fail here is worse than
     the blind spot it closes:
       - only when the title CHANGED across the segment (an unchanged title proves nothing);
-      - only when it has no digits, so a record ref or id can never be baked in. That rule
-        also makes the learn-on-replay path safe: the OTP wall's title is a raw URL full of
-        digits, so a false pass can never teach the gate the wrong title;
+      - only when it has no digits, so a record ref or id can never be baked in. NOTE the
+        digit rule does NOT make the learn-on-replay path safe, as this docstring claimed
+        until 2026-08-28: the OTP portal's ACCEPTED view is titled "Employee Approval
+        Request - Acting Office - Live Test" — clean text, no digits — and run
+        20260828_124929 learned exactly that from a leftover portal tab, turning a wrong
+        page into the expected end state of an unrelated subtask. What stops that class now
+        is registration: a learner may refine an entry the commit path registered, never
+        invent one (subtask_store.update_manifest's `create` flag). A leftover tab can still
+        mislead the learner for an entry that IS registered — the durable fix is to read the
+        title from the page the segment ACTED on. NOTE the network write gate's page
+        attribution is a different lens and does NOT supply this one: it asks WHEN (a write
+        issued during a page load, before the segment touched the page — checks.business_writes),
+        not WHICH PAGE. An `acted_urls` lens was designed for that gate on 2026-08-21 and
+        never reached a commit on any branch;
       - never for a segment that closed its own page — its surviving title is the same coin
         flip as its surviving url (see _recording_closed_its_page).
     """
@@ -1983,6 +2046,16 @@ async def _author_segment(
         # failing gets retired so the NEXT run authors a clean replacement.
         sstore.archive_if_failing(sid, threshold=_ARCHIVE_AFTER_FAILURES)
         return seg
+    if seg.gate.get("write_refusal_waived"):
+        # Passed only because the slice declares its own error branch (see
+        # Gate.allow_write_refusal): this trace ends on that branch — the refusal dialog
+        # and the Cancel that closes it. On a run where the write is ACCEPTED there is no
+        # dialog to cancel, so replaying it would fail and re-author anyway. Author it
+        # live instead; a run whose write IS accepted commits normally.
+        print(f"[*] segment [{sid}]: not cached — its write was refused and the slice "
+              f"declares that as an acceptable ending, so this trace records the error "
+              f"branch, not the work")
+        return seg
     # Promote the fresh recording to canonical before compiling from it. A segment that
     # recorded nothing (or only an orphaned stale temp exists) has nothing to commit —
     # never re-compile a previous run's trace under a fresh pass.
@@ -2003,7 +2076,6 @@ async def _author_segment(
     try:
         steps = save_steps(sstore.recording_path(sid), sstore.steps_path(sid),
                            max_steps=truncate_at, emit_start_goto=False,
-                           loop=getattr(sub, "kind", "action") == "loop",
                            # "exactly N clicks" wording pins a lone repeat cluster's
                            # count — the recorded count can be short one collapsed retry.
                            repeat_hint=repeat_hint_from_wording(sub.instantiated_prompt))
@@ -2039,13 +2111,6 @@ async def _author_segment(
         # quiet, and every downstream consumer would fall through to replaying THIS run's
         # stale values (the consumer gate keys on `bool(findings)`). Refuse instead: the
         # slice authors live each run, exactly as it does today.
-        if produces_noted_data(sub.template_prompt) \
-                and not any(s.get("action") in ("extract", "copy") for s in steps):
-            sstore.steps_path(sid).unlink(missing_ok=True)
-            print(f"[*] segment [{sid}]: not cached — this step NOTES a value for later "
-                  f"steps but recorded no extract_data capture, so a replay would note "
-                  f"nothing and its consumers would replay stale values")
-            return seg
         # Provenance commit guard — the general, wording-free memory rule: a segment
         # that acted with values sourced from the run's FINDINGS consumed runtime data,
         # and a cached replay would re-use this run's values forever. Since 2026-07-24
@@ -2214,14 +2279,24 @@ async def _author_segment(
             # Informational: the declared subtask is what triggers the helper tab at
             # replay time; the manifest field keeps the entry self-describing.
             manifest_fields["tab_url"] = sub.tab_url
-        sstore.update_manifest(sid, sub.template_prompt, **manifest_fields)
+        # create=True: this is the ONE call that registers an entry, and the only one
+        # holding a complete one (context, start_url, steps, params, bindings).
+        sstore.update_manifest(sid, sub.template_prompt, create=True, **manifest_fields)
         # Tier-1 upgrade (best-effort): transpile the committed steps into a code skill
         # (<sid>.skill.py + anchors). On any failure the steps stay authoritative and any
         # stale code artifacts are removed (codegen.compile_code_skill owns that).
         skills.compile_code_skill(sid)
         logger.info("segment %s: committed %d steps to the library", sid, len(steps))
     except Exception as exc:  # noqa: BLE001 - compile failure must not fail a passed segment
+        # PRINTED as well as logged. Swallowing is right — a compile bug must not fail a
+        # segment that genuinely passed — but a silent swallow makes "saved nothing" look
+        # exactly like "saved fine" in the run output, and the deliberate refusals above all
+        # print. Run 20260828_131821 lost four commits to a swallowed AttributeError and the
+        # only clue was a line in the log file.
         logger.exception("segment %s compile/commit error: %s", sid, exc)
+        print(f"[*] segment [{sid}]: NOT cached — the commit hit an unexpected error "
+              f"({type(exc).__name__}: {exc}). The segment itself passed; this is a "
+              f"framework bug, not a task failure.")
     return seg
 
 
@@ -2288,11 +2363,19 @@ async def run_hybrid_task(
             sid = sstore.subtask_id(sub.template_prompt, context)
             force_author = reauthor_match(reauthor, sub)
             is_judge = getattr(sub, "kind", "action") == "judge"
-            is_loop = getattr(sub, "kind", "action") == "loop"
             # A leading-"If" branch guard: whether its actions run at all depends on live
-            # page state, so a recording of the TRUE branch must never replay (and a TRUE
-            # branch run must never commit one). See decompose.is_conditional_guard.
-            is_conditional = is_conditional_guard(sub.template_prompt)
+            # page state. Such a slice DOES record and replay like any other — what makes
+            # that safe is `branch=True` below, which lets a replay whose first action
+            # finds nothing resolve as "condition not raised" instead of failing the
+            # segment into an agent takeover (see replay_segment). A declared `probe:` is
+            # the cheaper form of the same judgment: it answers the question before the
+            # page is touched at all. Wording is the fallback for a slice that declares
+            # neither, so an unprobed guard is protected too.
+            is_branch = (getattr(sub, "probe", None) is not None
+                         or is_conditional_guard(sub.template_prompt))
+            # Conditional too is declaration-driven: a `probe:` in tasks.yaml, never a
+            # leading "If" in the prose.
+            is_conditional = getattr(sub, "probe", None) is not None
             # ... unless the slice declares a `probe:` — a deterministic check that
             # replaces the agent's live presence judgment. A FALSE probe resolves the
             # segment as a zero-LLM no-op; a TRUE probe lets the branch replay/commit
@@ -2311,8 +2394,13 @@ async def run_hybrid_task(
             # authoring each run. Without findings there is nothing fresh to be stale
             # against (and nothing the agent could substitute either), so the zero-LLM
             # replay stays.
-            is_consumer = bool(findings) and consumes_noted_data(sub.template_prompt)
-            is_dynamic = is_consumer
+            # No consumer gate: a slice saying "the noted employee's name" is an ordinary
+            # recorded action now (user decision 2026-08-28 — wording must not decide
+            # recordability). What still protects a cached consumer from replaying the
+            # AUTHORING run's values is the provenance commit guard below, which judges the
+            # values a recording actually typed against extracts the run actually produced —
+            # a measured fact, not a reading of the prose. A value it cannot bind still
+            # refuses the commit, so that slice keeps authoring live.
 
             # Semantic routing: a wording with NO direct entry may still be a known
             # procedure (alias table -> local embeddings -> one LLM verify). A routed sid
@@ -2322,8 +2410,8 @@ async def run_hybrid_task(
             # direct-hit only (v1): a routed canonical entry could have been recorded on
             # a different site family.
             author_sid, route_values = sid, None
-            if (not fresh and not force_author and not is_judge and not is_loop
-                    and not is_conditional and not is_dynamic
+            if (not fresh and not force_author and not is_judge
+                    and not is_conditional
                     and not aux_url and not sstore.has_script(sid)
                     and getattr(runner.config, "semantic_router", False)):
                 routed = await router.route(
@@ -2341,22 +2429,7 @@ async def run_hybrid_task(
             seg: Segment | None = None
             skip_reason: str | None = None   # why this subtask did not replay
 
-            if is_dynamic and ((entry or {}).get("bindings")
-                               or (entry or {}).get("self_noted")):
-                # The entry was committed WITH runtime bindings: its dynamic values
-                # re-resolve from THIS run's own data at load time, so the consumer-
-                # wording net stands down and the zero-LLM replay proceeds. `self_noted`
-                # is the step-time twin — the entry re-reads a value its OWN earlier step
-                # captured this run, which is fresher still.
-                is_dynamic = False
 
-            if is_dynamic and sstore.has_script(sid):
-                # The entry predates this rule (or slipped in on a findings-free run):
-                # retire it AFTER the gate above captured its recorded end_context.
-                print(f"[*] subtask {i} [{sid}]: consumes data noted this run -> retiring "
-                      f"the cached recording (it would type the authoring run's stale "
-                      f"values)")
-                sstore.archive_entry(sid)
 
             if aux_url:
                 # The helper tab is the LOOP's responsibility, not the segments': opening
@@ -2415,7 +2488,6 @@ async def run_hybrid_task(
                 # decision.
                 if seg is None and not fresh and not force_author and not is_judge \
                         and (not is_conditional or probe is not None) \
-                        and not is_dynamic \
                         and sstore.has_script(sid):
                     load_sub = sub if route_values is None else SimpleNamespace(
                         instantiated_prompt=sub.instantiated_prompt, values=route_values)
@@ -2424,7 +2496,8 @@ async def run_hybrid_task(
                     if skill is not None:
                         print(f"[*] subtask {i} [{sid}]: library hit -> replay "
                               f"({len(skill)} steps, no LLM)")
-                        seg = await hs.replay_segment(sub, sid, context, skill, gate)
+                        seg = await hs.replay_segment(sub, sid, context, skill,
+                                                      gate, branch=is_branch)
                         if seg.ok:
                             from_template = bool((entry or {}).get("params"))
                             _promote_segment_heals(sid, seg, from_template=from_template)
@@ -2506,7 +2579,7 @@ async def run_hybrid_task(
                                 remaining=remaining, dirty=dirty, prior_failure=prior,
                                 findings=takeover_findings, run_values=run_values,
                                 start_url=raw_start_url,
-                                start_title=raw_start_title, dynamic=is_consumer)
+                                start_title=raw_start_title, dynamic=False)
                             seg.mode = "replay_failed->authored"
                             # Why the replay failed used to die with the rebound
                             # segment — stdout only, no artifact. Keep it on the record.
@@ -2537,11 +2610,6 @@ async def run_hybrid_task(
                         print(f"[*] subtask {i} [{sid}]: conditional branch guard -> agent "
                               f"runs it live, never cached (declare a probe: to make "
                               f"it replayable)")
-                    elif is_dynamic:
-                        skip_reason = "dynamic"
-                        print(f"[*] subtask {i} [{sid}]: uses data noted by an earlier "
-                              f"step -> agent runs it with this run's fresh values "
-                              f"(cached only if the provenance guard can bind them)")
                     elif fresh and sstore.has_script(sid):
                         # Without this print a --fresh run with a library hit is
                         # indistinguishable from a cache miss (observed live 2026-07-29:
@@ -2567,7 +2635,7 @@ async def run_hybrid_task(
                                                 findings=findings, run_values=run_values,
                                                 start_url=raw_start_url,
                                 start_title=raw_start_title,
-                                                dynamic=is_consumer,
+                                                dynamic=False,
                                                 # A fallback blob never commits: a whole-
                                                 # task recording replayed blind is the
                                                 # pre-hybrid behavior this mode degrades

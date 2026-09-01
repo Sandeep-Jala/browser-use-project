@@ -182,6 +182,11 @@ def _probe_write(requests_window: list[dict[str, Any]],
     for r in requests_window:
         if r.get("method") not in ("POST", "PUT", "PATCH"):
             continue
+        # Same page attribution business_writes applies: a write the page fired while
+        # loading is the app's, so it can neither satisfy a declared write_accepted nor
+        # stand in as the accepted write that waives a contradicting receipt.
+        if r.get("after_page_load"):
+            continue
         if frag.lower() not in str(r.get("url", "")).lower():
             continue
         if not 200 <= (r.get("status") or 0) < 400:
@@ -200,7 +205,7 @@ def _probe_write(requests_window: list[dict[str, Any]],
 
 
 def receipt_rollup(history: Any, requests_window: list[dict[str, Any]],
-                   ) -> tuple[bool, list[str]]:
+                   allow_write_refusal: bool = False) -> tuple[bool, list[str]]:
     """Does the agent's own receipt trail contradict its success claim? (ok, reasons).
 
     Deliberately conservative — exactly two rules, both on FINAL state only, applied
@@ -212,6 +217,12 @@ def receipt_rollup(history: Any, requests_window: list[dict[str, Any]],
        nothing accepted exists anywhere in the segment's window at gate time (re-scan
        of the live records — an in-flight write that settled after the receipt, or an
        earlier accepted save before a refused duplicate re-submit, waives the rule).
+       `allow_write_refusal` (the subtask's declaration) stands this rule down: a slice
+       whose wording declares its own error branch ends legitimately on a refused write.
+       It is the WRITE rule it waives — rule 1 above still applies, because a tool that
+       refused to click or fill is a different failure. The network-side twin of this
+       waiver lives in window_write_rollup's caller (hybrid.evaluate_gate), which keeps
+       reporting the refusal either way.
     """
     results = [r for item in getattr(history, "history", None) or []
                for r in getattr(item, "result", None) or []]
@@ -226,7 +237,7 @@ def receipt_rollup(history: Any, requests_window: list[dict[str, Any]],
                 f"{str(last.error)[:200]}")
     stamped = [r for r in results
                if (getattr(r, "metadata", None) or {}).get("write_outcome")]
-    if stamped:
+    if stamped and not allow_write_refusal:
         outcome = (stamped[-1].metadata or {})["write_outcome"]
         if outcome.get("fired") and not outcome.get("accepted"):
             ok_any, _, err, _ = _probe_write(requests_window, "")
@@ -252,11 +263,28 @@ _SAVE_CUE_RE = re.compile(
 
 
 def business_writes(requests_window: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The window's write requests that belong to the app itself — POST/PUT/PATCH
-    minus infrastructure noise (see _NOISE_WRITE_FRAGMENTS)."""
+    """The window's write requests that are THIS SEGMENT'S work — POST/PUT/PATCH minus
+    infrastructure noise (see _NOISE_WRITE_FRAGMENTS) and minus page-load traffic.
+
+    Page attribution: a page issues its own writes when it loads (addon subscriptions,
+    feature probes), and those are the APP's, not the segment's — judging them read run
+    20260901_093026's "go to Pay Forecast, refresh, pick the employee" segment, which
+    writes nothing at all, as a failed save, because the reload's
+    Addons/MSTeams/Subscribe answered 200 with `"status": false, "message": "Outlook/
+    Microsoft authentication not found for current user."`. The collector marks each
+    request issued after a document load and before the segment's next action
+    (NetworkCollector.note_interaction); an unstamped record is judged exactly as before,
+    so the rule can never go blind on traffic no path attributed.
+
+    The exclusion cuts BOTH ways, which is why it belongs here rather than in the roll-up:
+    boot traffic can no longer fail a segment, and an accepted boot write can no longer
+    vouch for one either.
+    """
     out: list[dict[str, Any]] = []
     for r in requests_window:
         if r.get("method") not in ("POST", "PUT", "PATCH"):
+            continue
+        if r.get("after_page_load"):
             continue
         url = str(r.get("url", "")).lower()
         if any(frag in url for frag in _NOISE_WRITE_FRAGMENTS):

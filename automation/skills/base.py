@@ -168,7 +168,9 @@ def _substituted_anchors(anchors: dict[str, Any],
                        for m in codegen._TOKEN.finditer(s)}
         if len(token_names) == 1:
             (name,) = token_names
-            if name in values:
+            # Same rule as the tier-0 stamp (adapt.instantiate): a token that only scopes
+            # a `:has-text(...)` ROW names the row, not the anonymous control inside it.
+            if name in values and adapt._token_names_the_target(raw_sels, name):
                 out[handle]["expect_text"] = values[name]
     return out
 

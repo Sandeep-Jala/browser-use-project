@@ -811,7 +811,7 @@ payroll_food_limited_e2e_rti:
     - prompt: >-
         then click the + next to the Additions or Deductions section to open the Add Addition
         or Deduction dialog, set Type to 'Additions', set Amount to 500, set Period to May 26,
-        set Name to bonus, and click Save. Add this bonus exactly once too: this Save also
+        set Name to Bonus, and click Save. Add this bonus exactly once too: this Save also
         closes silently with no confirmation message; do not reopen the dialog or add it
         again.
     - prompt: >-
@@ -822,6 +822,14 @@ payroll_food_limited_e2e_rti:
         the grid header row, left of 'Employees', selects or unselects all employees at
         once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click upload FPS on the bottom , select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit. if it shows an error, click cancel.
+      # This slice declares its own error branch ("if it shows an error, click
+      # cancel"), so a REFUSED FPS submit is a sanctioned ending, not a failed
+      # segment. Without the waiver the window write rule demotes it (run
+      # 20260831_163108: "Bryan Christie's FPS of this period is already submitted")
+      # and the loop stops with the last two slices unrun. The refusal is still
+      # reported under the segment's write_rollup, and a run whose submit IS accepted
+      # commits to the library as normal.
+      allow_write_refusal: true
     - prompt: >-
         Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
         May-26, and click Save & Next exactly 3 times.

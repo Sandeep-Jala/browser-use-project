@@ -42,10 +42,12 @@ class SubtaskDecl:
     prompt is the subtask's LIBRARY identity, so two tasks that differ only in values share
     one library recording. `marker` marks the save-owning subtask (the parent's create-write
     fires here); `postcondition` is an optional cheap success check for subtasks with no
-    write: {"url_contains": "..."} or {"visible": "<selector>"}. `kind` overrides the node
-    classification ("action" = replayable, "judge" = cognitive verification, "loop" =
-    repeat-until action; judge and loop always run LLM-live and are never cached) —
-    normally left None so decompose.node_kind decides. `tab_url` runs the
+    write: {"url_contains": "..."} or {"visible": "<selector>"}. `kind` declares the node
+    classification — "action" (replayable, the default) or "judge" (a verification, which
+    always runs LLM-live and is never cached). It is the ONLY way to mark a verification:
+    nothing infers kind from the prompt's wording, so an undeclared slice is an action and
+    is recorded. Validated on load; "loop" was removed on 2026-08-28 (a repeat is stated
+    with the repeat_click tool). `tab_url` runs the
     subtask in a separate helper tab opened at that URL (same browser context) — the tab is
     closed when the subtask ends and the main app page is never navigated. `verify` is the
     slice's declared deterministic checks (pipeline/checks.py), parsed and token-substituted
@@ -55,7 +57,12 @@ class SubtaskDecl:
     no-op, present runs the branch like a normal action (replayable/committable) —
     recorded TRUE-branch steps only ever run behind a TRUE probe. Like verify, it is
     parsed and token-substituted at load, never touches identity, and is ignored on
-    non-conditional slices.
+    non-conditional slices. `allow_write_refusal` exempts the slice from the window write
+    rule (checks.window_write_rollup): a slice whose own wording declares an error branch
+    ("click Submit. if it shows an error, click cancel") ends legitimately on a REFUSED
+    write, and the rule cannot know that — it judges observed traffic and never reads
+    prose, which is exactly what makes it hold for every undeclared task. The refusal is
+    still reported under the segment's write_rollup; it just stops failing the segment.
     """
     prompt: str
     values: dict[str, str] | None = None
@@ -65,6 +72,7 @@ class SubtaskDecl:
     tab_url: str | None = None
     verify: tuple[Check, ...] | None = None
     probe: Check | None = None
+    allow_write_refusal: bool = False
 
 
 @dataclass(frozen=True)
@@ -143,6 +151,18 @@ def _parsed_probe(key: str, i: int, d: dict[str, Any]) -> Check | None:
     return check
 
 
+def _parsed_write_waiver(key: str, i: int, d: dict[str, Any]) -> bool:
+    """One slice's `allow_write_refusal:` → bool. A non-bool fails loud for the same
+    reason a bad `kind` does: silently ignoring the typo would re-fail the run for the
+    exact reason the declaration exists to prevent, and it would look like it worked."""
+    raw = d.get("allow_write_refusal", False)
+    if not isinstance(raw, bool):
+        raise ValueError(
+            f"tasks.yaml entry {key!r} subtask {i}: allow_write_refusal must be true or "
+            f"false, got {raw!r}")
+    return raw
+
+
 def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
     """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
     registry must be caught at load, not as a silent no-marker/no-prompt run."""
@@ -155,10 +175,23 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
                         marker=d.get("marker"), postcondition=d.get("postcondition"),
                         kind=d.get("kind"), tab_url=d.get("tab_url"),
                         verify=_parsed_verify(key, i, d),
-                        probe=_parsed_probe(key, i, d))
+                        probe=_parsed_probe(key, i, d),
+                        allow_write_refusal=_parsed_write_waiver(key, i, d))
             for i, d in enumerate(entry["subtasks"])
         )
         for i, s in enumerate(subtasks):
+            # `kind` is the only mechanism now — decompose.node_kind reads the declaration
+            # and nothing else — so an unrecognised value must be LOUD. Before 2026-08-28 a
+            # typo fell through to wording inference and looked like it worked; today it
+            # would silently become a recorded action, which for a verification slice is
+            # exactly the bug the declaration exists to prevent.
+            if s.kind is not None and s.kind not in ("action", "judge"):
+                raise ValueError(
+                    f"tasks.yaml entry {key!r} subtask {i}: kind must be 'action' or "
+                    f"'judge', got {s.kind!r}"
+                    + (" — the 'loop' kind was removed on 2026-08-28; state a repeat with "
+                       "the repeat_click tool instead" if str(s.kind).lower() == "loop"
+                       else ""))
             if s.tab_url is not None and not is_absolute_http_url(s.tab_url):
                 raise ValueError(
                     f"tasks.yaml entry {key!r} subtask {i}: tab_url must be an absolute "

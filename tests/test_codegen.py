@@ -140,6 +140,9 @@ def test_compile_code_skill_end_to_end(stores):
     sid = "abc"
     ss.steps_path(sid).write_text(json.dumps(
         [{"action": "goto", "url": "http://app/x"}]))
+    # Registered, because has_script requires it: an unregistered body on disk is an ORPHAN
+    # (a run that died before its commit, or a commit a guard refused) and must not replay.
+    ss.update_manifest(sid, "prompt", create=True, context="/x", steps=1)
     assert compile_code_skill(sid) is not None
     assert ss.code_path(sid).exists() and ss.anchors_path(sid).exists()
     assert "await api.goto('http://app/x')" in ss.code_path(sid).read_text()

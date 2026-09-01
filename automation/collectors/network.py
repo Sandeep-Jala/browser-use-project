@@ -67,6 +67,10 @@ class NetworkCollector(Collector):
         # resurrecting the request as a partial record via _record_for's setdefault.
         self._skipped: set[Request] = set()
         self._bodies_captured = 0
+        # True from a document load until the segment next touches the page: everything a
+        # page issues on arrival is the APP's traffic, not the caller's work (see
+        # `note_interaction`). Starts False — nothing has loaded, so nothing is boot yet.
+        self._after_page_load = False
 
     def _attach_page(self, page: Page) -> None:
         # Bind the page so each record notes WHICH page issued the request (`page_url`) —
@@ -83,6 +87,7 @@ class NetworkCollector(Collector):
             request,
             {
                 "step": self.current_step,
+                "after_page_load": self._after_page_load,
                 "url": request.url,
                 "method": request.method,
                 "resourceType": request.resource_type,
@@ -105,6 +110,33 @@ class NetworkCollector(Collector):
                 pass
         return record
 
+    def note_interaction(self) -> None:
+        """The segment acted on the page — close the page-load window. Called by every
+        acting verb (agent_tools._stamp_action) and by every replayed step, which is what
+        keeps the flag honest on BOTH paths: a rule the replay path never cleared would
+        stop judging writes entirely after the first navigation."""
+        self._after_page_load = False
+
+    @staticmethod
+    def _is_page_load(request: Request, page: Page | None) -> bool:
+        """Is this the TOP page loading itself? Deliberately narrow — only a real document
+        navigation (goto/reload/hard link). A same-document SPA route keeps the window
+        closed, because there a write really can be the consequence of the click that
+        routed. An iframe's own document says nothing about the top page."""
+        if getattr(request, "resource_type", "") != "document":
+            return False
+        try:
+            if not request.is_navigation_request():
+                return False
+        except Exception:  # noqa: BLE001 - unreadable: a document request is a load
+            pass
+        try:
+            if page is not None and request.frame is not page.main_frame:
+                return False
+        except Exception:  # noqa: BLE001 - unreadable frame: judge it as the top page
+            pass
+        return True
+
     def _finish(self, request: Request, record: dict[str, Any]) -> None:
         start = self._started_at.get(request)
         if start is not None and record.get("duration_ms") is None:
@@ -122,6 +154,8 @@ class NetworkCollector(Collector):
         if not self._page_in_scope(page_url):
             self._skipped.add(request)
             return
+        if self._is_page_load(request, page):
+            self._after_page_load = True
         record = self._record_for(request, page)
         self._started_at.setdefault(request, time.monotonic())
         try:

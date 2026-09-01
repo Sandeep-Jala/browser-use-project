@@ -705,6 +705,56 @@ async def _callout_open(browser_session) -> bool:
     return bool(isinstance(got, dict) and not got.get("error") and got.get("open"))
 
 
+# repeat_click's cadence (the live twin of skills/api.py's constants). Between clicks the
+# control must be clickable AGAIN before the next one, so a slow employee load delays the
+# cadence instead of eating a click. The hard cap bounds the until-it-stops mode: reaching
+# it means the control was STILL advancing, which is reported as a failure rather than as
+# a finished list.
+_REPEAT_SETTLE_S = 0.4
+_REPEAT_READY_CAP_S = 10.0
+_REPEAT_POLL_S = 0.25
+_REPEAT_HARD_CAP = 200
+
+# Is the just-clicked control ready to be clicked again? Runs ON the node, so it survives a
+# re-render that keeps the same element (React reuses the button and swaps the row behind
+# it) and reports honestly when the node goes away — which is how the end of a list looks.
+_REPEAT_READY_JS = """function () {
+  if (!this.isConnected) return {ready: false, why: 'the control left the page'};
+  if (this.disabled || this.getAttribute('aria-disabled') === 'true')
+    return {ready: false, why: 'the control became disabled'};
+  var r = this.getBoundingClientRect();
+  if (!(r.width > 0 && r.height > 0))
+    return {ready: false, why: 'the control is no longer visible'};
+  try {
+    var cs = getComputedStyle(this);
+    if (cs && (cs.visibility === 'hidden' || cs.display === 'none'))
+      return {ready: false, why: 'the control was hidden'};
+  } catch (e) {}
+  return {ready: true, why: ''};
+}"""
+
+
+async def _repeat_ready(browser_session, node) -> tuple[bool, str]:
+    """(ready, why-not) for the control repeat_click just clicked, polled up to
+    _REPEAT_READY_CAP_S. Unprobeable counts as NOT ready with the reason said plainly: a
+    repeat that cannot verify its own target must stop and report, never keep clicking."""
+    deadline = time.monotonic() + _REPEAT_READY_CAP_S
+    why = "the control could not be probed"
+    while time.monotonic() < deadline:
+        try:
+            handle = await _field_handle(browser_session, node)
+            if handle:
+                got = await _call_on_field(handle, _REPEAT_READY_JS)
+                if isinstance(got, dict):
+                    if got.get("ready"):
+                        return True, ""
+                    why = str(got.get("why") or why)
+        except Exception as exc:  # noqa: BLE001 - a stale node reads as not-ready
+            why = f"the control could not be probed ({exc})"
+        await asyncio.sleep(_REPEAT_POLL_S)
+    return False, why
+
+
 # Keys that scroll the PAGE. Escape/Tab/Enter/arrows/Space are deliberately absent: they
 # are how the agent closes a popup, moves between its fields and walks a combobox INSIDE
 # it, and inside a text box they type or move the caret. Refusing those would trap the
@@ -1669,7 +1719,25 @@ def _stamp_action() -> float:
     rather than to the whole segment."""
     global _LAST_ACTION_T0
     _LAST_ACTION_T0 = time.monotonic()
+    note_interaction()
     return _LAST_ACTION_T0
+
+
+def note_interaction() -> None:
+    """Tell the live collector the segment is ACTING on the page, which closes the
+    page-load window it opened at the last document load (NetworkCollector.note_interaction).
+
+    Called from all three acting paths — this module's verbs via _stamp_action, tier-0
+    replay via script_compile.run_steps, tier-1 replay via skills.api.SkillApi — because a
+    path that never closed the window would leave every write after its first navigation
+    marked as the app's boot traffic, and the write gate would stop judging that segment
+    at all. Best-effort: no collector simply means there is nothing to attribute."""
+    if _LIVE_NETWORK is None:
+        return
+    try:
+        _LIVE_NETWORK.note_interaction()
+    except Exception as exc:  # noqa: BLE001 - attribution must never break an action
+        logger.debug("note_interaction failed: %s", exc)
 
 
 def clear_live_network() -> None:
@@ -2874,6 +2942,97 @@ def build_tools() -> Tools:
             # binder sees the WHOLE value and can bind it to the run data it came from.
             metadata={"paste": {"value": target, "rung": rung},
                       "interacted_element": _captured_element(node, "")},
+        )
+
+    @tools.action(
+        "Click ONE control repeatedly — the way to do a repeated step (Save & Next through a "
+        "run of employees, Next through the remaining rows). Pass times=N for exactly N "
+        "clicks, or times=0 to keep clicking until the control stops advancing — use times=0 "
+        "when the task says 'all the remaining ...' and names no number. Between clicks it "
+        "waits for the control to be clickable again, so a slow load delays the cadence "
+        "instead of eating a click, and it tells you how many clicks actually landed. Use "
+        "this instead of calling click N times: it cannot lose count, and it records as ONE "
+        "repeatable step."
+    )
+    async def repeat_click(index: int, times: int = 0, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+        """The live twin of SkillApi.repeat_click (skills/api.py).
+
+        Repetition had no first-class expression before this: the agent issued N separate
+        clicks and the COMPILER guessed afterwards whether adjacent same-target clicks were
+        iterations or slow-app retries — a guess keyed on `kind: loop`, itself inferred from
+        the prompt's wording. One counted call removes both the guess and the declaration:
+        the step carries its own count, which is exactly the shape codegen already turns
+        back into `api.repeat_click` and run_steps already loops.
+        """
+        _stamp_action()   # verify_save_registered windows on the LAST acting verb
+        if browser_session is None:
+            return ActionResult(error="repeat_click: BrowserSession not injected")
+        node = await browser_session.get_element_by_index(index)
+        if node is None:
+            return ActionResult(
+                error=f"repeat_click: element index {index} is not available — re-read the "
+                      f"page and use a current index.",
+                metadata={"no_click": True})
+        label = (getattr(node, "ax_name", "") or "").strip() or f"element {index}"
+        want = max(0, int(times or 0))
+        # times=0 means "until it stops advancing"; the hard cap is a runaway guard, not an
+        # expected stop — reaching it is reported as a failure, never as a finished list.
+        cap = want or _REPEAT_HARD_CAP
+        done, stopped = 0, ""
+        for _ in range(cap):
+            try:
+                event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
+                await event
+                res = await event.event_result(raise_if_any=True, raise_if_none=False)
+            except Exception as exc:  # noqa: BLE001 - report the count that DID land
+                stopped = f"the click failed ({exc})"
+                break
+            # browser-use also refuses a click by RETURNING {'validation_error': ...}.
+            if isinstance(res, dict) and res.get("validation_error"):
+                stopped = f"the click was refused ({res['validation_error']})"
+                break
+            done += 1
+            if done >= cap:
+                break
+            await asyncio.sleep(_REPEAT_SETTLE_S)
+            ready, why = await _repeat_ready(browser_session, node)
+            if not ready:
+                stopped = why
+                break
+
+        if want:
+            if done < want:
+                # A shortfall rides the ERROR channel so a queued Submit cannot fire on a
+                # half-done run, and carries NO repeat metadata: a wrong count must never
+                # become a cached step (same rule as a failed paste).
+                msg = (f"repeat_click: clicked {label} only {done} of the {want} times asked "
+                       f"— {stopped or 'the control stopped being clickable'}. Do NOT report "
+                       f"this step done: check how far the list actually got before acting.")
+                logger.info("⛔ %s", msg)
+                return ActionResult(error=msg, metadata={"no_click": True})
+            msg = f"Clicked {label} {done} times ({done} of {want} asked)."
+        else:
+            if not done:
+                msg = (f"repeat_click: {label} was not clickable at all "
+                       f"({stopped or 'no reason reported'}) — nothing was clicked.")
+                logger.info("⛔ %s", msg)
+                return ActionResult(error=msg, metadata={"no_click": True})
+            if not stopped:
+                msg = (f"repeat_click: clicked {label} {done} times and it was STILL "
+                       f"advancing at the {_REPEAT_HARD_CAP}-click safety cap — this is not "
+                       f"a finished list. Check the page before reporting this step done.")
+                logger.info("⛔ %s", msg)
+                return ActionResult(error=msg, metadata={"no_click": True})
+            msg = (f"Clicked {label} {done} times, until it stopped advancing "
+                   f"({stopped}) — the run is complete at {done}.")
+        logger.info("🔁 %s", msg)
+        return ActionResult(
+            extracted_content=msg, long_term_memory=msg, include_in_memory=True,
+            # `repeat.count` is what compile writes onto the click step, so the replay does
+            # the same number of clicks this run did — no adjacency guessing.
+            metadata={"repeat": {"count": done, "until_done": not want,
+                                 "wait_s": _REPEAT_SETTLE_S},
+                      "interacted_element": _captured_element(node, label)},
         )
 
     @tools.action(

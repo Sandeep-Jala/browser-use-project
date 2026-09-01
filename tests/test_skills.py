@@ -70,7 +70,7 @@ def test_load_skill_concrete_entry(stores):
     sid = "abc123"
     steps = [{"action": "click", "selectors": ["text=Go"]}]
     ss.steps_path(sid).write_text(json.dumps(steps))
-    ss.update_manifest(sid, "go to the section")
+    ss.update_manifest(sid, "go to the section", create=True)
 
     skill = load_skill(sid, Subtask(index=0, template_prompt="go to the section"))
     assert skill is not None
@@ -100,7 +100,7 @@ def _seed_code_entry(sid, *, code=GOOD_CODE, anchors=None, params=None):
         "clients": {"selectors": ['role=link[name="Clients"]']},
         "search": {"selectors": ['css=[placeholder="Search"]']},
     }))
-    ss.update_manifest(sid, "select a business", **({"params": params} if params else {}))
+    ss.update_manifest(sid, "select a business", create=True, **({"params": params} if params else {}))
 
 
 def test_load_skill_prefers_code_tier(stores):

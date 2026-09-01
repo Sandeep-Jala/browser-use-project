@@ -572,3 +572,63 @@ async def test_stamp_action_windows_the_verifier_to_the_current_action(monkeypat
     second = agent_tools._stamp_action()
     assert second >= first
     assert agent_tools._LAST_ACTION_T0 == second
+
+
+# ------------------------ page-load attribution (`after_page_load`) ------------------------
+# A page issues its own boot traffic when it loads — subscriptions, feature probes, push
+# registration. None of it is the SEGMENT's work, and one such POST (Addons/MSTeams/
+# Subscribe, 200 with a refusing body) failed run 20260901_093026's Pay Forecast segment,
+# whose only navigation was the "refresh the page" the subtask asked for. The collector
+# marks every request issued since the last document load and NOT yet preceded by an
+# interaction; `note_interaction` (one call per acting verb, one per replayed step) is what
+# ends the boot window.
+
+
+class _NavReq(_Req):
+    def __init__(self, url="https://app/paye/calculator"):
+        super().__init__(method="GET", url=url, rtype="document")
+
+    def is_navigation_request(self):
+        return True
+
+
+def test_requests_after_a_document_load_are_marked_page_load(tmp_path):
+    c = _collector(tmp_path)
+    c._active = True
+    before = _request(url="https://api.app/Save")
+    c._on_request(before)
+    c._on_request(_NavReq())
+    boot = _request(url="https://api.app/Addons/MSTeams/Subscribe")
+    c._on_request(boot)
+
+    by_url = {r["url"]: r for r in c.results()["requests"]}
+    assert by_url["https://api.app/Save"]["after_page_load"] is False
+    assert by_url["https://api.app/Addons/MSTeams/Subscribe"]["after_page_load"] is True
+
+
+def test_an_interaction_ends_the_page_load_window(tmp_path):
+    c = _collector(tmp_path)
+    c._active = True
+    c._on_request(_NavReq())
+    c.note_interaction()
+    save = _request(url="https://api.app/Save")
+    c._on_request(save)
+
+    record, = [r for r in c.results()["requests"] if r["url"].endswith("/Save")]
+    assert record["after_page_load"] is False
+
+
+def test_an_iframe_document_does_not_open_a_page_load_window(tmp_path):
+    """Only the top page's own load is a page load — an embedded document proves nothing
+    about what the segment did."""
+    c = _collector(tmp_path)
+    c._active = True
+    page = SimpleNamespace(url="https://app/paye", main_frame="main")
+    frame_doc = _NavReq(url="https://app/embed")
+    frame_doc.frame = "iframe"
+    c._on_request(frame_doc, page)
+    after = _request(url="https://api.app/Save")
+    c._on_request(after, page)
+
+    record, = [r for r in c.results()["requests"] if r["url"].endswith("/Save")]
+    assert record["after_page_load"] is False
