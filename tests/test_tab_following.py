@@ -105,9 +105,19 @@ def test_no_tab_growth_stamps_nothing(tmp_path):
 
 def test_the_real_otp_recording_stamps_its_external_link_click():
     # Fixture from the live recording rather than a hand-written belief about the shape.
-    steps = sc.compile_recording("library/5d6391bcce5b8c25.recording.json",
+    # The OTP slices were reworded and the part2 entry (5d6391bcce5b8c25) was replaced by
+    # this whole-flow entry; its history grows state.tabs 1 -> 2 across the same external
+    # link, so the stamp is still read off a real trace and not off this file.
+    steps = sc.compile_recording("library/07044b6a0dbf7988.recording.json",
                                  emit_start_goto=False)
-    assert [s.get("opens_tab") for s in steps] == [True, None, None, None, None]
+    assert [s.get("opens_tab") for s in steps] == [
+        None, None, None, None, None, True, None, None, None, None, None]
+    # The one stamp is on the external link itself, and the steps after it are the ones
+    # that only exist in the tab it opened.
+    assert steps[5]["fingerprint"]["tag"] == "a"
+    assert steps[5]["expect_text"] == "Open payroll review request as client"
+    assert [steps[6]["expect_text"], steps[-1]["expect_text"]] == [
+        "Already have an OTP", "Proceed Securely"]
 
 
 def test_the_stamp_survives_into_the_tier_1_anchor_bundle():

@@ -355,7 +355,22 @@ FROZEN_TIDS = {
     # re-commented it, this time also parking the Data Request + Send Email slices, and
     # reworded inside the commented block (Apr-26, "next 6 employees"). Decompositions
     # cached under any earlier id are orphaned; the next run authors the task fresh.
-    "payroll_food_limited_e2e_rti": "050d2647bf273450",
+    # Re-frozen 2026-08-26 (050d2647bf273450 -> d926e934ffa1b9ed, commit 24dd5f3): the
+    # RTI half was uncommented again and stayed uncommented — back to 19 slices, the
+    # Data Request + Send Email + Sent-badge + Verify slices live once more.
+    # Re-frozen 2026-08-28 (-> c3cdcff4fcb05376, commit 5a01f26): one word in the
+    # expense slice — the period spellings "April 2026"/"May 2026" became the app's own
+    # "Apr-2026"/"May-2026" so the combobox option text matches literally.
+    # Re-frozen 2026-09-01 (-> 2bdf4881b13c841c, commit 85c3709): THREE edits, and the
+    # slice count went 19 -> 20. The expense periods tightened again (Apr-2026/May-2026
+    # -> Apr-26/May-26, the grid's actual labels) and the bonus Name is capitalised
+    # ("bonus" -> "Bonus") to match the pay element; the FPS slice dropped the "bulk
+    # upload"/"upload FPS" naming for the button's real label ("select FPS ... click FPS
+    # on the bottom"); and its trailing "if it shows an error, click cancel" was lifted
+    # out into a slice of its own under probe {text_visible: "already submitted"}, so
+    # the cancel is a deterministic no-op when no error is shown instead of wording the
+    # agent has to judge. See test_e2e_rti_declared_subtasks_survive_validation.
+    "payroll_food_limited_e2e_rti": "2bdf4881b13c841c",
     # Added 2026-08-11 (user-dictated): Detailed payroll-review data request for the
     # first 12 employees (May-26) + no-reply send, a Pay Elements bonus-row edit
     # open-and-close, Verify All on the new request, then a Jun-26 payrun pass of
@@ -382,15 +397,27 @@ FROZEN_TIDS = {
     # and a run that took the line literally would leave no `otp` in run_values for the
     # consumer to bind to. It says "note and remember the OTP" again. The consumer slice
     # carries the paste reword below (both copies edited byte-identically).
-    "payroll_detailed_review_fps": "8174b98b5f2bd4b7",
-    # The four independently runnable parts of payroll_detailed_review_fps (2026-08-24,
-    # user-requested). Parts 2-4 open with a business-selection slice the full task does
-    # not have, so their prompts — and ids — are their own; part1 is the full task's first
-    # three slices verbatim. See test_detailed_review_fps_parts_partition_the_full_task.
-    # part1/part2 re-frozen 2026-08-24 PM: part1's Data-Request slice and part2's OTP
-    # slice were reworded while running the parts live, and part2 also carries the
-    # portal-loop rewrite above.
-    "payroll_detailed_review_fps_part1": "8be15ae6a6323200",
+    # RETIRED 2026-08-26 (commit 24dd5f3): the whole-task key `payroll_detailed_review_fps`
+    # was deleted from tasks.yaml, and with it old part2 (Bonus + OTP portal) and old part3
+    # (Verify all) — their slices were folded into part1, and old part4 was renamed part2.
+    # The registry is now just the two parts below; the ids retired with the keys were
+    # payroll_detailed_review_fps 8174b98b5f2bd4b7, ..._part3 20bbee5816f20709 and
+    # ..._part4 887ef76ffdfef2ae. Their cached decompositions are unreachable by key.
+    # The two surviving parts still open with a business-selection slice so each runs on
+    # its own; self-contained is not stateless — part1 must have run before part2, whose
+    # FPS submissions need FOOD LIMITED reset or the modal silently refuses.
+    # part1 re-frozen 2026-08-26 (8be15ae6a6323200 -> 2d24198e55c9ded9, commit 24dd5f3):
+    # 3 slices -> 10. It absorbed old part2's body (Bonus pay-element open-and-close, the
+    # OTP portal, payment / expense / deduction, the step-through) and old part3's Verify
+    # all, minus the duplicated business-selection openers. Three rewords rode along: the
+    # Data Request slice says "select ONLY the first 12 employees"; the OTP producer and
+    # consumer merged into ONE slice (copy the 6 digit number, then the external link, the
+    # new tab, and paste into the first code box) so copy_text and paste_text land in the
+    # same segment and the value never has to cross a segment boundary; and the payment
+    # amount moved 4000 -> 4002. The final slice keeps `kind: action` — it is the retired
+    # part3's fix, needed because the button named "Verify all" is the only thing that
+    # made it classify judge, and judge nodes never cache.
+    "payroll_detailed_review_fps_part1": "2d24198e55c9ded9",
     # Re-frozen 2026-08-25 (a04ea4bbd9a0051b -> f3e746bf3633d102): the final slice
     # dropped "until every employee in that list has been done" for "one click each,
     # and do nothing else on any of them". "Done" implied a body and the agent acted on
@@ -423,9 +450,16 @@ FROZEN_TIDS = {
     # added a Submit click to the tail of the final slice ("Then click submit, and then
     # close this tab"). Re-checked, not assumed: it stays kind=action and
     # repeat_hint_from_wording still reads 11.
-    "payroll_detailed_review_fps_part2": "5e882a1cb7ace619",
-    "payroll_detailed_review_fps_part3": "20bbee5816f20709",
-    "payroll_detailed_review_fps_part4": "887ef76ffdfef2ae",
+    # The comment block above this line documents the id history of the RETIRED part2 (the
+    # OTP portal part, last id 5e882a1cb7ace619), which no longer exists. The key `part2`
+    # now names what was part4 — the payrun + FPS pass — renamed in commit 24dd5f3.
+    # part2 (as part4) re-frozen 2026-08-28 (887ef76ffdfef2ae -> ..., commit 5a01f26) and
+    # again 2026-09-01 (-> 07380063784bef3b, commit 85c3709): 6 slices -> 32. The single
+    # Jun-26 pass became nine monthly passes (Jun-26 through Feb-26), each three slices —
+    # change the period in the nav combobox, Save & Next for the first 5 employees, then
+    # FPS submission with New_Employees_List_-_WI_LTD.csv — and the employee count per
+    # pass dropped from "the first 10 ... then the next 7" to a flat first 5.
+    "payroll_detailed_review_fps_part2": "07380063784bef3b",
 }
 
 
@@ -594,16 +628,20 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert joined == spec.prompt          # verbatim partition, no reword drift
 
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
-    # 2026-08-24: the task is its first SIX slices — the RTI half went live in 8393188 and
-    # the user re-commented it, parking the Data Request + Send Email slices with it (that
-    # flow now lives in payroll_detailed_review_fps and its parts). The fakenamegenerator
-    # aux flow is the user's chosen shape, and every slice is a recordable action: the
-    # forecast-load slice was flattened ("wait until the pay rows have loaded", no repeat
-    # cue) and the Net-to-Gross slice lost its refresh-first recovery after the 45-step
-    # seg-4 spiral.
-    assert len(subs) == 6                 # Tier 1 won; no fallback blob
+    # 2026-09-01: TWENTY slices. The RTI half was re-commented on 2026-08-24 (leaving six)
+    # and uncommented for good two days later in 24dd5f3, restoring the Data Request +
+    # Send Email + Sent-badge + Verify slices along with the payrun pass; 85c3709 then
+    # split the FPS slice's trailing "if it shows an error, click cancel" into a probe-
+    # gated slice of its own, taking 19 to 20. The e2e half is unchanged and still the
+    # user's chosen shape: the fakenamegenerator aux producer, then two consumers.
+    assert len(subs) == 20                # Tier 1 won; no fallback blob
     assert not any(getattr(s, "fallback", False) for s in subs)
-    assert [s.kind for s in subs] == ["action"] * 6
+    # Every slice is a recordable action — no judge, so every segment can cache. subs[9]
+    # ("tick the Select Employee checkbox ... and click Verify") is the one to watch: its
+    # kind: action is commented out in tasks.yaml, and it classifies action anyway only
+    # because "click Verify" is an imperative on a control name. If this list ever grows
+    # a "judge", that slice reworded into verification wording and stopped caching.
+    assert [s.kind for s in subs] == ["action"] * 20
     assert subs[1].tab_url and "fakenamegenerator" in subs[1].tab_url   # aux producer
     # The producer-override keeps the noting slice OUT of the consumer net; the two
     # slices that USE the noted identity stay consumers (bindings-only replay).
@@ -611,37 +649,40 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert decompose.consumes_noted_data(subs[2].template_prompt)
     assert decompose.consumes_noted_data(subs[3].template_prompt)
     assert "download" in subs[5].template_prompt.lower()              # download subtask
+    # The RTI half, back from the commented block: the probe-gated popup slice and the
+    # probe-gated Submit-error slice are what make the pass deterministic, and the FPS
+    # slice is the one that needs FOOD LIMITED reset.
+    assert subs[11].probe and subs[17].probe
+    assert subs[16].allow_write_refusal                # FPS submit may honestly refuse
 
 
 # --------------------- payroll_detailed_review_fps, split into parts ---------------------
-# 2026-08-24 (user-requested): the 13-slice task also exists as four independently runnable
-# parts. The full task stays the end-to-end vehicle, so shared slice wording now lives in
-# two places and drifts only on purpose — same arrangement as the e2e halves above.
+# 2026-08-26 (commit 24dd5f3): the four parts became TWO and the whole-task key was deleted,
+# so the parts are now the only vehicle and there is no second copy of any slice to keep in
+# sync — the drift-in-two-places arrangement noted here before is gone with it.
+# part1 = everything up to and including Verify all (old parts 1-3, minus their duplicated
+# openers). part2 = the old part4, renamed, with its single Jun-26 payrun pass expanded to
+# ten monthly passes.
 FPS_PART_SLICE_COUNTS = {
-    "payroll_detailed_review_fps_part1": 3,   # request + send email (full task's 1-3)
-    # The body is split four ways (payment / expense / deduction / step-through) rather
-    # than the full task's single portal slice — the user's choice, 2026-08-25.
-    "payroll_detailed_review_fps_part2": 8,   # opener + bonus + OTP + portal + body x3 + Next
-    "payroll_detailed_review_fps_part3": 2,   # opener + Verify all (8)
-    "payroll_detailed_review_fps_part4": 6,   # opener + payrun pass + FPS (9-13)
+    "payroll_detailed_review_fps_part1": 10,  # opener + request + email + bonus + OTP
+                                              # portal + payment/expense/deduction + Next
+                                              # + Verify all
+    # opener + Jun-26 period + the popup conditional, then one Save-&-Next-x5 + FPS pair
+    # for Jun-26 and a period + pair for each of Jul-26 .. Mar-26: 3 + 2 + 9*3 = 32.
+    "payroll_detailed_review_fps_part2": 32,
 }
 FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business name "
                    "FOOD LIMITED")
-# Node kinds the parts resolve to. part2's portal slice is a loop — three dialogs per
-# employee across a 12-employee list, so it must act live and can never be cached (a
-# replayed loop walks a fixed number of steps and lands anywhere). Its OTP slice is an
-# ACTION despite "note and remember": producer wording is not verification, and a replayed
-# extract re-reads the live OTP. All wording-driven; see decompose.node_kind.
+# Node kinds the parts resolve to — all ACTION, which is the property that matters: judge
+# and (until it was removed on 2026-08-28) loop nodes are never cached, so any slice that
+# flips off "action" starts re-authoring live every run. Two slices are only action because
+# they were made to be. part1's OTP slice is an action despite "copy the 6 digit number"
+# (producer wording is not verification), and its last slice carries an explicit
+# `kind: action` because the button named "Verify all" is otherwise enough to classify it
+# judge. All wording-driven otherwise; see decompose.node_kind.
 FPS_PART_SLICE_KINDS = {
-    "payroll_detailed_review_fps_part1": ["action"] * 3,
-    # All ACTION since 2026-08-25: the final Next-through-employees slice was a loop, and
-    # loop nodes are never cached (hybrid skips the replay and refuses the commit), so it
-    # ran live every run. Reworded to "exactly 11 clicks" — the same fixed-count move the
-    # RTI employee passes took on 2026-08-11 — which keeps it an action and lets it cache.
-    # If this flips back to "loop", a reword reintroduced a repeat + stop cue.
-    "payroll_detailed_review_fps_part2": ["action"] * 8,
-    "payroll_detailed_review_fps_part3": ["action"] * 2,
-    "payroll_detailed_review_fps_part4": ["action"] * 6,
+    "payroll_detailed_review_fps_part1": ["action"] * 10,
+    "payroll_detailed_review_fps_part2": ["action"] * 32,
 }
 
 

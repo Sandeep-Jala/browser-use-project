@@ -102,6 +102,47 @@ async def test_invalid_spec_subtasks_fall_back_to_whole_prompt(library):
     assert subs[0].marker == "Invoices"
 
 
+@pytest.mark.asyncio
+async def test_an_authored_split_is_not_capped_at_max_subtasks(library):
+    """MAX_SUBTASKS catches a RUNAWAY split — an LLM that kept emitting nodes. An author
+    who wrote N slices in tasks.yaml meant N slices.
+
+    The regression this guards: payroll_detailed_review_fps_part2 grew to 32 declared
+    slices (ten monthly payrun+FPS passes) and every run of it silently became ONE
+    whole-prompt blob — no per-segment gates, no cached segments, a logged ERROR nobody
+    was watching. Over the ceiling the failure is total and quiet, which is why it is
+    worth a test rather than a bigger constant."""
+    over = decompose.MAX_SUBTASKS + 8
+    slices = tuple(SubtaskDecl(prompt=f"do step {i}") for i in range(over))
+    prompt = " ".join(d.prompt for d in slices)
+    spec = TaskSpec(key="k", prompt=prompt, subtasks=slices)
+
+    subs = await decompose.get_decomposition(prompt, llm=None, spec=spec)
+    assert len(subs) == over
+    assert not any(s.fallback for s in subs)
+    assert subs[-1].template_prompt == f"do step {over - 1}"
+
+
+@pytest.mark.asyncio
+async def test_an_llm_split_is_still_capped_at_max_subtasks(library):
+    """The waiver is for authored splits only — the hallucination guard is untouched."""
+    over = decompose.MAX_SUBTASKS + 8
+    prompt = " ".join(f"do step {i}" for i in range(over))
+    reply = json.dumps({"subtasks": [
+        {"template_prompt": f"do step {i}", "values": {}, "is_save_step": False}
+        for i in range(over)
+    ]})
+    subs = await decompose.get_decomposition(prompt, llm=StubLLM(reply), marker=None)
+    assert len(subs) == 1 and subs[0].fallback is True
+
+
+@pytest.mark.asyncio
+async def test_an_empty_authored_split_is_still_rejected(library):
+    """Waiving the ceiling must not waive the floor: zero slices is still a broken
+    declaration, not a zero-step task."""
+    assert decompose._validate([], "anything", authored=True)
+
+
 # ------------------------------- tier 2: exact cache -------------------------------
 
 

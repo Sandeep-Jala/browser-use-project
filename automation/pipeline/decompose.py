@@ -42,6 +42,9 @@ _TOKEN = sstore.TOKEN_RE
 # the run degrades to whole_prompt_fallback — one giant node with no per-segment gates.
 # Keep in sync with the "2 to N subtasks" bullet in prompts.DECOMPOSE_SYSTEM_PROMPT: if the
 # prompt states a smaller number the LLM self-limits and raising this constant does nothing.
+# Applies to LLM and derived splits ONLY: a split declared in tasks.yaml is author-written,
+# so there is no runaway to catch and _validate(authored=True) waives the count (2026-09-01,
+# after a 32-slice task silently ran as one blob). Raise this for the LLM's sake alone.
 MAX_SUBTASKS = 24
 
 # Verification wording that marks a subtask as a JUDGE node: its success is a judgment call
@@ -443,15 +446,30 @@ def _as_cache(prompt: str, source: str, subs: list[Subtask]) -> dict[str, Any]:
     }
 
 
-def _validate(raw: list[Any], prompt: str) -> str | None:
+def _count_rule(ceiling: int | None) -> str:
+    return f"1..{ceiling}" if ceiling is not None else "at least 1"
+
+
+def _validate(raw: list[Any], prompt: str, *, authored: bool = False) -> str | None:
     """Why this decomposition is unusable, or None if it is sound.
 
     The hallucination guard mirrors adapt.parameterize: a value the parent prompt never
     contains could not be read out of a future prompt either — and here it also means the
     LLM invented work. Token/value closure guarantees instantiated prompts are concrete.
+
+    `authored` marks a split a human wrote in tasks.yaml (Tier 1). MAX_SUBTASKS is a
+    ceiling on a RUNAWAY split — an LLM that kept emitting nodes — and an author-written
+    list is neither runaway nor hallucinated: it is the declaration the run is supposed to
+    honour. Applying the ceiling to it silently swapped a 32-slice payroll task for one
+    whole-prompt blob (payroll_detailed_review_fps_part2, 2026-09-01), losing every
+    per-segment gate and every cached segment. Only the count is waived; every other rule
+    here still applies to authored splits, and the empty-list case is still rejected.
     """
-    if not isinstance(raw, list) or not (1 <= len(raw) <= MAX_SUBTASKS):
-        return f"expected 1..{MAX_SUBTASKS} subtasks, got {len(raw) if isinstance(raw, list) else type(raw).__name__}"
+    ceiling = None if authored else MAX_SUBTASKS
+    if not isinstance(raw, list):
+        return f"expected {_count_rule(ceiling)} subtasks, got {type(raw).__name__}"
+    if len(raw) < 1 or (ceiling is not None and len(raw) > ceiling):
+        return f"expected {_count_rule(ceiling)} subtasks, got {len(raw)}"
     prompt_lower = " ".join(prompt.split()).lower()
     for i, d in enumerate(raw):
         if not isinstance(d, dict) or not str(d.get("template_prompt", "")).strip():
@@ -670,7 +688,7 @@ async def get_decomposition(
              "allow_write_refusal": getattr(d, "allow_write_refusal", False)}
             for d in declared
         ]
-        problem = _validate(raw, prompt)
+        problem = _validate(raw, prompt, authored=True)
         if problem:
             # A registry declaration is author-maintained; a broken one should be loud.
             logger.error("spec.subtasks for %s invalid (%s); using whole-prompt fallback",
