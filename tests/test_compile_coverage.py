@@ -1110,6 +1110,37 @@ async def test_find_click_verify_name_refuses_wrong_named_match(tmp_path):
         assert await page.evaluate("window.__picked") == "FOOD"
 
 
+# ---- a `done` batched behind other actions is silently discarded (2026-09-02) ----
+# browser-use runs a batched step in order and BREAKS at a `done` that is not the first
+# action ("Done action is allowed only as a single action"), logging it at DEBUG — so it
+# never reaches the run log and the agent gets another step with no reason given. Run
+# 20260902_105732 subtask 3 batched [repeat_click(times=5), done]: all five clicks landed,
+# the `done` vanished, and on the unexplained extra turn the agent read the correct end
+# state as a failure and clicked Save & Next five more times by hand — ten employees paid
+# for a five-employee slice, and the segment cached repeat_click(9).
+
+
+def test_dropped_done_notice_fires_only_when_a_batched_done_was_discarded():
+    from automation.pipeline.runner import dropped_done_notice
+
+    notice = dropped_done_notice(["repeat_click", "done"], finished=False)
+    assert notice is not None
+    # It must name what DID run and forbid redoing it — the redo is the whole failure.
+    assert "repeat_click" in notice
+    assert "DID run" in notice and "Do NOT repeat" in notice
+    assert "ONLY action" in notice
+
+    # `done` as the sole action is executed normally: nothing was dropped.
+    assert dropped_done_notice(["done"], finished=False) is None
+    # It ran (is_done came back) — whatever else the batch held, nothing was discarded.
+    assert dropped_done_notice(["click", "done"], finished=True) is None
+    # No `done` in the batch at all.
+    assert dropped_done_notice(["click", "wait", "search_page"], finished=False) is None
+    # Only the actions BEFORE the dropped done are reported as having run.
+    notice = dropped_done_notice(["click", "wait", "done", "scroll"], finished=False)
+    assert "click, wait" in notice and "scroll" not in notice
+
+
 def test_discovery_loop_notice_fires_on_pure_discovery_streaks():
     from automation.pipeline.runner import discovery_loop_notice
 
@@ -2514,6 +2545,29 @@ def test_the_declared_count_outranks_the_agents_observation(tmp_path):
     The declaration wins — a stated count beats adjacency inference, but not the task."""
     out = tmp_path / "s.json"
     history = [_item({"click": {"index": 1}}, element=_btn())] + [_repeat_item(5)] * 3
+    steps = sc.save_steps(str(_write(tmp_path, history)), out,
+                          emit_start_goto=False, repeat_hint=5)
+    clicks = [x for x in steps if x["action"] == "click"]
+    assert len(clicks) == 1 and clicks[0]["count"] == 5, clicks
+
+
+def test_a_manual_redo_after_a_repeat_is_pinned_back_to_the_declared_count(tmp_path):
+    """Run 20260902_105732 subtask 3, the shape that cached repeat_click(9) for a slice
+    that asked for 5: repeat_click(times=5) landed all five, the agent decided it had
+    failed and clicked Save & Next five more times by hand, and every manual click fused
+    into the stated cluster. Without a declared number nothing corrects that — stated_count
+    shields the cluster from the dissolve, so 9 rode through in both directions.
+
+    With the count declared, the ASK wins over what the agent happened to do."""
+    history = [_repeat_item(5)]
+    for _ in range(5):                      # click / wait / click / wait ... the manual redo
+        history += [_item({"click": {"index": 1}}, element=_btn()),
+                    _item({"wait": {"seconds": 2}})]
+    out = tmp_path / "s.json"
+
+    unpinned = sc.compile_recording(str(_write(tmp_path, history)), emit_start_goto=False)
+    assert [x["count"] for x in unpinned if x["action"] == "click"] == [9]
+
     steps = sc.save_steps(str(_write(tmp_path, history)), out,
                           emit_start_goto=False, repeat_hint=5)
     clicks = [x for x in steps if x["action"] == "click"]

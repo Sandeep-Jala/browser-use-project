@@ -244,14 +244,19 @@ class _FakeDomNode:
 
 
 class _FakeBrowserSession:
-    def __init__(self, nodes):
+    def __init__(self, nodes, page_text=None):
         self._nodes = nodes
+        # The serialized tree the agent is SHOWN — static text included. Absent by
+        # default so every existing caller keeps the no-witness path.
+        self._page_text = page_text
 
     async def get_browser_state_summary(self, include_screenshot=False):
         from types import SimpleNamespace
 
-        return SimpleNamespace(dom_state=SimpleNamespace(selector_map=self._nodes),
-                               url="https://duckduckgo.com")
+        dom = SimpleNamespace(selector_map=self._nodes)
+        if self._page_text is not None:
+            dom.llm_representation = lambda: self._page_text
+        return SimpleNamespace(dom_state=dom, url="https://duckduckgo.com")
 
     async def get_element_by_index(self, index):
         return self._nodes.get(index)
@@ -853,6 +858,49 @@ async def test_find_by_text_click_carries_outcome_receipts(monkeypatch):
     assert "dialog CLOSED" in msg
 
 
+async def test_find_by_text_click_is_charged_to_the_repeat_ledger(monkeypatch):
+    """find_by_text is the OTHER doorway onto a control — the prompt sends the agent here
+    whenever a target looks ambiguous. It neither fed nor checked the repeat ledger, so a
+    redo could spend the whole budget through it without ever being charged."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    _stamped_dialog(monkeypatch, {"present": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {})
+    monkeypatch.setattr(agent_tools, "_REPEAT_TARGETS", set())
+    monkeypatch.setattr(agent_tools, "_REPEAT_BUDGET", None)
+    node = _FakeDomNode("Save & Next", attributes={"id": "btnSave"})
+    node.node_name = "BUTTON"
+    node.tag_name = "button"
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="save & next", click_first=True),
+                   browser_session=_FakeClickSession({4: node}, result=None))
+
+    assert res.error is None
+    assert agent_tools._CLICK_LEDGER == {"id=btnSave": 1}
+
+
+async def test_find_by_text_click_is_refused_when_the_budget_is_spent(monkeypatch):
+    """Closing the guard on `click` alone would just move the redo one tool along."""
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    _stamped_dialog(monkeypatch, {"present": False, "open": 0})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {"id=btnSave": 5})
+    monkeypatch.setattr(agent_tools, "_REPEAT_TARGETS", {"id=btnSave"})
+    monkeypatch.setattr(agent_tools, "_REPEAT_BUDGET", 5)
+    node = _FakeDomNode("Save & Next", attributes={"id": "btnSave"})
+    node.node_name = "BUTTON"
+    node.tag_name = "button"
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="save & next", click_first=True),
+                   browser_session=_FakeClickSession({4: node}, result=None))
+
+    assert res.error and "REFUSED" in res.error and "COMPLETE" in res.error
+    assert res.metadata == {"no_click": True}
+    assert agent_tools._CLICK_LEDGER == {"id=btnSave": 5}, "a refusal clicks nothing"
+
+
 async def test_find_by_text_miss_reports_static_text_instead_of_not_in_dom(monkeypatch):
     """A label that exists as STATIC text (the shadow-DOM modal's 'Period to', run
     20260805_123407_334719) used to get 'the element is not in this page's DOM' — a lie
@@ -904,7 +952,14 @@ async def test_find_by_text_miss_sweeps_from_top_and_resets_after(monkeypatch):
     assert last_top > last_sweep                              # and again after failing
 
 
-async def test_find_by_text_true_miss_still_says_not_in_dom(monkeypatch):
+async def test_find_by_text_true_miss_does_not_claim_the_text_is_absent(monkeypatch):
+    """0 matches means nothing CLICKABLE carries the text — it is not proof the text is
+    off the screen (closed shadow roots and cross-frame content both defeat the probes).
+    Run 20260901_174417 subtask 2 is what the old assertion cost: the receipt told the
+    agent its open Send Email panel "is not in this page's DOM", so it concluded the
+    dropdown must be an icon button, blind-clicked a nameless one, then re-ran the same
+    string through search_page — the "do not repeat this query" clause having read as
+    scoped to find_by_text alone."""
     async def raw(_session, _expr):
         return {"count": 0}
     monkeypatch.setattr(agent_tools, "_eval_js", raw)
@@ -913,8 +968,77 @@ async def test_find_by_text_true_miss_still_says_not_in_dom(monkeypatch):
     res = await fn(params=pm(text="Ghost Section"),
                    browser_session=_FakeBrowserSession({}))
 
-    assert "not in this page's DOM" in res.extracted_content
+    msg = res.extracted_content
+    assert "not in this page's DOM" not in msg
+    assert "NOT proof" in msg
+    # Both causes offered, string first — and each ends in a concrete action.
+    assert "1. THE STRING" in msg and "2. THE PAGE" in msg
+    assert "select_dropdown(near_text=" in msg
+    # The cross-tool loophole step 2 walked through.
+    assert "ANY other tool" in msg
     assert (res.metadata or {}).get("no_click") is True
+
+
+async def test_find_by_text_miss_reads_static_text_from_the_page_state(monkeypatch):
+    """The second witness. The JS probe runs in the main frame AFTER the scroll sweep,
+    against a DOM that may have re-rendered under it; the serialized state is the page
+    the agent actually read. Run 20260901_174417 subtask 2: 'Select sender' was the open
+    panel's combobox placeholder, present in that state message under 'From' (which also
+    still said "Loading ..."), and the JS probe returned 0 regardless."""
+    async def raw(_session, _expr):
+        return {"count": 0}                       # both finders miss
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    shown = "Send email\nFrom\nSelect sender\nInclude signature\nLoading ...\nSend"
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Select sender"),
+                   browser_session=_FakeBrowserSession({}, page_text=shown))
+
+    msg = res.extracted_content
+    assert "STATIC text" in msg and "Select sender" in msg
+    assert "not in this page's DOM" not in msg and "NOT proof" not in msg
+    assert (res.metadata or {}).get("no_click") is True
+
+
+async def test_find_by_text_state_witness_never_pre_empts_the_hidden_click(monkeypatch):
+    """Ordering is load-bearing: the witness runs only AFTER the raw control hunt. In the
+    same run, find_by_text('Send', click_first=true) succeeded through the hidden-click
+    path — and 'Send' is ALSO bare static text in that snapshot. A witness that ran first
+    would turn every working hidden click into an "it's only a label" refusal."""
+    async def raw(_session, expr):
+        if "DOCLICK" in expr:
+            return {"count": 1, "clicked": True, "name": "Send",
+                    "element": {"tag": "button", "attrs": {}, "xpath": ""}}
+        return {"count": 0}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    shown = "Send email\nFrom\nSelect sender\nSend"
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Send", click_first=True),
+                   browser_session=_FakeBrowserSession({}, page_text=shown))
+
+    assert "STATIC text" not in res.extracted_content
+
+
+async def test_find_by_text_static_text_branch_addresses_the_field_by_label(monkeypatch):
+    """The branch fires exactly when the query names text that owns no control — the
+    precondition near_text was built for. Sending the agent to look up an INDEX there is
+    what produced the blind click(index=271); it must address the field by the label."""
+    async def raw(_session, expr):
+        if "DOCLICK" in expr:
+            return {"count": 0}
+        return {"count": 1, "name": "Period to",
+                "element": {"tag": "div", "attrs": {}, "xpath": ""}}
+    monkeypatch.setattr(agent_tools, "_eval_js", raw)
+
+    fn, pm = _registered_action("find_by_text")
+    res = await fn(params=pm(text="Period to"),
+                   browser_session=_FakeBrowserSession({}))
+
+    msg = res.extracted_content
+    assert "select_dropdown(near_text='Period to'" in msg
+    assert "combobox input's" not in msg          # the stale index advice is gone
+    assert "do NOT click an index near it" in msg
 
 
 # ------------------------- select_dropdown read-back override -------------------------
@@ -1849,6 +1973,7 @@ async def test_still_advancing_at_the_cap_is_a_failure_not_a_finished_list(monke
 def _budget(monkeypatch, n, verdicts=None):
     _ready(monkeypatch, verdicts if verdicts is not None else [(True, "")] * 40)
     monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {})
+    monkeypatch.setattr(agent_tools, "_REPEAT_TARGETS", set())
     monkeypatch.setattr(agent_tools, "_REPEAT_BUDGET", n)
 
 
@@ -1872,7 +1997,12 @@ async def test_the_receipt_names_the_control(monkeypatch):
     assert "element 4" not in res.extracted_content
 
 
-async def test_a_second_repeat_is_refused_once_the_budget_is_spent(monkeypatch):
+async def test_a_second_repeat_does_no_work_once_the_budget_is_spent(monkeypatch):
+    """The invariants here are the ones that stopped run 20260901_122209 — a second repeat
+    performs NO clicks and never compiles. Its CHANNEL changed on 2026-09-03: it used to be
+    an error reading "REFUSED — did NOT click", which run 20260903_114110_507756 quoted as
+    its reason for reporting a completed step incomplete. A request already satisfied is
+    answered on the success channel now; see tests/test_repeat_satisfied.py."""
     _budget(monkeypatch, 5)
     fn, _pm = _registered_action("repeat_click")
     node = _save_next()
@@ -1885,9 +2015,9 @@ async def test_a_second_repeat_is_refused_once_the_budget_is_spent(monkeypatch):
     assert first.metadata["repeat"]["count"] == 5
 
     second = await fn(index=4, times=5, browser_session=session)
-    assert second.error and "COMPLETE" in second.error
+    assert "COMPLETE" in second.extracted_content
     assert second.metadata == {"no_click": True}      # never compiles
-    assert len(clicks) == 5, "the refused call must not click at all"
+    assert len(clicks) == 5, "the satisfied call must not click at all"
 
 
 async def test_a_manual_click_counts_against_the_budget(monkeypatch):
@@ -1922,6 +2052,116 @@ async def test_no_declared_budget_leaves_the_tool_unconstrained(monkeypatch):
     assert "6 click(s) on it in this step" in res.extracted_content
 
 
+# ------- the budget must also bind PLAIN clicks on the repeated control (2026-09-02) -------
+# Run 20260902_105732 subtask 3 went the opposite way round to run 20260901_122209:
+# repeat_click(times=5) landed all five clicks, browser-use silently DROPPED the `done` the
+# agent had batched behind it, and on the unexplained extra turn the agent read the correct
+# end state (the 6th, unsaved employee on screen) as a failure and clicked Save & Next five
+# more times BY HAND. It obeyed the letter of "do NOT call repeat_click again" and walked
+# straight past the guard, because the guard only ever ran inside repeat_click. Ten
+# employees were paid for a five-employee slice and the segment cached repeat_click(9).
+#
+# The budget is one segment-wide number while the ledger is keyed per control, so it may
+# only bind a control repeat_click has ACTUALLY repeated — capping every other button in
+# the segment at the same N would be an over-reach.
+
+
+async def _spend_the_budget(monkeypatch, node, n=5):
+    """Run the repetition that makes `node` the control this segment's budget is about."""
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: node})
+    session.event_bus.dispatch = lambda _e: _FakeEvent(None)
+    res = await fn(index=4, times=n, browser_session=session)
+    assert res.error is None
+    return res
+
+
+async def test_a_manual_click_is_refused_once_the_repetition_is_complete(monkeypatch):
+    from types import SimpleNamespace
+
+    _budget(monkeypatch, 5)
+    node = _save_next()
+    await _spend_the_budget(monkeypatch, node)
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    clicked = []
+
+    async def _builtin(params=None, browser_session=None):
+        clicked.append(1)
+        raise AssertionError("the refused click must never reach the built-in")
+
+    res = await agent_tools._click_with_dialog_outcome(
+        _builtin, SimpleNamespace(index=4), _FakeBrowserSession({4: node}))
+
+    assert not clicked
+    assert res.error and "REFUSED" in res.error and "COMPLETE" in res.error
+    assert res.metadata == {"no_click": True}          # never compiles into the recording
+
+
+async def test_the_refusal_does_not_inflate_the_ledger(monkeypatch):
+    """A refusal clicked nothing, so it must not be counted — otherwise the receipts start
+    reporting clicks that never happened."""
+    from types import SimpleNamespace
+
+    _budget(monkeypatch, 5)
+    node = _save_next()
+    await _spend_the_budget(monkeypatch, node)
+    before = dict(agent_tools._CLICK_LEDGER)
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+
+    await agent_tools._click_with_dialog_outcome(
+        _fake_builtin_click, SimpleNamespace(index=4), _FakeBrowserSession({4: node}))
+
+    assert agent_tools._CLICK_LEDGER == before == {"id=btnSave": 5}
+
+
+async def test_a_different_control_is_never_capped_by_the_budget(monkeypatch):
+    """The scoping guarantee: "exactly 5 clicks" of Save & Next says nothing about how many
+    times any OTHER button in the segment may be clicked."""
+    from types import SimpleNamespace
+
+    _budget(monkeypatch, 5)
+    await _spend_the_budget(monkeypatch, _save_next())
+    other = _FakeDomNode("FPS", attributes={"id": "btnFps"})
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+
+    for _ in range(7):
+        res = await agent_tools._click_with_dialog_outcome(
+            _fake_builtin_click, SimpleNamespace(index=9),
+            _FakeBrowserSession({9: other}))
+        assert res.error is None, "an unrepeated control carries no budget"
+    assert agent_tools._CLICK_LEDGER["id=btnFps"] == 7
+
+
+async def test_a_control_never_repeated_is_not_capped_either(monkeypatch):
+    """Only a control repeat_click actually ran on joins _REPEAT_TARGETS. Without that, a
+    declared count would silently cap the first button the agent happened to click twice."""
+    from types import SimpleNamespace
+
+    _budget(monkeypatch, 1)
+    node = _save_next()
+    _dialog_states(monkeypatch, None, None)
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+
+    for _ in range(3):
+        res = await agent_tools._click_with_dialog_outcome(
+            _fake_builtin_click, SimpleNamespace(index=4),
+            _FakeBrowserSession({4: node}))
+        assert res.error is None
+    assert agent_tools._REPEAT_TARGETS == set()
+
+
+def test_the_repeat_targets_set_is_per_segment(monkeypatch):
+    monkeypatch.setattr(agent_tools, "_REPEAT_TARGETS", {"id=btnSave"})
+    agent_tools.set_live_network(object())
+    try:
+        assert agent_tools._REPEAT_TARGETS == set(), "a new segment starts from zero"
+    finally:
+        agent_tools.clear_live_network()
+
+
 def test_the_ledger_is_per_segment(monkeypatch):
     monkeypatch.setattr(agent_tools, "_CLICK_LEDGER", {"id=btnSave": 5})
     agent_tools.set_live_network(object())
@@ -1930,3 +2170,87 @@ def test_the_ledger_is_per_segment(monkeypatch):
     finally:
         agent_tools.clear_live_network()
 
+
+
+# ---------------- the loop must not walk through a RELABEL (2026-09-01) ----------------
+# Run 20260901_165748 subtask 8: repeat_click(times=0) reported "Clicked Next 12 times,
+# until it stopped advancing (the control left the page)". The 12th click was the SUBMIT —
+# the app relabels the same button Next -> Submit on the last employee, and _REPEAT_READY_JS
+# checks connected/disabled/visible and never the name (its comment says it deliberately
+# "survives a re-render that keeps the same element"). So the loop clicked Submit as
+# iteration 12, the follow-up find_by_text('Submit') honestly found 0 matches on the Thank
+# You page, and the committed entry was ONE action — repeat_until_done('next') — with no
+# submit step in it at all. 11 Next + 1 Submit recorded as 12 Next.
+
+
+def _names(monkeypatch, seq):
+    """Script the between-clicks NAME probe (one read per readiness check)."""
+    vals = list(seq)
+
+    async def fake(_session, _node):
+        return vals.pop(0) if vals else (vals[-1] if vals else "")
+    monkeypatch.setattr(agent_tools, "_repeat_live_name", fake)
+
+
+def test_relabel_predicate_needs_two_real_names():
+    assert agent_tools._repeat_relabelled("Next", "Submit") is True
+    assert agent_tools._repeat_relabelled("Next", "Next") is False
+    # Fail OPEN on an unreadable name: a blank must never stop a healthy loop.
+    assert agent_tools._repeat_relabelled("Next", "") is False
+    assert agent_tools._repeat_relabelled("", "Submit") is False
+
+
+def test_relabel_predicate_ignores_case_spacing_and_icon_glyphs():
+    """Fluent renders icons as literal PUA text nodes inside the control, so the raw name
+    flickers between renders; only a real word change may stop the loop."""
+    assert agent_tools._repeat_relabelled("Save & Next", " save &  next ") is False
+    assert agent_tools._repeat_relabelled("Next", " Next") is False
+
+
+async def test_until_done_stops_when_the_control_is_relabelled(monkeypatch):
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Next")})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+    _ready(monkeypatch, [(True, "")] * 10)
+    # baseline read, then: still "Next" twice, then the button becomes Submit.
+    _names(monkeypatch, ["Next", "Next", "Next", "Submit"])
+
+    res = await fn(index=4, times=0, browser_session=session)
+
+    assert len(clicks) == 3                       # the Submit is NOT clicked as iteration 4
+    assert res.metadata["repeat"]["count"] == 3
+    assert "Submit" in res.extracted_content and "Next" in res.extracted_content
+    # And it must tell the agent to act on the new control as its OWN step, so the
+    # recording gets a real click('submit') instead of a swallowed iteration.
+    assert "OWN action" in res.extracted_content
+    assert "do NOT call repeat_click" in res.extracted_content
+
+
+async def test_counted_mode_refuses_when_the_control_is_relabelled_early(monkeypatch):
+    """A counted loop that hits a different control is a SHORTFALL, not a finished run:
+    error channel, and no repeat metadata that could be cached as a step."""
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Save & Next")})
+    session.event_bus.dispatch = lambda _e: _FakeEvent(None)
+    _ready(monkeypatch, [(True, "")] * 10)
+    _names(monkeypatch, ["Save & Next", "Save & Next", "FPS"])
+
+    res = await fn(index=4, times=6, browser_session=session)
+
+    assert res.error and "only 2 of the 6" in res.error
+    assert "FPS" in res.error
+    assert res.metadata.get("repeat") is None
+
+
+async def test_an_unreadable_name_never_stops_the_loop(monkeypatch):
+    """Fail open: the name probe going blank must not truncate a healthy run."""
+    fn, _pm = _registered_action("repeat_click")
+    session = _FakeClickSession({4: _FakeDomNode("Next")})
+    clicks = []
+    session.event_bus.dispatch = lambda _e: (clicks.append(1), _FakeEvent(None))[1]
+    _ready(monkeypatch, [(True, "")] * 10)
+    _names(monkeypatch, ["Next", "", "", ""])
+
+    res = await fn(index=4, times=4, browser_session=session)
+    assert len(clicks) == 4 and "4 of 4" in res.extracted_content

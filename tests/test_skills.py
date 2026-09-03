@@ -467,3 +467,72 @@ async def test_a_failure_BEFORE_the_optional_tail_still_fails(stores):
     out = await _execute_code(Skill(sid="s", body="code", code=code), page=None,
                               timeout_ms=1000, api=stub)
     assert out["failed_at"] == 0 and "boom" in out["error"]
+
+
+# ---------------- repeat verbs must not collapse the selector ladder (2026-09-01) ----------
+
+_XP = "xpath=/html/body/div/div/form/div[2]/div[2]/button"
+_NAMED = 'css=button:text-is("Next")'
+
+
+def _ladder_api(monkeypatch, winner):
+    """A SkillApi whose clicks always land on `winner`, recording the selector ladder
+    each iteration was given."""
+    from automation.skills import api as api_mod
+
+    ladders = []
+
+    async def fake_click(page, step, timeout_ms):
+        ladders.append(list(step["selectors"]))
+        return winner, None
+
+    monkeypatch.setattr(api_mod, "_click_with_retry", fake_click)
+    api = api_mod.SkillApi(_FakeReadyPage(), {"next": {"selectors": [_XP, _NAMED]}})
+    return api, ladders
+
+
+async def test_repeat_click_keeps_the_fallback_ladder_after_pinning(monkeypatch):
+    """Pinning the winning selector must PROMOTE it, never replace the ladder.
+
+    Collapsing to one selector makes it `last` in _resolve_step, which activates the
+    ambiguity concession ("act on the first visible match") — a concession meant only
+    for when the durable candidates are EXHAUSTED. Measured live (run
+    20260901_160947, subtask 8, entry 7320039db9ba7e26): the positional xpath was
+    unique on iteration 1 and got pinned, discarding `css=button:text-is("Next")`;
+    from iteration 2 it matched 2 visible buttons, the fingerprint gate could not tell
+    them apart (both `button` + `type=button`; recorded text is deliberately not
+    compared), and the loop ping-ponged — 34 advance POSTs across exactly 2 employees,
+    17 each, strictly alternating, heading for the cap of 200.
+    """
+    api, ladders = _ladder_api(monkeypatch, _XP)
+    await api.repeat_click("next", 3, 0.0)
+    assert len(ladders) == 3
+    assert ladders[0] == [_XP, _NAMED]
+    # The self-named fallback must still be reachable on every later iteration.
+    assert _NAMED in ladders[1] and _NAMED in ladders[2]
+
+
+async def test_repeat_click_promotes_the_winner_to_the_front(monkeypatch):
+    """The speed-up is kept: the selector that won is tried first next time."""
+    api, ladders = _ladder_api(monkeypatch, _NAMED)
+    await api.repeat_click("next", 2, 0.0)
+    assert ladders[0] == [_XP, _NAMED]
+    assert ladders[1] == [_NAMED, _XP]
+
+
+async def test_repeat_until_done_keeps_the_fallback_ladder_after_pinning(monkeypatch):
+    """The until-done twin pins the same way and needs the same ladder."""
+    from automation.skills import api as api_mod
+
+    api, ladders = _ladder_api(monkeypatch, _XP)
+    rounds = {"n": 0}
+
+    async def stop_after_three(self, step, handle):
+        rounds["n"] += 1
+        if rounds["n"] >= 3:
+            raise RuntimeError("stopped advancing")
+
+    monkeypatch.setattr(api_mod.SkillApi, "_await_repeat_ready", stop_after_three)
+    assert await api.repeat_until_done("next", 0.0) == 3
+    assert ladders[0] == [_XP, _NAMED]
+    assert _NAMED in ladders[1] and _NAMED in ladders[2]

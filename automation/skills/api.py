@@ -24,12 +24,15 @@ from typing import Any, Awaitable, Callable
 
 from playwright.async_api import Page
 
+from automation.pipeline.subtask_store import rebase_to_live
 from automation.pipeline.script_compile import (_REOPEN_MS, _SETTLE_MS, _click_with_retry,
+                                                _close_and_return,
                                                 _click_and_follow, _esc, _extract_value,
                                                 _fill_with_retry,
                                                 _find_click, _paste_with_retry,
                                                 _resolve_with_scroll,
-                                                _select_with_retry, _upload_with_retry,
+                                                _select_with_retry, _step_selectors,
+                                                _upload_with_retry,
                                                 _wheel_scroll, merge_extract)
 
 logger = logging.getLogger("framework.skills.api")
@@ -50,6 +53,29 @@ interrupt_handlers: list[InterruptHandler] = []
 # The footprint of an OPEN custom dropdown menu (react-select listbox / option ids, ARIA
 # listboxes). Used by select_option to decide whether typing-to-filter has anywhere to go.
 _OPEN_MENU_CSS = '[id$="-listbox"], [role="listbox"], [id*="-option-"]'
+
+
+def _pinned_ladder(step: dict[str, Any], sel: str) -> list[str]:
+    """The step's selectors with the winning one PROMOTED to the front — never replaced
+    by it.
+
+    The repeat verbs pin whatever resolved first so later iterations skip the ladder,
+    but collapsing to a single selector also makes that selector `last` in
+    _resolve_step, which is what enables its ambiguity concession: act on the first
+    visible match. That concession exists for when the durable candidates are
+    EXHAUSTED, and a one-element cache fakes exhaustion.
+
+    Measured (run 20260901_160947, subtask 8, entry 7320039db9ba7e26 "click Next for
+    all of the remaining employees"): the positional xpath was unique on iteration 1
+    and got pinned, discarding `css=button:text-is("Next")`. From iteration 2 it
+    matched two visible buttons; the fingerprint gate cannot separate them (both
+    `button` with `type=button`, and it deliberately does not compare text), so each
+    click was a coin flip. 34 advance POSTs landed across exactly two employees, 17
+    each, strictly alternating, on course for the cap of 200. Keeping the fallbacks
+    means an ambiguous pin is rejected AS ambiguous and the self-named candidate
+    behind it decides.
+    """
+    return [sel] + [s for s in _step_selectors(step) if s != sel]
 
 
 class SkillApi:
@@ -276,7 +302,7 @@ class SkillApi:
                 cached = None
                 sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
             if cached is None and not sel.endswith("(hidden dispatch)"):
-                cached = {**step, "selectors": [sel]}
+                cached = {**step, "selectors": _pinned_ladder(step, sel)}
             self._last_click = step
             self._record("click", handle, sel, healed)
             await self.page.wait_for_timeout(_SETTLE_MS)
@@ -309,7 +335,7 @@ class SkillApi:
                 cached = None
                 sel, healed = await _click_with_retry(self.page, step, self.timeout_ms)
             if cached is None and not sel.endswith("(hidden dispatch)"):
-                cached = {**step, "selectors": [sel]}
+                cached = {**step, "selectors": _pinned_ladder(step, sel)}
             self._last_click = step
             self._record("click", handle, sel, healed)
             done += 1
@@ -565,6 +591,22 @@ class SkillApi:
             logger.debug("skill clipboard write failed: %s", exc)
         return value
 
+    async def close_tab(self) -> None:
+        """Close the tab this skill is running in and continue in the one it came from —
+        the compiled form of a segment that ends "…and then close this tab".
+
+        Left undone, the tab stays open AND stays pinned as the session's aux page, so the
+        next subtask replays inside it (run 20260902_091047_561480: subtask 9 ran the Data
+        Request grid's selectors against the portal tab). Refuses to close the last open
+        tab, like the live agent's close does — see script_compile._close_and_return."""
+        self._acting()
+        self.page = await _close_and_return(self.page)
+        self._done("close_tab")
+
     async def goto(self, url: str) -> None:
-        await self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        """Navigate, REBASED onto the live page (see subtask_store.rebase_to_live): a
+        recorded absolute URL carries the authoring run's client id, and replaying it
+        verbatim moved the run to a different company mid-task."""
+        await self.page.goto(rebase_to_live(url, self.page.url),
+                             wait_until="domcontentloaded", timeout=self.timeout_ms)
         self._done("goto")

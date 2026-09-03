@@ -632,3 +632,46 @@ def test_an_iframe_document_does_not_open_a_page_load_window(tmp_path):
 
     record, = [r for r in c.results()["requests"] if r["url"].endswith("/Save")]
     assert record["after_page_load"] is False
+
+
+# ---------------- the bounce must read the LATEST write, not the first (2026-09-01) -------
+# Run 20260901_163709 subtask 8 ("click Next for all the remaining employees, then Submit,
+# then close this tab"): the agent advanced 11 employees (11 accepted finalSubmit=false
+# writes), clicked Submit, and the server REFUSED it — 200 with "Unable to sent email to
+# client." The agent honestly called fail_and_stop. The bounce stepped OVER that refusal,
+# found the FIRST of the 11 routine advances, and told the agent the record exists and to
+# continue. With the portal tab already closed it re-opened the review panel in the app and
+# re-entered all 11 employees through the agent-side screen (agentEntry=true) before the
+# run was killed by hand. A refusal that lands AFTER the last accepted write is evidence
+# the claim is TRUE — it must never be the thing that refutes it.
+
+
+def _refused_submit():
+    return _write_snapshot(
+        body=_APRIL_BODY,
+        url="https://api.app/CalculationDataRequest/6a96/Employee/6a91?finalSubmit=true")
+
+
+async def test_fail_and_stop_does_not_bounce_when_the_latest_write_was_refused():
+    agent_tools.set_live_network(_FakeLiveNetwork(
+        [_accepted_business_write(), _accepted_business_write(), _refused_submit()]))
+    try:
+        res = await agent_tools._fail_and_stop_result("Unable to send email to client")
+        assert res.is_done is True and res.success is False
+        assert res.error == "Unable to send email to client"
+    finally:
+        agent_tools.clear_live_network()
+
+
+async def test_fail_and_stop_bounce_cites_the_latest_accepted_write():
+    """When the segment's last word IS an acceptance, the bounce still fires — and cites
+    the write the agent is actually reacting to (the most recent), not the oldest."""
+    early = _write_snapshot(body=_MAY_BODY, url="https://api.app/Years/27/EARLY")
+    latest = _write_snapshot(body=_MAY_BODY, url="https://api.app/Years/27/LATEST")
+    agent_tools.set_live_network(_FakeLiveNetwork([early, latest]))
+    try:
+        res = await agent_tools._fail_and_stop_result("nothing saved")
+        assert res.error and "REFUSED" in res.error
+        assert "LATEST" in res.error and "EARLY" not in res.error
+    finally:
+        agent_tools.clear_live_network()

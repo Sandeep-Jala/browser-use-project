@@ -822,13 +822,6 @@ payroll_food_limited_e2e_rti:
         the grid header row, left of 'Employees', selects or unselects all employees at
         once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click FPS on the bottom, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit.
-      # This slice declares its own error branch ("if it shows an error, click
-      # cancel"), so a REFUSED FPS submit is a sanctioned ending, not a failed
-      # segment. Without the waiver the window write rule demotes it (run
-      # 20260831_163108: "Bryan Christie's FPS of this period is already submitted")
-      # and the loop stops with the last two slices unrun. The refusal is still
-      # reported under the segment's write_rollup, and a run whose submit IS accepted
-      # commits to the library as normal.
       allow_write_refusal: true
     - prompt: >-
         If an error is shown after Submit, click Cancel to close it.
@@ -889,80 +882,316 @@ payroll_detailed_review_fps_part2:
   tags: [payroll]
   subtasks:
     - prompt: >-
-        Go to the Payroll module, search for and select the business name FOOD LIMITED.
+        Go to the Payroll module, search for and select the business name Food Alchemy LTD.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Jun-26 through the combobox in the
+        Then go to Payroll & RTI and change the period to Apr-26 through the combobox in the
         nav bar.
     - prompt: >-
         If a popup appears at any point after clicking Save & Next, tick 'Don't show this
         again', click Process, and continue.
+      probe: {text_visible: "Don't show this again"}
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the
         next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        Then click bulk uplaod FPS submission, click on Employees checkbox to uncheck it, and then select the first 5 employees checkbox, click upload FPS button, select the reason H - correction to earlier submission from the combobox, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit.
     - prompt: >-
-        change the period to Jul-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to May-26 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Jun-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+       Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.    
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Jul-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Aug-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Sep-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit. 
     - prompt: >-
-        change the period to Aug-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Oct-26 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
     - prompt: >-
-        change the period to Sep-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Nov-26 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
     - prompt: >-
-        change the period to Oct-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Dec-26 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
     - prompt: >-
-        change the period to Nov-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Jan-27 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
     - prompt: >-
-        change the period to Dec-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Feb-27 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
     - prompt: >-
-        change the period to Jan-26 through the combobox in the nav bar.
+        Then go to Payroll & RTI and change the period to Mar-27 through the combobox in the nav bar.
     - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
-    - prompt: >-
-        change the period to Feb-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
-    - prompt: >-
-        change the period to Mar-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        click FPS submission, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+
     
+payroll_client:
+  tags: [payroll]
+  subtasks:
+    # - prompt: >-
+    #     Go to clients section, click on + Add, then search and select business name Food Alchemy LTD, click Add
+    #     contact, set first name Sandy, set last name Japna, set designation as director, and
+    #     click on save.
+    - prompt: >-
+        Go to the Payroll module, search for and select the business name Food Alchemy LTD, then
+        go to the Employee section.
+    - prompt: >-
+        Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
+        URL directly shows a freshly generated identity: male, Scottish name set, United
+        Kingdom). From the generated identity, note and remember exactly these details for use
+        in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
+    - prompt: >-
+        Return to the Payroll tab and click Add Employee, then fill in the form using the
+        noted details: enter the noted name, address, and gender; enter the noted date of
+        birth converted to dd/mm/yyyy format; set the join date to 06/04/2026; set Join With
+        to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
+        with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 06/04/2026 and with loan end date
+        01/07/2027; then click Save.
+    # - prompt: >-
+    #     Go to employee section. Click Import, upload the file Employees_List.csv using the Select or drop
+    #     file control, and save, and then click save.
+    # - prompt: >-
+    #     Go to pension section. Add a pension scheme: provider nest, set scheme name nesting pension, employer reference EMP54637, set payment frequency monthly, set Payment due date as on specific date and select on 1st, set no tax relief, 
+    #     set earnings basis standard qualifying earnings, set contribution type minimum contribution rate, set payment source other, and save. Go to assignment, select employer, select the first 2 and last 2 employees, unselect everything else, 
+    #     select nesting pension, set assign date 06/04/2026, and save.
+    - prompt: >-
+        Next go to Pay Forecast,Refresh the page and then type the noted employee name into the combobox and select
+        the employee, and wait until the employee's pay rows have loaded.
+    - prompt: >-
+        Once the pay rows are loaded, set the pay of Dec-26 to 5000; this also raises the
+        pay shown for the months after it, which is normal — leave those as they are. Then
+        set the net pay of Feb-27 to 4000 using the Net to Gross option: click the pencil
+        icon at the right end of the Feb-27 row, and in thepopup that opens, type 4000 into the Net amount box beside the £ sign (it starts at 0; do not type into the grid's own pay cells
+        behind the popup) and click Calculate. The popup closes on Calculate and the Feb-27 row then shows a £4,000.00
+        net pay; if the popup closed before you clicked Calculate or the box would not
+        take the value, reopen it with the same pencil icon and enter it again.
+    - prompt: >-
+        Then click Download and select PDF, then click Download again and select Excel.
+    - prompt: >-
+        Then go to Data Request, click Add Request, click Payroll Review, and click
+        Standard. Scroll down inside the employee list itself, not the page (only a
+        window of rows is rendered at once), until the noted employee's name comes into
+        view, tick the checkbox on that employee's row, and click Save.
+    - prompt: >-
+        In the Send Email section that opens, open the From dropdown and select the no-reply
+        option, then click Send; if the Send Email section has not closed after clicking Send, click Send again.
+        If the email was not sent, it is saved as Drafted; click the email button next to
+        the Drafted status to reopen the Send Email section,open the From dropdown and select the no-reply option, then click Send.
+    - prompt: >-
+        Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
+        click the blue Sent badge in its Status column to open the Payroll Status dialog; in
+        that dialog set Status to Submitted, type well done in the Notes field, and click
+        Save.
+    - prompt: >-
+        Then click the ref. no. link on that same top row to open the Payroll Review panel,
+        tick the Select Employee checkbox at the top of that panel so that the Verify button
+        becomes enabled, and click Verify. The task is complete after clicking Verify.
+    - prompt: >-
+        then go to Payroll & RTI, in the combobox select Monthly and the combobox next to it
+        select Apr-26, and click Save & Next.
+    - prompt: >-
+        If a popup appears at any point after clicking Save & Next, tick 'Don't show this
+        again', click Process, and continue.
+      probe: {text_visible: "Don't show this again"}
+    - prompt: >-
+        Click Save & Next for the next 6 employees: exactly 6 clicks, waiting for the next
+        employee to fully load after each click.
+    - prompt: >-
+        With the 7th employee of the pay run now shown, click Add Expenses or Benefits, set
+        Type to 'Assets transferred', set the period from Apr-26 and set period to May-26, set Cost to 200, set Employee contribution to 100, and click Save. Add this
+        expense exactly once: the dialog simply closes on Save with no confirmation
+        message, and the grid then lists the expense at its net value 100.00 (the 200 cost
+        minus the 100 contribution), which is a successful add; do not click Add Expenses
+        or Benefits again;
+    - prompt: >-
+        then click the + next to the Additions or Deductions section to open the Add Addition
+        or Deduction dialog, set Type to 'Additions', set Amount to 500, set Period to May 26,
+        set Name to Bonus, and click Save. Add this bonus exactly once too: this Save also
+        closes silently with no confirmation message; do not reopen the dialog or add it
+        again.
+    - prompt: >-
+        Then click Save & Next for the next 5 employees in the same way: exactly 5 more
+        clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS which is a button next to Save & Next. The checkbox in
+        the grid header row, left of 'Employees', selects or unselects all employees at
+        once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click FPS on the bottom, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+      allow_write_refusal: true
+    - prompt: >-
+        If an error is shown after Submit, click Cancel to close it.
+      probe: {text_visible: "already submitted"}
+    - prompt: >-
+        Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to
+        May-26, and click Save & Next exactly 3 times.
+    - prompt: >-
+        Finally, go to Clients, go to Practice Settings, click Edit, select alphabetic order A
+        to Z, and click Save. The task is complete after that final Save; take no further
+        actions.
+    - prompt: >-
+        Now Go to Data Request Section. Click + Request, click Payroll Review, click Detailed, change the date combobox to
+        May-26, select only the first 12 employees in the list, and click Save.
+    - prompt: >-
+        In the Send Email section that opens, click on the dropdown next to from and select the no-reply
+        option, then click Send; if the Send Email section has not closed after clicking
+        Send, click Save again. If the email was not sent, it is saved as Drafted; click the
+        email button next to the Drafted status to reopen the Send Email section, then click
+        Send. if you see a notification of "Why not wish them a great weekend 🙂", click send again.
+    - prompt: >-
+        Go to Settings, go to Pay Elements, and click the edit option on the row whose
+        element name is Bonus; when the edit dialog opens, close it without changing
+        anything.
+    - prompt: >-
+        Now go to Data Request, and on the top row (S.No. 1, the newest request) click the
+        ref. no. to open the Payroll Review panel, and click Get OTP, copy the 6 digit number (OTP), close the review panel.
+        Now click on the external link button next to the ref. no, A new tab will be open click Already have an OTP, paste the OTP from the previous step into the first code box and click proceed Securely. 
+    - prompt: >-
+        click the + button next to payment, enter 4002 in the amount field, click Save. 
+    - prompt: >-
+        CLick + next to the Add Expenses or benefits, select type Payment on behalf. period to Jun-26,
+        enter the amount 200 and click Save. 
+    - prompt: >-
+        click the + next tot he Addition or Deductions, select type Deduction, period to Jun-26, Select Name Salary sacrifice, Description Salary sacrifice for childminder,
+        Amount 1000, enter click Save. 
+    - prompt: >-
+        Then click Next for all of the remaining employees, waiting for the
+        next employee to fully load after each click and doing nothing else on any of them.
+        Then click submit, and then close this tab.
+    - prompt: >-
+        Now go to Data Request, click on the staus of the top ref. no., Select the Status Submitted and Add a note, Well done and Save. and click on the top ref. no. link to open the Payroll Review panel, click the employee checkbox to select all the employee and then click Verify all.
+      kind: action
+    - prompt: >-
+        Go to the Payroll module, search for and select the business name FOOD LIMITED.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to May-26 through the combobox in the
+        nav bar.
+    - prompt: >-
+        If a popup appears at any point after clicking Save & Next, tick 'Don't show this
+        again', click Process, and continue.
+      probe: {text_visible: "Don't show this again"}
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the
+        next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Jun-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+       Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.    
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Jul-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Aug-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Sep-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit. 
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Oct-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Nov-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Dec-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Jan-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Feb-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.
+    - prompt: >-
+        Then go to Payroll & RTI and change the period to Mar-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
+        click Submit.

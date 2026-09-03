@@ -370,7 +370,10 @@ FROZEN_TIDS = {
     # out into a slice of its own under probe {text_visible: "already submitted"}, so
     # the cancel is a deterministic no-op when no error is shown instead of wording the
     # agent has to judge. See test_e2e_rti_declared_subtasks_survive_validation.
-    "payroll_food_limited_e2e_rti": "2bdf4881b13c841c",
+    # Re-pinned 2026-09-02 for edits ALREADY in the working tree before that day's
+    # repeat-budget work: the FPS slice went back to "Bulk upload FPS" and the
+    # already-submitted waiver comment was dropped. Not caused by the reword of part2.
+    "payroll_food_limited_e2e_rti": "abae6339e8b7484b",
     # Added 2026-08-11 (user-dictated): Detailed payroll-review data request for the
     # first 12 employees (May-26) + no-reply send, a Pay Elements bonus-row edit
     # open-and-close, Verify All on the new request, then a Jun-26 payrun pass of
@@ -459,7 +462,18 @@ FROZEN_TIDS = {
     # change the period in the nav combobox, Save & Next for the first 5 employees, then
     # FPS submission with New_Employees_List_-_WI_LTD.csv — and the employee count per
     # pass dropped from "the first 10 ... then the next 7" to a flat first 5.
-    "payroll_detailed_review_fps_part2": "07380063784bef3b",
+    # Reworded 2026-09-02 to ": exactly 5 clicks" on all twelve Save & Next slices, so
+    # repeat_hint_from_wording arms the repeat budget and pins the compiled count (run
+    # 20260902_105732 cached repeat_click(9) for a five-employee slice).
+    # Re-pinned 2026-09-02 (later that day) for tasks.yaml edits made outside the prompt
+    # work: the pass now opens on May-26 rather than Apr-26 and the slice count went
+    # 38 -> 35.
+    "payroll_detailed_review_fps_part2": "e7bfe50d0f9c358f",
+    # Added 2026-09-02: the full twelve-month payrun/FPS walk as one declared task, 64
+    # slices. It shares its period and Save & Next wording with
+    # payroll_detailed_review_fps_part2 — library entries key on wording + context, not
+    # on task, so the two reuse each other's recordings.
+    "payroll_food_limited": "213fae74829d852a",
 }
 
 
@@ -669,7 +683,7 @@ FPS_PART_SLICE_COUNTS = {
                                               # + Verify all
     # opener + Jun-26 period + the popup conditional, then one Save-&-Next-x5 + FPS pair
     # for Jun-26 and a period + pair for each of Jul-26 .. Mar-26: 3 + 2 + 9*3 = 32.
-    "payroll_detailed_review_fps_part2": 32,
+    "payroll_detailed_review_fps_part2": 35,
 }
 FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business name "
                    "FOOD LIMITED")
@@ -682,7 +696,7 @@ FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business
 # judge. All wording-driven otherwise; see decompose.node_kind.
 FPS_PART_SLICE_KINDS = {
     "payroll_detailed_review_fps_part1": ["action"] * 10,
-    "payroll_detailed_review_fps_part2": ["action"] * 32,
+    "payroll_detailed_review_fps_part2": ["action"] * 35,
 }
 
 

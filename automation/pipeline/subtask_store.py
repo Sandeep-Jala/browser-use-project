@@ -87,6 +87,57 @@ def normalize_context(url: str) -> str:
     return norm
 
 
+def rebase_to_live(recorded_url: str, live_url: str) -> str:
+    """`recorded_url` with its volatile path segments taken from `live_url` instead.
+
+    A compiled `goto` carries the authoring run's absolute URL, which means it carries that
+    run's CLIENT. library/d85bb1eda9ba8381 (Pay Forecast) was authored in FOOD LIMITED and
+    its four `api.goto()` lines named `/paye/clients/6a61d0…/calculator` outright; replayed
+    in Food Alchemy it teleported the run to the other client and looked for the freshly
+    added employee in a company that had never heard of them (run 20260903_093236_260802
+    — the create POST goes to Clients/6a984504…, the next four requests to 6a61d0…).
+
+    The identity layer was already right and always had been: that entry's context is
+    `/paye/clients/*/rti/payrun` because _VOLATILE_SEGMENT calls a long hex id instance
+    data, not page structure, so ONE recording is meant to serve every client. Only the
+    executable half disagreed. This is the two halves saying the same thing — the same
+    predicate that writes the `*` decides what a replay may substitute.
+
+    The walk: compare paths segment by segment; where BOTH are volatile take the live one;
+    where both are literal and equal keep going; on any other disagreement stop and keep the
+    recorded tail verbatim. Stopping matters — past a divergence the two paths describe
+    different parts of the app and position no longer means anything, so an id there has
+    nothing to correspond to. The recorded query and fragment always survive: they say what
+    the goto wanted, not where it was.
+
+    Never rewrites across origins. The aux identity tab and the OTP portal are different
+    SITES, and dragging a goto onto whatever host happens to be live would be exactly this
+    bug pointed the other way. An unreadable or degenerate live URL (about:blank, "") also
+    returns the recording unchanged: with nothing to rebase onto, the recorded URL is the
+    best guess available, and a navigation is not the place to fail closed.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    rec, live = urlsplit(recorded_url or ""), urlsplit(live_url or "")
+    if not rec.netloc or rec.netloc != live.netloc or rec.scheme != live.scheme:
+        return recorded_url
+    rec_segments = (rec.path or "/").split("/")
+    live_segments = (live.path or "/").split("/")
+    out = list(rec_segments)
+    for i, seg in enumerate(rec_segments):
+        if i >= len(live_segments):
+            break
+        if _VOLATILE_SEGMENT.match(seg) and _VOLATILE_SEGMENT.match(live_segments[i]):
+            out[i] = live_segments[i]
+        elif seg.lower() != live_segments[i].lower():
+            break
+    path = "/".join(out)
+    if path == rec.path:
+        return recorded_url
+    logger.info("goto rebased onto the live page: %s -> %s", rec.path, path)
+    return urlunsplit((rec.scheme, rec.netloc, path, rec.query, rec.fragment))
+
+
 def normalize_aux_context(url: str) -> str:
     """Page-state key for a helper-tab (aux) URL: normalize_context host-QUALIFIED.
 

@@ -24,6 +24,8 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Locator, Page
 
+from automation.pipeline.subtask_store import rebase_to_live
+
 logger = logging.getLogger("framework.script")
 
 # ids with a 3+ digit run look auto-generated (e.g. "SearchBox129") — don't anchor on them.
@@ -730,12 +732,37 @@ def _with_recovered_text(element: dict[str, Any] | None,
     return enriched
 
 
+def _refusal_stamp(results: list[Any], i: int, key: str) -> bool:
+    """Did the action at history position `i` come back carrying refusal metadata `key`?
+    The phantom-action rule reads this: a tool that refused changed nothing, so compiling
+    it would bake a step that acts where the recording did not."""
+    md = results[i].get("metadata") if i < len(results) and \
+        isinstance(results[i], dict) else None
+    return bool(isinstance(md, dict) and md.get(key))
+
+
 def _refused_scroll(results: list[Any], i: int) -> bool:
     """Did the scroll action at history position `i` refuse instead of moving anything?
     (agent_tools stamps metadata no_scroll when a dismiss-on-scroll popup was open.)"""
-    md = results[i].get("metadata") if i < len(results) and \
-        isinstance(results[i], dict) else None
-    return bool(isinstance(md, dict) and md.get("no_scroll"))
+    return _refusal_stamp(results, i, "no_scroll")
+
+
+def _closed_its_own_tab(tab_id: Any, item: dict[str, Any]) -> bool:
+    """Did this recorded `close` shut the tab the recording was ACTING in?
+
+    Recorded tab ids are per-run target ids, meaningless on the next run, so the only
+    close a replay can repeat is "close the tab this segment is running in" — which is
+    what the answer here decides. The recorder captures the tab list and the acting URL
+    before the action, so the closed tab's own entry is what identifies it. A close of
+    some OTHER tab (or a recording with no tab list to check against) is unreplayable
+    and must be dropped: guessing would shut the app tab.
+    """
+    state = item.get("state") or {}
+    url = state.get("url")
+    for tab in state.get("tabs") or []:
+        if str(tab.get("target_id") or "") == str(tab_id or ""):
+            return bool(url) and tab.get("url") == url
+    return False
 
 
 # The sentence every indexed tool returns INSTEAD of acting when the index it was given
@@ -1809,6 +1836,21 @@ def compile_recording(
                     pages = 0.8
                 _push_step(steps, {"action": "scroll_panels",
                                    "pages": max(0.2, min(pages, 1.0))})
+            elif name == "close":
+                # A segment that ends "…and then close this tab" must actually close it on
+                # replay: the tab it leaves open stays pinned as the session's aux page and
+                # the NEXT subtask runs inside it (run 20260902_091047_561480, subtask 9).
+                if _refusal_stamp(results, i, "no_close"):
+                    # The last-tab guard shut nothing (agent_tools.build_tools).
+                    logger.info("compile: skipping recorded close at step %d — it was "
+                                "refused and closed nothing", item_idx)
+                elif _closed_its_own_tab(params.get("tab_id"), item):
+                    _push_step(steps, {"action": "close_tab"})
+                else:
+                    logger.warning(
+                        "compile: dropping recorded close of tab %s at step %d — it is not "
+                        "the tab the recording was acting in, and a per-run tab id cannot "
+                        "be resolved at replay", params.get("tab_id"), item_idx)
             elif name == "wait":
                 # Keep the agent's deliberate pauses (capped). They are load-bearing on this
                 # slow React app: they let the invoice form and its react-select menus finish
@@ -3195,6 +3237,41 @@ async def _click_and_follow(page: Page, step: dict[str, Any], timeout_ms: int
     return sel, healed, opened
 
 
+async def _close_and_return(page: Page) -> Page:
+    """Close the tab the replay is running in and CONTINUE in the tab it came from.
+
+    The mirror of _click_and_follow: that one follows the tab a recorded click opened,
+    this one leaves the tab a recorded close shut. The survivor is the first still-open
+    page — the app tab, since it existed before the one being closed. Survivors are
+    counted across ALL of the browser's contexts, the way the session pins its own pages
+    (HybridSession._pick_main_page): refusing because the only remaining tab sits in
+    another context would silently leave this one open, which is the failure the step
+    exists to prevent.
+
+    Closing the LAST open tab is refused, exactly as the live agent's close is
+    (agent_tools.build_tools): it would destroy the page the workflow runs in. Nothing
+    left to close also means the post-close state is already here, so this is a no-op
+    rather than a failure.
+    """
+    context = page.context
+    contexts = list(getattr(context, "browser", None).contexts) if getattr(
+        context, "browser", None) is not None else [context]
+    survivors = [pg for ctx in contexts for pg in ctx.pages
+                 if pg is not page and not pg.is_closed()]
+    if not survivors:
+        logger.warning("close_tab: this is the LAST open tab — leaving it open (closing it "
+                       "would destroy the page this replay runs in)")
+        return page
+    landing = survivors[0]
+    await page.close()
+    try:
+        await landing.bring_to_front()
+    except Exception as exc:  # noqa: BLE001 - focus is a convenience, the handle is not
+        logger.debug("close_tab: bring_to_front failed: %s", exc)
+    logger.info("close_tab: closed this tab; replay continues in %s", landing.url)
+    return landing
+
+
 # Non-digits a page may add when it reformats a value it accepted ("£5,000.00" for "5000").
 _NUM_NOISE_RE = re.compile(r"[^\d.\-]")
 
@@ -3967,7 +4044,10 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                 # must have its own write judged, not written off as page-load traffic.
                 _note_interaction()
             if action == "goto":
-                await page.goto(step["url"], wait_until="domcontentloaded", timeout=timeout_ms)
+                # Rebased onto whatever page is live, so a recorded absolute URL cannot
+                # carry the authoring run's client into this one — see rebase_to_live.
+                await page.goto(rebase_to_live(step["url"], page.url),
+                                wait_until="domcontentloaded", timeout=timeout_ms)
             elif action == "click" and step.get("until_done"):
                 # Recorded as "until it stops advancing": clicking until the target stops
                 # resolving IS the stop condition, so a longer list than the authoring run
@@ -4091,6 +4171,12 @@ async def run_steps(page: Page, steps: list[dict[str, Any]], timeout_ms: int = 1
                     entry["healed"] = healed
                 log.append(entry)
                 await page.wait_for_timeout(_SETTLE_MS)
+            elif action == "close_tab":
+                # The recorded segment ended by closing the tab it worked in. Replay must
+                # too: the tab it leaves open stays pinned as the session's aux page and
+                # the NEXT subtask runs inside it (run 20260902_091047_561480).
+                page = await _close_and_return(page)
+                log.append({"step": idx, "action": action, "used": ""})
             elif action == "wait":
                 await page.wait_for_timeout(int(step.get("seconds", 0) * 1000))
             executed += 1

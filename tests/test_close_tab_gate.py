@@ -183,3 +183,59 @@ async def test_an_ordinary_segment_still_commits_its_real_end_context(stores, mo
 
     assert entry is not None
     assert entry["end_context"] == "/datarequests"
+
+
+# ---------------- a close eats the `done` batched behind it (2026-09-01) ----------------
+# Run 20260901_165748 subtask 8 ("… then click submit, and then close this tab"). The agent
+# finished — 12 Next clicks until the control left the page, landed on the Thank You page —
+# and step 2 planned TWO actions:
+#
+#     [1/2] close({"tab_id": "EB61"})
+#     [2/2] done({"text": "All remaining employees were advanced through, submission …"})
+#
+# One result came back. Closing the focused tab detaches it ("Agent focus target … detached!
+# Auto-recovering by switching to another target"), browser-use reads that as a page change
+# and skips the rest of the batch, so the `done` never ran. Step 3 woke up on the app's Data
+# Request list with no completion recorded and a task string still reading "click Next for
+# all of the remaining employees", opened the app-side review panel — which honestly starts
+# at employee 1 of 12 — and began the whole slice again through a different entry surface
+# (agentEntry=true instead of the portal's agentEntry=false).
+#
+# Any slice whose wording ENDS with "close this tab" produces exactly this batch, so the
+# close receipt has to carry the completion cue itself, into the NEXT step's memory.
+from automation.pipeline.agent_tools import _close_receipt  # noqa: E402
+
+
+def _inner(content="Closed tab #EB61", error=None):
+    from browser_use.agent.views import ActionResult
+    return ActionResult(extracted_content=content, error=error)
+
+
+def test_close_receipt_names_the_dropped_done():
+    r = _close_receipt(_inner(), "EB61")
+    assert "Closed tab #EB61" in (r.extracted_content or "")
+    assert "call done" in (r.extracted_content or "")
+    # The specific trap, named: a done queued behind the close does not run.
+    assert "DROPPED" in (r.extracted_content or "")
+
+
+def test_close_receipt_warns_against_re_deriving_the_job_from_the_new_page():
+    r = _close_receipt(_inner(), "EB61")
+    assert "different page" in (r.extracted_content or "")
+    assert "not started" in (r.extracted_content or "")
+
+
+def test_close_receipt_persists_into_the_next_step():
+    """The cue is only useful on the step AFTER the close, so it must be long-term."""
+    r = _close_receipt(_inner(), "EB61")
+    assert r.long_term_memory and "call done" in r.long_term_memory
+    assert r.include_in_memory is True
+
+
+def test_close_receipt_left_alone_when_the_close_failed():
+    """A close that errored closed nothing; telling the agent its step is complete then
+    would be the same false-completion bug pointing the other way."""
+    failed = _inner(content=None, error="could not close tab")
+    r = _close_receipt(failed, "EB61")
+    assert r.error == "could not close tab"
+    assert not (r.long_term_memory or "")

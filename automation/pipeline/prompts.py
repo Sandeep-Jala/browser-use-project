@@ -93,13 +93,24 @@ ELEMENT / OBJECTIVE NOT FOUND POLICY
 When searching for a SPECIFIC element, record, button, menu,
 field, tab, row, client, file, section, or action target:
   • NEVER substitute a different item — exact match only.
-  • Try at most 3–4 MEANINGFULLY DIFFERENT approaches
+  • FIRST recovery approach: re-read your step's own wording.
+    Search again with find_by_text("<the word IT uses>"), or do
+    the action IT names to open the section — a miss is as often
+    a wrong QUERY, or a section not yet open, as a wrong page.
+  • Then try at most 3–4 MEANINGFULLY DIFFERENT approaches
     (scroll, filter, search, expand parent section, switch tab).
-  • Do NOT repeat the same failed approach.
+  • Do NOT re-issue a call that already failed UNCHANGED, and do
+    not carry a dead search string from tool to tool. Re-issuing
+    it CHANGED is not a repeat: scoping it with near_text, or
+    switching to the wording your own step uses, is a NEW
+    approach and is what the receipts ask you for.
+  • MANY matches is not a miss — it is a hit you have not
+    narrowed, and none of the advice above applies to it. Do not
+    switch tools and do not invent a route: scope it with
+    near_text, or click the index whose row the receipt names.
   • Do NOT scroll endlessly through large lists.
   • A click that returns "Element index N not available" COUNTS
     as one failed attempt toward the 3–4 limit.
-  • FIRST recovery approach: find_by_text("<the element's label>").
   • After exhausting meaningful approaches → use an escape-hatch tool.
 
 ───────────────────────────────────────────────────────────
@@ -315,9 +326,11 @@ page may have changed":
      takes a FRESH page snapshot and returns every matching
      element with its CURRENT click index. Then click that
      index, or pass click_first=true when the label is unique.
-  4. If find_by_text returns 0 matches, the element is not on
-     the page: use scroll, or apply the ELEMENT NOT
-     FOUND POLICY. Never re-issue the same query.
+  4. If find_by_text returns 0 matches, that means no CLICKABLE
+     element carries that text — not that the text is absent.
+     Read its receipt: it names the likely cause. Never re-issue
+     that call unchanged, through that tool or any other — act on
+     the cause the receipt names first.
 
 find_elements is for STRUCTURAL queries only (table rows,
 list items). NEVER call it with a broad selector such as
@@ -335,10 +348,19 @@ off-screen — so it is NOT in your clickable list at all — while
 unrelated icons next to it ARE.
 
 When your task says to click a control BY NAME:
+  • EXCEPTION — a dropdown/combobox has no name of its own, so
+    no text search can reach it. See DROPDOWN / COMBOBOX PICKS.
   • Call find_by_text("<that exact name>", click_first=true) to
     click it. find_by_text reaches controls that are off-screen or
     zero-size, which a plain click(index) CANNOT. Prefer it over
     guessing an index for any named control.
+  • When SEVERAL carry that same name — one icon per grid row,
+    one checkbox per employee — do NOT pick between them by
+    position. Re-call it scoped to the row:
+    find_by_text("<that name>", near_text="<text in the row you
+    want>", click_first=true). The ambiguity receipt also names
+    the row each candidate sits in, so you can check the row
+    text before you scope by it.
   • NEVER click a nameless "<button/>" by index just because it
     sits where you expect your target. A guessed index is usually
     a different nearby control; clicking it acts on the WRONG thing
@@ -663,6 +685,7 @@ def scoped_subtask_prompt(
     observe: bool = False,
     conditional: bool = False,
     aux_tab: str | None = None,
+    next_conditional: str | None = None,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
 
@@ -687,17 +710,52 @@ def scoped_subtask_prompt(
     was not reached is a failed run" footer made the agent hunt for controls matching
     the branch's action words to force the condition true (observed live: a suppressed
     popup's "click Process" resolved to a "Reminder to process the payroll" icon button,
-    opening/closing the email modal in an endless loop). `aux_tab`
+    opening/closing the email modal in an endless loop). `next_conditional` is the condition the NEXT slice declares as
+    its `probe:`, already rendered into words: an expected outcome of THIS step that a
+    separate step handles. Without saying so, the producing agent read that outcome as
+    its own failed action — the still-ahead list even handed it the successor's action
+    words ("click Cancel") under a generic do-not-start rule it ignores once it believes
+    its step failed — so it dismissed the dialog and retried its own actions to clear it
+    (observed live: a server-refused FPS submit became 4 submits, 3 uploads and 2
+    self-issued Cancels in one segment, cached as 22 replayable actions). `aux_tab`
     marks an aux-tab segment: the framework already opened and focused a helper tab at
     that URL, all work happens there, and facts must be captured via extract_data so
     future replays can re-read them fresh.
     """
     lines = [
+        # NOT "the page is already in the correct starting state for your step" (the
+        # original wording, unchanged since the pipeline's first commit). That was an
+        # unconditional promise the framework cannot keep: a segment starts wherever the
+        # PREVIOUS one finished, which is only the right page by luck. Run
+        # 20260902_120618 subtask 5 is the measured cost — "Then go to Payroll & RTI and
+        # change the period to Jun-26" ran from the payroll SUMMARY page, and the agent's
+        # own reasoning shows it never treated the navigation as an action at all: "we
+        # need to change the period filter in the Payroll & RTI navbar ... this is the
+        # final required action". Given a guarantee that you are already correctly
+        # placed, a phrase naming a page CANNOT be an instruction to go there — it can
+        # only be scenery, which is exactly how it was read. It then set the report's
+        # period filter, the payrun never moved off May-26, and the segment committed a
+        # skill with no navigation in it.
+        #
+        # Check-then-navigate, not "always navigate": an agent genuinely on the right
+        # page must not re-click a nav item and risk resetting the page state.
         "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
-        "browser. The page is already in the correct starting state for your step.",
+        "browser. Earlier steps ran in this same session and left the app wherever they "
+        "finished, which is NOT necessarily where your step needs to be. If your step "
+        "names a page, module, section or tab, make sure you are actually on it before "
+        "doing the rest — those words are an action to perform when you are not there, "
+        "not a description of where you already are.",
     ]
     if completed:
-        lines.append("\nAlready done (do NOT redo, verify, or navigate back to these):")
+        # The carve-out matters as much as the list. These lines are the wording of
+        # EARLIER subtasks, and a repeated workflow states the same step once per cycle:
+        # the run above handed the agent "...change the period to May-26..." as already
+        # done while its own job was the byte-identical Jun-26 line, so the navigation
+        # half of its own job was sitting in the forbidden list.
+        lines.append(
+            "\nAlready done (do NOT redo, verify, or navigate back to these — but this "
+            "never excuses skipping any part of YOUR OWN job below, even where the "
+            "wording repeats):")
         lines.extend(f"  - {c}" for c in completed)
     if findings:
         lines.append(
@@ -803,6 +861,24 @@ def scoped_subtask_prompt(
             "to MAKE the condition true, and never click a control merely because its "
             "name or tooltip contains a word from this step's actions. If the "
             "condition DOES hold, perform the stated actions and verify them as usual."
+        )
+    if next_conditional:
+        lines.append(
+            f"\nEXPECTED OUTCOME ALREADY HANDLED BY THE NEXT STEP: "
+            f"{next_conditional}. If that appears, it is a KNOWN and ACCEPTED result "
+            f"of this step — not a failure, and not yours to clear. Your step is then "
+            f"FINISHED: call done with success=true and state in your done message "
+            f"exactly what appeared, quoting the message text you can read. Do NOT "
+            f"close, cancel, dismiss or click through it, and do NOT repeat, re-enter "
+            f"or retry any of this step's actions to make it go away — a separate step "
+            f"immediately after yours handles it, and redoing your actions here "
+            f"duplicates work that step cannot undo. This overrides the re-click rule "
+            f"above: this outcome IS the page's response, so the action DID register "
+            f"and there is nothing to re-locate and click again. It also overrides the "
+            f"done condition and the end-state rule below — the framework checks for "
+            f"this outcome deterministically before the next step runs, so reporting "
+            f"it and stopping is a PASS, not success claimed without reaching the end "
+            f"state."
         )
     if remaining:
         lines.append("\nStill ahead in this workflow (context only — each is handled "

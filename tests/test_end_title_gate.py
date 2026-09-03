@@ -297,3 +297,81 @@ async def test_a_FAILED_replay_teaches_nothing(stores, monkeypatch):
                                titles=["Setting - Acting Office", "Acting Office"])
 
     assert not entry.get("end_title")
+
+
+# ------------------------------- settling the read -------------------------------
+#
+# Reading the title LIVE is not enough, which is what run 20260903_091650_671199 proved.
+# This SPA updates document.title a whole navigation behind, so the commit's single
+# immediate read picked up the PREVIOUS page's title and pinned it; evaluate_gate then read
+# the settled title through _settled() and could never agree with it. Commit reads early,
+# gate reads late — so the commit now gets the same settle budget the gate will use.
+
+
+def _reader(*titles):
+    """A current_title() whose successive calls walk `titles` (the last one repeats)."""
+    seen = list(titles)
+
+    async def read():
+        return seen[0] if len(seen) == 1 else seen.pop(0)
+    return read
+
+
+async def test_the_read_waits_for_the_title_to_stop_changing(monkeypatch):
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
+    # The exact live shape: the Employees page still reporting the previous page's title.
+    read = _reader("Payroll & RTI - Acting Office", "Employees - Acting Office",
+                   "Employees - Acting Office")
+
+    assert await hybrid._settled_title(read) == "Employees - Acting Office"
+
+
+async def test_an_already_settled_title_is_returned_unchanged(monkeypatch):
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
+
+    assert await hybrid._settled_title(_reader("Acting Office")) == "Acting Office"
+
+
+async def test_a_title_that_never_settles_returns_its_last_read(monkeypatch):
+    """Best effort, not a hang. _pin_end_title's own guards still apply to whatever
+    comes back, and a pin is demote-only in the first place."""
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
+    churn = _reader(*[f"T{i}" for i in range(50)])
+
+    assert (await hybrid._settled_title(churn)).startswith("T")
+
+
+async def test_an_unreadable_title_settles_immediately(monkeypatch):
+    """No page, no wait: an empty title pins nothing anyway, so polling it is pure delay
+    on every commit that has nothing to pin."""
+    calls = {"n": 0}
+
+    async def read():
+        calls["n"] += 1
+        return ""
+
+    assert await hybrid._settled_title(read) == ""
+    assert calls["n"] == 1
+
+
+async def test_the_commit_pins_the_settled_title_not_the_lagging_one(stores, monkeypatch):
+    """Regression for run 20260903_091650_671199 / library/77a0af5f643402f2.
+
+    The segment ended on the Employees page, but document.title still read
+    "Payroll & RTI - …" at the instant the commit looked. That value became the expected
+    end state, and the entry then false-failed four consecutive runs — its steps all ran,
+    its url gate matched, and only the pin disagreed.
+    """
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
+    prompt = "go to the Payroll module and then to the Employee section"
+    spec = TaskSpec(key="t", prompt=prompt, subtasks=(SubtaskDecl(prompt=prompt),))
+    fake = _EndsAt(_runner(), agents=[_seg(True, mode="authored")],
+                   urls=["http://app/section", "http://app/portal"],
+                   titles=["Dashboard - Acting Office", "Payroll & RTI - Acting Office",
+                           "Employees - Acting Office", "Employees - Acting Office"])
+    fake.recording = _navigating("Dashboard - Acting Office", "Employees - Acting Office")
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    sid = ss.subtask_id(prompt, ss.normalize_context("http://app/section"))
+    assert ss.load_manifest()[sid]["end_title"] == "Employees - Acting Office"

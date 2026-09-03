@@ -82,6 +82,8 @@ class FakeSession:
         self.replay_branch = []      # `branch` flag each replay was given
         self.agent_calls = 0
         self.findings_seen = []
+        self.remaining_seen = []      # still-ahead list each agent call received
+        self.next_conditional_seen = []   # the successor-probe handoff each call received
         self.record_paths = []
         self.events = []              # ordered ("open", url)/("close",)/("replay",)/("agent",)
         self.aux_open_error = None    # set to make open_aux_tab raise
@@ -138,10 +140,12 @@ class FakeSession:
 
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
                             dirty=False, prior_failure=None, record_path=None,
-                            findings=None):
+                            findings=None, next_conditional=None):
         self.events.append(("agent",))
         self.agent_calls += 1
         self.findings_seen.append(list(findings or []))
+        self.remaining_seen.append(list(remaining or []))
+        self.next_conditional_seen.append(next_conditional)
         self.record_paths.append(record_path)
         seg = self.agents.pop(0)
         seg.index, seg.sid, seg.context = sub.index, sid, context
@@ -1899,3 +1903,62 @@ def test_the_last_refusal_wins():
     """The agent retried: the branch begins after the refusal it actually cancelled."""
     body = json.dumps({"status": False, "message": "already submitted"})
     assert hybrid._refused_write_step([_req(4, body=body), _req(9, body=body)]) == 9
+
+
+def _cond_subs(*probe_args):
+    """Subtasks: one plain producer, then one probed guard per arg, then a plain tail."""
+    from automation.pipeline.checks import Check
+    subs = [Subtask(index=0, template_prompt="click Submit", values={}, marker=None,
+                    postcondition=None, tab_url=None)]
+    for n, arg in enumerate(probe_args, start=1):
+        subs.append(Subtask(index=n, template_prompt=f"If {arg}, click Cancel.",
+                            values={}, marker=None, postcondition=None, tab_url=None,
+                            probe=Check(kind="text_visible", arg=arg, timeout_s=3.0)))
+    subs.append(Subtask(index=len(subs), template_prompt="go to Clients", values={},
+                        marker=None, postcondition=None, tab_url=None))
+    return subs
+
+
+def test_describe_next_conditionals_renders_the_successors_probe():
+    """The condition crosses the boundary in the SAME words evaluate_gate/probe_condition
+    use — via the shared _describe_check — and nothing else does."""
+    subs = _cond_subs("already submitted")
+    assert hybrid._describe_next_conditionals(subs, 0) == (
+        'the text "already submitted" visible on the page', 1)
+
+
+def test_describe_next_conditionals_walks_consecutive_guards():
+    """A guard chain is ONE handoff from the producing step's point of view."""
+    desc, n = hybrid._describe_next_conditionals(_cond_subs("first", "second"), 0)
+    assert n == 2
+    assert desc == ('the text "first" visible on the page or '
+                    'the text "second" visible on the page')
+
+
+def test_describe_next_conditionals_none_without_a_probed_successor():
+    """The common case: no probed successor, no block, and the scan stops at the first
+    unprobed slice rather than reaching a later one."""
+    subs = _cond_subs("already submitted")
+    assert hybrid._describe_next_conditionals(subs, 1) == (None, 0)   # guard -> tail
+    assert hybrid._describe_next_conditionals(subs, 2) == (None, 0)   # last subtask
+    plain = [Subtask(index=i, template_prompt=f"step {i}", values={}, marker=None,
+                     postcondition=None, tab_url=None) for i in range(2)]
+    assert hybrid._describe_next_conditionals(plain, 0) == (None, 0)
+
+
+async def test_probed_successors_are_dropped_from_remaining_and_described_instead(
+        stores, monkeypatch):
+    """A probed successor is DESCRIBED to its producer as an expected outcome, so it must
+    not ALSO sit in the still-ahead list — that line handed the agent the successor's
+    action words ("click Cancel to close it") under a generic do-not-start rule it stops
+    honouring the moment it believes its own step failed (run 20260901_151214)."""
+    prompt, spec = _probe_spec()
+    fake = FakeSession(_runner(), agents=[_seg(True, mode="authored")], probes=[False])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert fake.agent_calls == 1                       # the producer slice only
+    assert fake.remaining_seen[0] == []                # the guard was dropped, not listed
+    assert _PROBE_COND_LINE not in " ".join(fake.remaining_seen[0])
+    assert fake.next_conditional_seen[0] == (
+        'the text "Don\'t show this again" visible on the page')

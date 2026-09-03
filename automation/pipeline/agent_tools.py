@@ -516,6 +516,51 @@ def _captured_element(node: Any, label: str) -> dict[str, Any] | None:
 # lists — it only ever runs to the actual end of the content.
 _PANEL_SCROLL_ROUNDS = 20
 
+# The beat a scroll needs before the DOM is worth reading again. Setting scrollTop fires the
+# app's scroll handler, which sets React state, which MOUNTS the newly revealed rows — on a
+# later frame. Read in the same tick and the query answers about the previous render window.
+#
+# Run 20260903_110957_989862 subtask 6: the noted employee WAS in the Data Request list, and
+# find_by_text's hunt swept the whole thing without seeing them, because it re-queried
+# immediately after every scroll. The step size was never the problem (0.8 of the container
+# leaves 20% overlap; nothing is skipped visually) — the READ was.
+#
+# 400ms is not a new number: script_compile's _scroll_containers, _scroll_tops and
+# _wheel_scroll all wait exactly this, and the scroll_panels tool had its own inline copy.
+# The rule was in the codebase four times and the one path that hunts for a NAME in a
+# virtualized list still missed it, which is why scrolling and settling are now a single
+# helper that both callers go through.
+_SCROLL_SETTLE_S = 0.4
+
+
+async def _scroll_and_settle(browser_session, fraction: float = 0.8) -> int:
+    """Advance every scrollable container, then WAIT for the rows to mount. Returns how many
+    scrollers moved — 0 means nothing left to scroll, which is how a sweep knows to stop.
+
+    Best-effort like every other scroll path: an unscrollable/unreachable page returns 0 and
+    ends the sweep rather than failing the lookup that called it."""
+    try:
+        moved = int(await _eval_js(
+            browser_session, _SCROLL_CONTAINERS_JS % json.dumps(float(fraction))) or 0)
+    except Exception as exc:  # noqa: BLE001 - a scroll must never crash the run
+        logger.debug("container scroll failed: %s", exc)
+        return 0
+    await asyncio.sleep(_SCROLL_SETTLE_S)
+    return moved
+
+
+async def _scroll_tops_and_settle(browser_session) -> int:
+    """Reset page + containers to the top, then wait for the rows to mount. The hunt
+    companion to _scroll_and_settle, and it needs the same beat for the same reason: a sweep
+    that starts by resetting and reads immediately reads the PRE-reset window."""
+    try:
+        moved = int(await _eval_js(browser_session, _SCROLL_TOPS_JS) or 0)
+    except Exception as exc:  # noqa: BLE001 - a scroll must never crash the run
+        logger.debug("scroll-to-top failed: %s", exc)
+        return 0
+    await asyncio.sleep(_SCROLL_SETTLE_S)
+    return moved
+
 
 # A combobox whose popup is a dialog is a date/time picker (Fluent DatePicker), not an
 # option filter: typed text IS its value and reads back verifiably.
@@ -742,6 +787,11 @@ async def _callout_open(browser_session) -> bool:
 # declared count is a declaration.
 _CLICK_LEDGER: dict[str, int] = {}
 _REPEAT_BUDGET: int | None = None
+# Controls repeat_click has actually run a repetition on THIS segment. The budget is one
+# segment-wide number while the ledger is keyed per control, so it may only be enforced
+# against a control a repetition has already established it is about — capping every other
+# button in the segment at the same N would be an over-reach.
+_REPEAT_TARGETS: set[str] = set()
 
 
 def set_repeat_budget(budget: int | None) -> None:
@@ -771,6 +821,42 @@ def _note_clicks(node: Any, n: int = 1) -> int:
     return _CLICK_LEDGER[key]
 
 
+def _refuse_if_over_budget(node: Any, label: str) -> "ActionResult | None":
+    """Refuse a PLAIN click that would exceed the segment's declared repeat count, or None
+    to let it through. Only ever fires on a control repeat_click has already repeated (see
+    _REPEAT_TARGETS).
+
+    Why plain clicks need this at all: repeat_click's own guard is the one that stopped run
+    20260901_122209, but it only covers repeat_click. Run 20260902_105732 subtask 3 went the
+    other way round — repeat_click(5) landed all five, browser-use silently DROPPED the
+    `done` the agent had batched behind it (agent/service.py: "Done action is allowed only
+    as a single action"), and on the unexplained extra turn the agent read the correct end
+    state as a failure and clicked Save & Next five more times BY HAND. Ten employees were
+    paid for a five-employee slice, and the segment cached repeat_click(9). Obeying the
+    letter of "do NOT call repeat_click again" while redoing the work with `click` is the
+    hole this closes.
+
+    ERROR channel + no_click, like every other refusal here: the error stops the rest of a
+    batched step, and no_click keeps the phantom out of the recording."""
+    if _REPEAT_BUDGET is None:
+        return None
+    try:
+        key = _ledger_key(node)
+    except Exception:  # noqa: BLE001 - a guard must never break a click
+        return None
+    if key not in _REPEAT_TARGETS:
+        return None
+    already = _CLICK_LEDGER.get(key, 0)
+    if already < _REPEAT_BUDGET:
+        return None
+    msg = (f"click REFUSED — did NOT click: {label} has already been clicked {already} "
+           f"time(s) in this step, which is the {_REPEAT_BUDGET} this step asks for. The "
+           f"repetition is COMPLETE and those clicks all landed. Do NOT click it again by "
+           f"hand — verify the end state on the page and call done.")
+    logger.info("⛔ %s", msg)
+    return ActionResult(error=msg, metadata={"no_click": True})
+
+
 # repeat_click's cadence (the live twin of skills/api.py's constants). Between clicks the
 # control must be clickable AGAIN before the next one, so a slow employee load delays the
 # cadence instead of eating a click. The hard cap bounds the until-it-stops mode: reaching
@@ -798,6 +884,112 @@ _REPEAT_READY_JS = """function () {
   } catch (e) {}
   return {ready: true, why: ''};
 }"""
+
+
+# The control's OWN name, read in the page. Visible text first: that is what the task and
+# the user call the control by ("click Next", "then click submit"), and it is what changes
+# when an app swaps a button's job on the last row. PUA glyphs are stripped because Fluent
+# renders icons as literal text nodes inside the control (see _CAND_ROW_NAME_JS).
+_CONTROL_NAME_JS = """function () {
+  var t = function (s) { return (s || '').replace(/[\\uE000-\\uF8FF]/g, ' ')
+                                         .replace(/\\s+/g, ' ').trim(); };
+  var text = t(this.innerText || this.textContent);
+  if (text) return text;
+  var g = this.getAttribute ? this.getAttribute.bind(this) : function () { return ''; };
+  return t(g('aria-label')) || t(g('title')) || t(this.value) || '';
+}"""
+
+
+async def _repeat_live_name(browser_session, node) -> str:
+    """One in-page read of the control's name, or "" when it cannot be read.
+
+    Deliberately unpolled and fail-open: this feeds a STOP decision, and a name that
+    cannot be read is not evidence of anything.
+    """
+    try:
+        handle = await _field_handle(browser_session, node)
+        if not handle:
+            return ""
+        return str(await _call_on_field(handle, _CONTROL_NAME_JS) or "").strip()
+    except Exception as exc:  # noqa: BLE001 - unreadable name never stops a healthy loop
+        logger.debug("repeat_click: could not read the control's name (%s)", exc)
+        return ""
+
+
+# How many candidates get a row probe. Each is one CDP round trip, and a listing shows at
+# most 25 — past that the agent is being told to narrow its text, not to read more rows.
+_ROW_PROBE_CAP = 30
+
+
+def _pua_strip(text: Any) -> str:
+    """Readable text: Private Use Area glyphs dropped, whitespace collapsed. Case KEPT.
+
+    Fluent renders its icons as literal PUA TEXT NODES (the 2026-08-21 pencil trap, where a
+    has-text guard disabled the very reader written for that cell), so any text read off this
+    app's DOM can carry them. One definition, used wherever such text is shown or compared."""
+    return re.sub(r"\s+", " ", re.sub(r"[\uE000-\uF8FF]", " ", str(text or ""))).strip()
+
+
+def _pua_norm(text: Any) -> str:
+    """_pua_strip, casefolded — the comparable form."""
+    return _pua_strip(text).casefold()
+
+
+def _repeat_norm_name(name: str) -> str:
+    return _pua_norm(name)
+
+
+def _row_matches(row_text: Any, tokens: list[str]) -> bool:
+    """Does a candidate's row carry every token of `near_text`?
+
+    Token containment, the same rule `text` itself uses \u2014 so 'feb 27' and 'Feb-27' agree and
+    punctuation never decides a row. Empty/unreadable row text is False, never True: see
+    find_by_text's near_text branch for why this fails CLOSED."""
+    if not tokens:
+        return False
+    hay = _pua_norm(row_text)
+    return bool(hay) and all(t in hay for t in tokens)
+
+
+async def _row_labels(browser_session, matches: list) -> dict[int, str]:
+    """{index: row text} for candidates, best-effort and concurrent.
+
+    Reuses _row_context_label \u2014 the probe built so an anonymous checkbox click could name
+    the employee row it ticked. A candidate whose row cannot be read is simply absent:
+    callers treat it as garnish (the listing) or as a non-match (near_text scoping)."""
+    async def one(idx: int, node: Any) -> tuple[int, Any]:
+        return idx, await _row_context_label(browser_session, node)
+
+    out: dict[int, str] = {}
+    try:
+        results = await asyncio.gather(
+            *(one(idx, node) for idx, node, _ in matches[:_ROW_PROBE_CAP]),
+            return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001 - row identity must never break a lookup
+        logger.debug("row-label probe failed: %s", exc)
+        return out
+    for res in results:
+        if isinstance(res, tuple) and res[1]:
+            text = _pua_strip(res[1])
+            if text:
+                out[res[0]] = text
+    return out
+
+
+def _repeat_relabelled(before: str, after: str) -> bool:
+    """True when the repeated control has become a DIFFERENT control.
+
+    _REPEAT_READY_JS checks connected/disabled/visible and never the name — by design,
+    so the loop survives the re-render that swaps the row behind a reused button. That
+    same tolerance is what let run 20260901_165748 click Submit as iteration 12 of a
+    Next loop: the app relabels the one button on the last employee. 11 Next + 1 Submit
+    was recorded as `repeat_until_done('next')` — one step, no submit in it anywhere.
+
+    Both names must be readable before this may stop anything: a blank is not evidence,
+    and truncating a healthy run is worse than one swallowed click.
+    """
+    a, b = _repeat_norm_name(before), _repeat_norm_name(after)
+    return bool(a and b and a != b)
 
 
 async def _repeat_ready(browser_session, node) -> tuple[bool, str]:
@@ -1772,6 +1964,7 @@ def set_live_network(collector: Any) -> None:
     global _LIVE_NETWORK, _SEGMENT_T0, _FAIL_BOUNCED, _LAST_ACTION_T0
     _LIVE_NETWORK = collector
     _CLICK_LEDGER.clear()   # per-segment, like every other name reset here
+    _REPEAT_TARGETS.clear()
     _SEGMENT_T0 = time.monotonic()
     _LAST_ACTION_T0 = _SEGMENT_T0    # no action yet: the whole segment is the window
     _FAIL_BOUNCED = False
@@ -1816,20 +2009,100 @@ def clear_live_network() -> None:
 # Writes the app's infrastructure fires constantly (push auth, SignalR negotiate, token
 # refresh, keep-alives) — never evidence that USER work landed, so the fail_and_stop
 # bounce must ignore them (observed live: /auth/webpush POSTs in every segment).
+_CLOSE_DONE_HINT = (
+    "If closing that tab was the LAST action of your step, your step is COMPLETE — call "
+    "done NOW, reporting what you accomplished before the close. A done batched behind a "
+    "close is DROPPED: closing the focused tab detaches it, and the rest of that action "
+    "batch is skipped. Do NOT re-derive your job from the page you landed on — it is a "
+    "different page from the one you did the work in, and it may well show that work as "
+    "not started."
+)
+
+
+def _close_receipt(inner: Any, tab_id: str) -> Any:
+    """A successful close, carrying the completion cue into the NEXT step's memory.
+
+    `close` is the one action that can destroy the page the agent is standing on, and
+    browser-use skips whatever was queued behind it. A slice whose wording ends with
+    "close this tab" therefore ALWAYS emits close+done and ALWAYS loses the done — the
+    agent then wakes on a surviving tab with no record of finishing and starts over.
+    Run 20260901_165748 subtask 8 is the measured case: 12 employees advanced and
+    submitted in the portal, the done dropped, and the whole slice re-run through the
+    app's own review panel (which honestly opens at employee 1 of 12).
+
+    A close that ERRORED is returned untouched: it closed nothing, and telling the agent
+    its step is complete there would be the same false completion with the sign flipped.
+    """
+    if getattr(inner, "error", None):
+        return inner
+    base = (getattr(inner, "extracted_content", None) or f"Closed tab #{tab_id}").strip()
+    msg = f"{base} — {_CLOSE_DONE_HINT}"
+    return ActionResult(
+        extracted_content=msg,
+        long_term_memory=msg,
+        include_in_memory=True,
+        metadata=getattr(inner, "metadata", None),
+    )
+
+
+def _state_text_witness(state: Any, tokens: list[str], query: str) -> str:
+    """The query as a line of the page state the agent was SHOWN, or "".
+
+    A second, independent witness for find_by_text's static-text branch. The JS probe
+    runs in the main frame AFTER the scroll sweep, against a DOM that may have
+    re-rendered underneath it; `state` was serialized one frame earlier and is the page
+    the agent actually read. selector_map holds interactive nodes only — which is why
+    the name lookup missed — but llm_representation() re-serializes the same tree
+    INCLUDING its static text.
+
+    Run 20260901_174417 subtask 2 is what this is for: 'Select sender' was the open
+    panel's combobox placeholder, right there in the state message under 'From' (the
+    same snapshot still said "Loading ..."), the JS probe returned 0 anyway, and the
+    receipt then told the agent its open panel "is not in this page's DOM". It
+    blind-clicked a nameless button and re-ran the same string through search_page.
+
+    Best-effort by construction: llm_representation is semi-private in browser-use, so
+    an absent or raising one degrades to exactly the previous behaviour.
+    """
+    try:
+        rep = state.dom_state.llm_representation() or ""
+    except Exception as exc:  # noqa: BLE001 - a witness that cannot testify says nothing
+        logger.debug("find_by_text state-text witness unavailable: %s", exc)
+        return ""
+    low = rep.lower()
+    if not rep or not all(t in low for t in tokens):
+        return ""
+    line = next((ln for ln in rep.splitlines()
+                 if all(t in ln.lower() for t in tokens)), query)
+    return " ".join(line.split())[:200]
+
+
 _INFRA_WRITE_RE = re.compile(r"/auth/|negotiate|token|keepalive|telemetry", re.I)
 
 
 def _segment_accepted_write() -> dict[str, Any] | None:
-    """The first accepted BUSINESS write of the current segment, or None: settled 2xx,
+    """The LATEST accepted BUSINESS write of the current segment, or None: settled 2xx,
     non-negative body verdict, not infra traffic. Read from the live collector at call
-    time so a write that settled after its click's receipt still counts."""
+    time so a write that settled after its click's receipt still counts.
+
+    None when the segment's most recent business write was REFUSED. The bounce this
+    feeds argues "your failure claim contradicts this segment's own receipt", and that
+    only holds when the receipt is about the write the agent is actually reacting to.
+    Run 20260901_163709 subtask 8 is what the latest-not-first rule is for: the agent
+    advanced 11 employees (11 accepted writes), clicked Submit, and the server refused
+    it 200-with-"Unable to sent email to client." Scanning FORWARD stepped over that
+    refusal, produced one of the 11 routine advances, and told an agent that had
+    reported the truth to carry on — it reopened the review panel in the app and
+    re-entered all 11 employees through the agent-side screen. A refusal landing after
+    the last acceptance is evidence the claim is TRUE; it must never be what refutes it.
+    """
     if _LIVE_NETWORK is None:
         return None
     try:
         writes = _LIVE_NETWORK.writes_since(_SEGMENT_T0)
     except Exception:  # noqa: BLE001 - the bounce is best-effort, never a crash source
         return None
-    for w in writes:
+    for w in reversed(list(writes)):
         record = w.get("record") or {}
         if _INFRA_WRITE_RE.search(str(record.get("url") or "")):
             continue
@@ -1840,7 +2113,9 @@ def _segment_accepted_write() -> dict[str, Any] | None:
             continue
         verdict = _write_verdict(record)
         if verdict is not None and verdict[0]:
-            continue
+            # The segment's last word is a refusal. Nothing earlier can contradict a
+            # failure claim made after it.
+            return None
         return record
     return None
 
@@ -2408,6 +2683,49 @@ async def _row_context_label(browser_session, node) -> str | None:
         return None
 
 
+_SCRIPT_URL_RE = re.compile(r"^\s*(javascript|data)\s*:", re.IGNORECASE)
+
+
+def _script_url_refusal(url: Any) -> "ActionResult | None":
+    """Refuse a `navigate` to a script/document URL, or None to let it through.
+
+    `evaluate` is excluded from this registry on purpose — JS writes are unrecordable, so a
+    recording that leans on them compiles to a script missing those actions (see this
+    module's docstring). `navigate` was the loophole that handed it back, and the loophole
+    costs the page.
+
+    Run 20260903_102354_153542 subtask 4: unable to address one of twelve identical "Net to
+    gross" pencils, the agent sent
+    `navigate(url="javascript:()=>{…querySelectorAll('tr')…}")`. browser-use's
+    SecurityWatchdog blocks that — but only after the NavigateToUrlEvent is dispatched, and
+    the block lands the tab on **about:blank**. The Pay Forecast page was gone; twelve of
+    the segment's nineteen steps went on recovering, and it then did the same thing again.
+    Three earlier authorings of that identical slice took three steps each.
+
+    So the refusal happens BEFORE dispatch: the page keeps its state, and the receipt names
+    the tools that actually reach a control — a refusal that only says "no" just sends the
+    agent looking for the next door. `data:` is refused on the same ground: it is not a page
+    in this app, and navigating to it replaces the one the segment is working in.
+
+    ERROR channel, like every other refusal here — multi_act stops a step's remaining queued
+    actions on an error, and both live attempts had further actions queued behind them.
+    """
+    if not _SCRIPT_URL_RE.match(str(url or "")):
+        return None
+    msg = (
+        f"navigate REFUSED: {str(url)[:80]!r} is a script/document URL, not a page. This "
+        "framework removes the `evaluate` action deliberately — JavaScript actions cannot "
+        "be recorded or replayed, so anything done that way is lost from the run — and "
+        "`navigate` is not a way around that. Nothing was navigated: the page is unchanged "
+        "and your work on it stands, so do NOT recover from this. To reach a control, use "
+        "find_by_text('<its name>', click_first=True), adding near_text='<text in its row>' "
+        "when several look identical, or list_actions(near_text='<nearby heading or row>') "
+        "and click the index it reports."
+    )
+    logger.warning("⛔ %s", msg)
+    return ActionResult(error=msg, metadata={"no_click": True})
+
+
 async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> ActionResult:
     """Delegate the click to the built-in unchanged, then append the network+dialog
     outcome suffix and stamp the structured write_outcome. Plain clicks that fired no
@@ -2423,8 +2741,12 @@ async def _click_with_dialog_outcome(builtin_click, params, browser_session) -> 
     if node is not None:
         # A plain click counts toward the segment's repeat ledger: subtask 15 of run
         # 20260901_122209 clicked Save & Next once by hand BEFORE calling repeat_click, so a
-        # budget that ignored manual clicks would still overshoot by one. Recorded only —
-        # an ordinary click is never refused for being over budget.
+        # budget that ignored manual clicks would still overshoot by one. Refused BEFORE it
+        # is counted (a refusal clicked nothing, so it must not inflate the ledger), and only
+        # on a control repeat_click already repeated — see _refuse_if_over_budget.
+        refusal = _refuse_if_over_budget(node, _control_name(node, index))
+        if refusal is not None:
+            return refusal
         _note_clicks(node, 1)
     row_label, row = None, None
     if node is not None and _is_anonymous_toggle(node):
@@ -2491,6 +2813,23 @@ def build_tools() -> Tools:
     async def click(params, browser_session=None) -> ActionResult:
         return await _click_with_dialog_outcome(_builtin_click_fn, params, browser_session)
 
+    # Same-name override of `navigate` that DELEGATES to the built-in, refusing only
+    # script/document URLs — see _script_url_refusal for the run that made this necessary.
+    # Description, param model and terminates_sequence are carried over verbatim: from the
+    # agent's side this must stay the same action, or the override silently changes how
+    # every ordinary navigation is prompted.
+    _builtin_navigate = tools.registry.registry.actions["navigate"]
+    _builtin_navigate_fn = _builtin_navigate.function
+
+    @tools.action(_builtin_navigate.description,
+                  param_model=_builtin_navigate.param_model,
+                  terminates_sequence=_builtin_navigate.terminates_sequence)
+    async def navigate(params, browser_session=None) -> ActionResult:
+        refusal = _script_url_refusal(getattr(params, "url", None))
+        if refusal is not None:
+            return refusal
+        return await _builtin_navigate_fn(params=params, browser_session=browser_session)
+
     # Same-name override of `close` that DELEGATES to the built-in, refusing only the one
     # close that cannot be recovered from: the LAST open tab. Closing it destroys the page
     # the workflow runs in — browser-use then spawns a fresh about:blank with no history,
@@ -2522,7 +2861,9 @@ def build_tools() -> Tools:
             # error channel: multi_act stops the remaining queued actions, so a `done`
             # batched behind this close cannot report a close that never happened.
             return ActionResult(error=msg, metadata={"no_close": True})
-        return await _builtin_close_fn(params=params, browser_session=browser_session)
+        return _close_receipt(
+            await _builtin_close_fn(params=params, browser_session=browser_session),
+            str(params.tab_id))
 
     # Same name/param model as the built-in: same-name registration OVERRIDES it (excluding
     # "input" would drop this replacement too), and the recorder still captures the
@@ -2862,15 +3203,10 @@ def build_tools() -> Tools:
         if refused is not None:
             return refused
         frac = max(0.2, min(float(pages), 1.0))
-        try:
-            moved = int(await _eval_js(
-                browser_session, _SCROLL_CONTAINERS_JS % json.dumps(frac)) or 0)
-        except Exception as exc:  # noqa: BLE001 - a scroll must never crash the run
-            logger.warning("scroll_panels failed: %s", exc)
-            return ActionResult(error=f"scroll_panels failed: {exc}")
-        # Virtualized rows render only after the scroll commits — give React a beat so
-        # the agent's NEXT snapshot (or a batched find in this same step) sees them.
-        await asyncio.sleep(0.4)
+        # Virtualized rows render only after the scroll commits, so the helper scrolls AND
+        # waits — the tool used to keep its own copy of that beat while find_by_text's hunt
+        # had none, which is exactly how the rule went missing where it mattered most.
+        moved = await _scroll_and_settle(browser_session, frac)
         if moved:
             msg = (f"scroll_panels: scrolled {moved} container(s) down {frac} page(s) — "
                    "element indexes from before this scroll are now STALE; re-read the "
@@ -3064,14 +3400,43 @@ def build_tools() -> Tools:
         if _REPEAT_BUDGET is not None:
             remaining = _REPEAT_BUDGET - already
             if remaining <= 0:
-                # ERROR channel: multi_act stops the rest of a batched step, which is how the
-                # repeat_click+done pair of run 20260901_122209 slipped a whole extra pass in.
-                msg = (f"repeat_click REFUSED — did NOT click: {label} has already been "
-                       f"clicked {already} time(s) in this step, which is the "
-                       f"{_REPEAT_BUDGET} this step asks for. The repetition is COMPLETE. Do "
-                       f"NOT repeat it — verify the end state on the page and call done.")
-                logger.info("⛔ %s", msg)
-                return ActionResult(error=msg, metadata={"no_click": True})
+                # SATISFIED, not refused — and the difference decided run
+                # 20260903_114110_507756 subtask 15. repeat_click(5) had landed all five;
+                # the agent then rewrote its own memory between two consecutive steps
+                # ("Completed 5 further Save & Next clicks" -> "Next: advance through five
+                # more"), called this four more times, and reported the step incomplete
+                # QUOTING the old wording: "repeat_click was refused and no further
+                # navigation occurred ... this final action was not executed". A correct
+                # segment was recorded FAILED and the run stopped with fifteen good subtasks
+                # behind it.
+                #
+                # The agent asked for N clicks on this control. N clicks on this control
+                # exist. Its request HOLDS, so the honest answer is success with zero work
+                # done. "REFUSED — did NOT click" is a sentence about failure, and it was
+                # read as one. (The plain-click twin, _refuse_if_over_budget, already says
+                # "and those clicks all landed"; this branch never carried that clause.)
+                #
+                # Dropping the ERROR channel here does NOT reopen run 20260901_122209's
+                # hole. That channel stops batched follow-ups from firing against a page the
+                # refused action left unchanged-but-expected-to-change; here nothing is
+                # clicked, so the page really is unchanged and no index goes stale. The
+                # budget also stays enforced on the other route: a batched plain click on
+                # this control still meets _refuse_if_over_budget, the guard that stopped
+                # ten employees being paid for a five-employee slice in run 20260902_105732.
+                #
+                # long_term_memory, like the success receipt: the completion fact has to
+                # outlive the agent's memory rewrite, or the only line that survives the turn
+                # is the one framing the work as not done.
+                msg = (f"repeat_click: 0 additional clicks were needed — {label} has already "
+                       f"been clicked {already} time(s) in this step, which is the "
+                       f"{_REPEAT_BUDGET} this step asks for, and those clicks all landed. "
+                       f"The repetition is COMPLETE and this call changed nothing on the "
+                       f"page. This is NOT a failure of your step — do not repeat it and do "
+                       f"not report the step incomplete because of it. Verify the end state, "
+                       f"and if the rest of your step is done call done with success=true.")
+                logger.info("🔁 %s", msg)
+                return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                    include_in_memory=True, metadata={"no_click": True})
             if want and want > remaining:
                 logger.info("🔁 repeat_click: %s asked for %d but only %d of this step's "
                             "%d remain — clamping", label, want, remaining, _REPEAT_BUDGET)
@@ -3083,7 +3448,9 @@ def build_tools() -> Tools:
         # times=0 means "until it stops advancing"; the hard cap is a runaway guard, not an
         # expected stop — reaching it is reported as a failure, never as a finished list.
         cap = want or _REPEAT_HARD_CAP
-        done, stopped = 0, ""
+        # Read BEFORE the first click so a one-iteration relabel is caught too.
+        base_name = await _repeat_live_name(browser_session, node)
+        done, stopped, relabel = 0, "", ""
         for _ in range(cap):
             try:
                 event = browser_session.event_bus.dispatch(ClickElementEvent(node=node))
@@ -3104,10 +3471,23 @@ def build_tools() -> Tools:
             if not ready:
                 stopped = why
                 break
+            now_name = await _repeat_live_name(browser_session, node)
+            if _repeat_relabelled(base_name, now_name):
+                relabel = now_name
+                stopped = (f"the control is now named '{now_name}' (it was "
+                           f"'{base_name}') — a DIFFERENT control, not another iteration")
+                break
 
         # Ledger BEFORE the verdicts below: the clicks landed whether or not the count came
         # out right, and the next call must account for them.
         total = _note_clicks(node, done) if done else already
+        if done:
+            # This control is now what the segment's budget is ABOUT, which is what lets the
+            # plain-click paths enforce it without capping unrelated buttons.
+            try:
+                _REPEAT_TARGETS.add(_ledger_key(node))
+            except Exception:  # noqa: BLE001 - accounting must never break the receipt
+                pass
         spent = (f" {total} click(s) on it in this step so far"
                  + (f" of the {_REPEAT_BUDGET} this step asks for." if _REPEAT_BUDGET
                     else ".")) if total != done else ""
@@ -3136,9 +3516,19 @@ def build_tools() -> Tools:
                        f"a finished list. Check the page before reporting this step done.")
                 logger.info("⛔ %s", msg)
                 return ActionResult(error=msg, metadata={"no_click": True})
-            msg = (f"Clicked {label} {done} times, until it stopped advancing "
-                   f"({stopped}) — the run is complete at {done}.{spent} Do NOT call "
-                   f"repeat_click on {label} again in this step.")
+            if relabel:
+                # NOT "the run is complete": the list ended, but a different control is
+                # now sitting where the repeated one was, and the task may well name it.
+                # Clicking it as its OWN action is what puts a real step in the recording
+                # — the swallowed-Submit bug is precisely a missing step, not a wrong one.
+                msg = (f"Clicked {label} {done} times, then STOPPED: {stopped}. The "
+                       f"repetition is COMPLETE at {done}.{spent} '{relabel}' is a "
+                       f"SEPARATE control — if the task asks you to act on it, click it "
+                       f"as its OWN action; do NOT call repeat_click on it.")
+            else:
+                msg = (f"Clicked {label} {done} times, until it stopped advancing "
+                       f"({stopped}) — the run is complete at {done}.{spent} Do NOT call "
+                       f"repeat_click on {label} again in this step.")
         logger.info("🔁 %s", msg)
         return ActionResult(
             extracted_content=msg, long_term_memory=msg, include_in_memory=True,
@@ -3157,9 +3547,11 @@ def build_tools() -> Tools:
         "CURRENT click index — use click(index) with that index immediately. Use this to locate "
         "a specific button/link/tab/menu item by its label, especially after an 'Element index "
         "N not available' failure. Pass click_first=True to also click it when exactly one "
-        "element matches."
+        "element matches. When SEVERAL controls share the same name — one icon per grid row, "
+        "one checkbox per employee — pass near_text='<text in the row you want>' to scope the "
+        "search to that row; that clicks the right one directly, with no index to pick."
     )
-    async def find_by_text(text: str, click_first: bool = False, browser_session=None) -> ActionResult:  # injected by name; do not annotate
+    async def find_by_text(text: str, click_first: bool = False, near_text: str = "", browser_session=None) -> ActionResult:  # injected by name; do not annotate
         query = (text or "").strip()
         if not query:
             return ActionResult(error="find_by_text: text must be non-empty")
@@ -3179,6 +3571,39 @@ def build_tools() -> Tools:
         if not tokens:
             return ActionResult(error=f"find_by_text: no searchable text in {query!r}")
         matches = _matching_nodes(state, tokens)
+        near_tokens = [t for t in re.split(r"[^a-z0-9]+", (near_text or "").strip().lower()) if t]
+        # The ROW each candidate sits in — the only thing that tells twelve identical "Net to
+        # gross" pencils apart. Probed once, then used BOTH to scope (near_text) and to label
+        # the listing. Skipped when there is nothing to disambiguate.
+        rows: dict[int, str] = {}
+        if matches and (near_tokens or len(matches) > 1):
+            rows = await _row_labels(browser_session, matches)
+        # `matches` guard: scoping may only NARROW candidates that exist. Without it a query
+        # that matched nothing returned "0 element(s) carry 'X', but NONE of them sits in a
+        # row containing 'Y'" — which blames the scope for a miss it did not cause — and,
+        # worse, returned BEFORE the 0-match path, so passing near_text silently disabled the
+        # raw-DOM search and its scroll hunt, the only way to reach a 0-size or off-screen
+        # control (run 20260903_122807_063006 subtask 16, steps 5 and 6). Falling through is
+        # safe: the raw path refuses ambiguity itself, and the wrong-row hazard needs several
+        # same-named controls to exist in the first place.
+        if near_tokens and matches:
+            scoped = [m for m in matches if _row_matches(rows.get(m[0]), near_tokens)]
+            if not scoped:
+                # FAILS CLOSED. Falling back to the unscoped candidates would click a row the
+                # agent did not ask for, which is the failure this machinery exists to
+                # prevent (run 20260817_124339 paid AARAN instead of Harris Duncan off a
+                # stale positional index). ERROR channel: a click_first that clicked nothing
+                # is a refusal, and multi_act must stop the rest of the batch.
+                seen = "; ".join(sorted({r[:40] for r in rows.values()})[:6]) or "none readable"
+                msg = (f"find_by_text('{query}', near_text='{near_text}'): {len(matches)} "
+                       f"element(s) carry '{query}', but NONE of them sits in a row "
+                       f"containing '{near_text}' — nothing was clicked. Rows seen: {seen}. "
+                       f"Either the row is not rendered yet (scroll the list itself), or the "
+                       f"text you scoped by is not in that row — check it against the rows "
+                       f"listed above and try the wording they use.")
+                logger.info("🔎 %s", msg)
+                return ActionResult(error=msg, metadata={"no_click": True})
+            matches = scoped
 
         def _line(idx: int, node: Any, label: str) -> str:
             attrs = node.attributes or {}
@@ -3186,6 +3611,23 @@ def build_tools() -> Tools:
             for attr in ("id", "aria-label"):
                 if attrs.get(attr):
                     parts.append(f"{attr}='{attrs[attr][:60]}'")
+            # The icon hint is often the ONLY reason a query matched, and leaving it out
+            # makes a correct click look like a wrong one. Run 20260903_122807_063006
+            # subtask 16: find_by_text('Bulk upload FPS') clicked the right control and
+            # reported "text=' FPS' id='btnFPS'" — the app labels that button plain FPS and
+            # carries "Bulk upload" only in its icon, which _matching_nodes folds into the
+            # haystack and this line then dropped. The agent read the receipt, concluded it
+            # had "mis-clicked the manual FPS button" (a control that does not exist; it
+            # coined the name), and spent ten steps closing the panel it had just opened.
+            # list_actions has always shown these hints — see its _decoded.
+            hints = _descendant_icon_hints(node)
+            if hints and hints.lower() not in " ".join(parts).lower():
+                parts.append(f"icon='{hints[:60]}'")
+            # Without this, an ambiguous listing of row-scoped icons is N byte-identical
+            # lines and the receipt's own "pick the right index" cannot be followed
+            # (run 20260903_102354_153542: 24 of them, then improvised JavaScript).
+            if rows.get(idx):
+                parts.append(f"row='{rows[idx][:60]}'")
             return " ".join(parts)
 
         page_url = getattr(state, "url", "") or ""
@@ -3222,13 +3664,18 @@ def build_tools() -> Tools:
                     popup = await _callout_open(browser_session)
                 if not popup:
                     if not (raw and not raw.get("error") and raw.get("count")):
-                        await _eval_js(browser_session, _SCROLL_TOPS_JS)
+                        # Settled, not raced: the reset mounts a different window and the
+                        # query must see IT, not the one the page had a frame ago.
+                        await _scroll_tops_and_settle(browser_session)
                         raw = await _eval_js(browser_session, expr)
                     for _ in range(_PANEL_SCROLL_ROUNDS):
                         if raw and not raw.get("error") and raw.get("count"):
                             break
-                        moved = await _eval_js(browser_session,
-                                               _SCROLL_CONTAINERS_JS % json.dumps(0.8))
+                        # _scroll_and_settle, never the raw script: re-querying in the same
+                        # tick as the scroll reads the PREVIOUS render window, and twenty
+                        # rounds of that walk a virtualized list without ever seeing it
+                        # (run 20260903_110957_989862 subtask 6 — the employee was there).
+                        moved = await _scroll_and_settle(browser_session, 0.8)
                         if not moved:
                             break
                         raw = await _eval_js(browser_session, expr)
@@ -3236,7 +3683,7 @@ def build_tools() -> Tools:
                         # A failed hunt must not leave the page parked at the bottom: the
                         # agent's next snapshot should show the page's head, not its floor
                         # (the manual scroll-up from run 20260817_133135, automated).
-                        await _eval_js(browser_session, _SCROLL_TOPS_JS)
+                        await _scroll_tops_and_settle(browser_session)
             except Exception as exc:  # noqa: BLE001 - fallback is best-effort
                 logger.debug("find_by_text raw-DOM fallback failed: %s", exc)
             if raw and not raw.get("error") and raw.get("count"):
@@ -3293,15 +3740,21 @@ def build_tools() -> Tools:
                                         _RAW_TEXT_FIND_JS % json.dumps(tokens))
             except Exception as exc:  # noqa: BLE001 - probe is best-effort
                 logger.debug("find_by_text static-text probe failed: %s", exc)
+            found = ""
             if isinstance(static, dict) and not static.get("error") and static.get("count"):
                 found = " ".join(str(static.get("name") or "").split())[:200]
+            else:
+                found = _state_text_witness(state, tokens, query)
+            if found:
                 msg = (f"find_by_text('{query}'): no clickable control matches, but the "
                        f"text EXISTS on this page as STATIC text: '{found}'. It is a "
                        "label/heading, not a control — the section IS on this page; do "
-                       "NOT navigate away or scroll-hunt for it. To operate the field "
-                       "NEXT TO this label, use the element indexes from the page state "
-                       "(for a dropdown, call select_dropdown on the combobox input's "
-                       "index). Nothing was clicked.")
+                       "NOT navigate away, do NOT scroll-hunt for it, and do NOT click "
+                       "an index near it. To operate the field BESIDE this label, "
+                       "address it BY the label: for a dropdown/combobox call "
+                       f"select_dropdown(near_text='{query}', text='<the option>') — no "
+                       "index lookup. For any other field use its own index from the "
+                       "page state. Nothing was clicked.")
                 logger.info("🔎 %s", msg)
                 # no_click: a probe that touched nothing — same compile rule as below.
                 return _nothing_clicked(msg, click_first)
@@ -3322,11 +3775,19 @@ def build_tools() -> Tools:
                 logger.info("🔎 %s", msg)
                 return _nothing_clicked(msg, click_first)
             msg = (
-                f"find_by_text('{query}'): 0 matches on the CURRENT page ({page_url}). "
-                "The element is not in this page's DOM. FIRST check: is this the page you think "
-                "you are on? If a previous click navigated you away (e.g. back to a list page), "
-                "recover with go_back or re-open the right section. Otherwise scroll (0.5 "
-                "pages at most) or apply the ELEMENT NOT FOUND POLICY; do not repeat this query."
+                f"find_by_text('{query}'): 0 matches — nothing carrying this text is "
+                f"clickable on the CURRENT page ({page_url}). This is NOT proof the text "
+                "is absent from the screen. Do NOT re-issue this string through this or "
+                "ANY other tool. Decide which of two causes it is before you act:\n"
+                "  1. THE STRING. Re-read your step and retry with the word IT uses. If "
+                "what you want is a field with no name of its own (a dropdown/combobox, "
+                "an unlabelled input), stop searching for it — address it by the label "
+                "beside it, with select_dropdown(near_text='<that label>', ...).\n"
+                "  2. THE PAGE. The section may not be open yet, or a click may have "
+                "navigated you away. Re-read your step for the action that OPENS this "
+                "section and do that first; recover a lost page with go_back.\n"
+                "Otherwise scroll (0.5 pages at most) or apply the ELEMENT NOT FOUND "
+                "POLICY."
             )
             logger.info("🔎 %s", msg)
             # no_click: this touched nothing — without the stamp, compile treats a
@@ -3415,6 +3876,13 @@ def build_tools() -> Tools:
                            f"field itself is truly your target.")
                     logger.info("🔎 %s", msg)
                     return ActionResult(error=msg, metadata={"no_click": True})
+            # Same repeat-budget guard the plain click override applies, and for the same
+            # reason: this is the OTHER doorway onto a control (the prompt sends the agent
+            # here whenever a target looks ambiguous), so leaving it unguarded would let a
+            # redo walk straight past the refusal.
+            refusal = _refuse_if_over_budget(node, label)
+            if refusal is not None:
+                return refusal
             pre = await _dialog_state(browser_session, node)
             t0 = _stamp_action()
             try:
@@ -3432,6 +3900,10 @@ def build_tools() -> Tools:
                        f"{res['validation_error']} Nothing was clicked.")
                 logger.info("🔎 %s", msg)
                 return ActionResult(error=msg, metadata={"no_click": True})
+            # This click landed, so it counts toward the segment's repeat ledger exactly as a
+            # plain click does — otherwise the budget could be spent through this path
+            # without ever being charged.
+            _note_clicks(node, 1)
             # Record WHAT we clicked so script_compile can turn this custom action into a real
             # click step (a custom action carries no index, so browser-use captures no
             # interacted_element for it). Same DOMInteractedElement shape a built-in click records.
@@ -3454,8 +3926,10 @@ def build_tools() -> Tools:
         ambiguous = click_first and len(matches) > 1
         guidance = (
             f"Ambiguous: {len(matches)} candidates, so NOTHING WAS CLICKED. Do NOT call "
-            f"find_by_text('{query}') again — pick the right index from the list above "
-            "and click(index) NOW."
+            f"find_by_text('{query}') again unchanged. Either pick the right index from "
+            f"the list above (each line names the ROW it sits in) and click(index) NOW, "
+            f"or re-call it scoped: find_by_text('{query}', near_text='<text in the row "
+            f"you want>', click_first=True), which clicks that row's one directly."
             if ambiguous
             else "Click your target with click(index) NOW — indexes are fresh but go stale on re-render."
         )
@@ -3739,7 +4213,16 @@ def build_tools() -> Tools:
         "Each result carries its decoded icon name and its click index. Use this when you need an "
         "icon whose tooltip/label is not findable by text (e.g. a 'send survey', 'edit', or "
         "'download' icon in a toolbar or table row) — call list_actions with the nearest visible "
-        "heading or row text, read the decoded names, then click the matching index. Read-only."
+        "heading or row text, read the decoded names, then click the matching index. "
+        "Read-only, and it ENDS the turn: read the indices, then click on your next turn.",
+        # Whatever is queued behind this in the same turn was chosen WITHOUT the indices it
+        # returns. Run 20260903_100115_102078 issued list_actions and click(index=1) in one
+        # turn twice over: `1` meant "the first thing you are about to list", while the real
+        # indices on that page were 1180/1290/7413, and browser-use answers a missing index
+        # with a plain extracted_content (tools/service.py) — no error, so the rest of the
+        # batch sailed on. multi_act breaks on this flag the same way it does for
+        # navigate/search/switch/evaluate: the agent gets the listing, then chooses.
+        terminates_sequence=True,
     )
     async def list_actions(near_text: str = "", browser_session=None) -> ActionResult:  # injected by name; do not annotate
         if browser_session is None:
@@ -3778,6 +4261,29 @@ def build_tools() -> Tools:
                         break
                 except Exception:  # noqa: BLE001
                     continue
+        if near_tokens and anchor is None:
+            # The landmark is NOT on the page. Falling through here listed the page's first
+            # 30 named controls under the heading "Clickable controls near '<landmark>'",
+            # because the window filter below is skipped when there is no anchor to window
+            # around — an answer to a question the tool never managed to ask.
+            #
+            # Run 20260903_100115_102078 subtask 16 is the cost. The bulk-upload grid had
+            # never been opened, so "Select Employee", then "Anas Burns", then "Employees"
+            # all missed; all three returned 30 confident-looking controls. The agent
+            # concluded the grid was in front of it, skipped the sentence that opens it
+            # ("select Bulk upload FPS"), and spent the segment hunting checkboxes that did
+            # not exist — clicking a nameless button into an import modal and cancelling it.
+            #
+            # SUCCESS channel, by the intent rule in _text_miss: this is a probe, and "what
+            # is near this?" is a question whose answer can honestly be none. Stopping a
+            # batch is terminates_sequence's job, not this branch's.
+            msg = (f"list_actions: '{near_text}' is not on the page, so there is nothing to "
+                   f"list near it — no controls are reported. This usually means the "
+                   f"section holding it is not open yet: do the action your step names to "
+                   f"open it, then call list_actions again.")
+            logger.info("🧭 %s", msg)
+            return ActionResult(extracted_content=msg, long_term_memory=msg,
+                                include_in_memory=True)
 
         window = 40
         rows: list[str] = []

@@ -149,6 +149,37 @@ def _action_name(entry: dict[str, Any]) -> str:
     return next((k for k in entry if k != "interacted_element"), "")
 
 
+def dropped_done_notice(action_names: list[str], finished: bool) -> str | None:
+    """The notice for a `done` browser-use silently discarded, or None when nothing was.
+
+    browser-use runs a batched step in order and BREAKS at a `done` that is not the first
+    action — "Done action is allowed only as a single action" (agent/service.py) — logging
+    it at DEBUG, so it never reaches the run log and the agent is handed another step with
+    no reason given.
+
+    Run 20260902_105732 subtask 3 is what this is for. The agent batched
+    [repeat_click(times=5), done]; the repeat landed all five clicks, the `done` vanished,
+    and on the unexplained extra turn the agent read the correct end state (the 6th, unsaved
+    employee on screen) as a failure and clicked Save & Next five more times by hand. Ten
+    employees were paid for a five-employee slice. Telling it what actually happened is what
+    lets it re-issue `done` instead of inventing a recovery.
+    """
+    if finished or "done" not in action_names[1:]:
+        return None
+    ran = [n for n in action_names[:action_names.index("done", 1)]]
+    did = ", ".join(ran) if ran else "your earlier actions"
+    return (
+        "⚠ YOUR `done` WAS DROPPED — not because anything failed. This framework's agent "
+        "loop only accepts `done` as the ONLY action in a step, so the `done` you batched "
+        f"behind {did} was discarded before it ran. That is the ONLY reason you are being "
+        "asked for another step.\n"
+        f"Everything before it DID run and its receipts stand: {did}. Do NOT repeat any of "
+        "it, do NOT treat the extra turn as evidence that it failed, and do NOT invent a "
+        "recovery for work that already succeeded. If the step is finished, call `done` "
+        "now as the ONLY action in this step."
+    )
+
+
 def discovery_loop_notice(actions: list[dict[str, Any]]) -> str | None:
     """A loop-breaking notice when the trailing actions are ALL read-only discovery, else
     None. Observed live: after misreading a find_by_text click receipt, the agent spent 18
@@ -498,6 +529,30 @@ class Runner:
             except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
                 logger.debug("discovery-loop nudge skipped: %s", exc)
 
+        def _nudge_if_done_dropped(_agent: "AgentType") -> None:
+            """Tell the agent when its batched `done` was silently discarded, so it
+            re-issues it instead of inventing a recovery (see dropped_done_notice)."""
+            try:
+                items = getattr(_agent.history, "history", None) or []
+                if not items:
+                    return
+                last = items[-1]
+                out = getattr(last, "model_output", None)
+                if out is None:
+                    return
+                names = []
+                for act in getattr(out, "action", None) or []:
+                    data = act.model_dump(exclude_unset=True)
+                    names.append(next(iter(data), "") if data else "")
+                finished = any(getattr(r, "is_done", False)
+                               for r in (getattr(last, "result", None) or []))
+                notice = dropped_done_notice(names, finished)
+                if notice and _inject_context(_agent, notice):
+                    logger.info("⚠ dropped-done nudge injected (batch was %s)",
+                                " + ".join(n for n in names if n))
+            except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
+                logger.debug("dropped-done nudge skipped: %s", exc)
+
         def _nudge_if_search_typed(_agent: "AgentType") -> None:
             """Search-Enter enforcement: many lists in this app only run the search when Enter
             is pressed, and the model reliably forgets. If the LAST action typed into a search
@@ -597,6 +652,7 @@ class Runner:
             for collector in collectors:
                 collector.current_step = step_state["n"]
             _nudge_if_unintended_navigation(_agent)
+            _nudge_if_done_dropped(_agent)
             _nudge_if_search_typed(_agent)
             _nudge_if_discovery_loop(_agent)
             # Re-assert the reveal stylesheet on the current document each step (idempotent,

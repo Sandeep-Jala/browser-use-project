@@ -233,6 +233,36 @@ def _describe_check(check: Any) -> str:
     }.get(check.kind, f'{check.kind} "{check.arg}"')
 
 
+def _describe_next_conditionals(subtasks: list[Subtask],
+                                i: int) -> tuple[str | None, int]:
+    """The probe condition(s) of the run of conditional slices that immediately FOLLOW
+    subtask `i`, in agent-actionable words, plus how many slices that run covers.
+
+    A declared `probe:` says deterministically that the framework will look for this
+    outcome BEFORE that slice runs. The step that PRODUCES the outcome is its
+    predecessor, and nothing told the predecessor so: it read the outcome as its own
+    failed action and did the successor's work itself (run 20260901_151214, the FPS
+    submit slice — the server refused the write, the agent cancelled the dialog,
+    reopened the form, re-uploaded and re-submitted; 4 submits for 1, 15 steps, 554k
+    tokens, and the flail was committed as 22 replayable actions).
+
+    Only the CONDITION crosses the boundary, never the successor's action words —
+    telling the predecessor "click Cancel" is the very thing this stops. Consecutive
+    guards are ONE handoff from the producing step's point of view, so the scan walks
+    the whole run; the count is what lets the caller drop those slices from the
+    still-ahead list, where their action words would otherwise be handed over verbatim.
+    """
+    run = []
+    for sub in subtasks[i + 1:]:
+        probe = getattr(sub, "probe", None)
+        if probe is None:
+            break
+        run.append(probe)
+    if not run:
+        return None, 0
+    return " or ".join(_describe_check(p) for p in run), len(run)
+
+
 def _describe_expected_end(gate: Gate) -> str | None:
     """The gate's pass condition in words the agent can act on, or None when the gate has
     no page-state condition (marker gates verify via verify_save_registered instead, and
@@ -733,17 +763,28 @@ class HybridSession:
         """The page segments run against: the live aux (helper) tab while one is open, else
         the pinned main page. Explicit handles, not a scan — with two live tabs a scan
         could not tell which one the segment means."""
-        for page in (self._aux_page, self._main_page):
-            if page is not None and not page.is_closed():
-                return page
-        self._main_page = self._pick_main_page()
-        if self._main_page is not None:
-            # The pinned page DIED and a survivor takes its place. browser-use's
-            # RecordingWatchdog streams frames from ONE CDP session and silently drops
-            # every other session's (recording_watchdog.on_screencastFrame), so without
-            # a focus event here the run video freezes for the rest of the run while
-            # the run itself carries on. Fire-and-forget from this sync path; keep a
-            # ref so the loop cannot GC the task mid-flight.
+        moved = False
+        if self._aux_page is not None and self._aux_page.is_closed():
+            # The helper tab is GONE — a segment that ended "…and then close this tab"
+            # (replayed by script_compile._close_and_return, or done live by the agent).
+            # Release the pin HERE rather than at each call site: a closed page that still
+            # owns the session is how the OTP portal tab kept the next subtask inside it
+            # (run 20260902_091047_561480).
+            self._aux_page, moved = None, True
+        if self._aux_page is not None and not self._aux_page.is_closed():
+            return self._aux_page
+        if self._main_page is None or self._main_page.is_closed():
+            self._main_page = self._pick_main_page()
+            moved = True
+        if moved and self._main_page is not None:
+            # The page the run acts on CHANGED (the aux tab closed, or the pinned page
+            # died and a survivor takes its place). browser-use's RecordingWatchdog
+            # streams frames from ONE CDP session and silently drops every other
+            # session's (recording_watchdog.on_screencastFrame), so without a focus event
+            # here the run video freezes for the rest of the run while the run itself
+            # carries on — and a takeover agent would act on the tab it still thinks is
+            # current. Fire-and-forget from this sync path; keep a ref so the loop cannot
+            # GC the task mid-flight.
             try:
                 self._bg_focus_task = asyncio.get_running_loop().create_task(
                     self._focus_browser_use(self._main_page))
@@ -1203,6 +1244,7 @@ class HybridSession:
         completed: list[str], remaining: list[str],
         dirty: bool = False, prior_failure: str | None = None,
         record_path: Path | None = None, findings: list[str] | None = None,
+        next_conditional: str | None = None,
     ) -> Segment:
         """Run the LLM agent for ONE subtask on the shared live session. `findings` are the
         observations earlier segments recorded (each a "prompt: outcome" line) — the data
@@ -1218,7 +1260,8 @@ class HybridSession:
             downloads_file=gate.kind == "download",
             findings=findings, observe=kind == "judge",
             conditional=getattr(sub, "probe", None) is not None,
-            aux_tab=getattr(sub, "tab_url", None))
+            aux_tab=getattr(sub, "tab_url", None),
+            next_conditional=next_conditional)
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
                       context=context, mode="authored", kind=kind)
         try:
@@ -1863,6 +1906,38 @@ def tokenize_steps(steps: list[dict[str, Any]],
     return rewritten
 
 
+async def _settled_title(read: Any) -> str:
+    """The document title once it stops changing — the only safe input for a pin.
+
+    Reading LIVE is not enough, which is the correction run 20260903_091650_671199 forced.
+    This SPA updates document.title a whole navigation behind, and the lag is in the APP,
+    not in browser-use's capture — so a live read taken at the instant the segment ends is
+    exactly as stale as a recorded one. library/77a0af5f643402f2 ends on the Employees page
+    and its commit read "Payroll & RTI - Acting Office - Live Test", the title of the page
+    BEFORE it; that became the entry's expected end state. Every run after it false-failed:
+    all seven steps ran, the url gate matched "/paye/clients/*/", and only the pin
+    disagreed, because evaluate_gate reads the title through _settled() — a polling window
+    — and so sees the caught-up "Employees - …". Commit read early, gate read late; they
+    could never agree. Four consecutive runs died there.
+
+    The fix is symmetry: give the commit the same settle budget the gate will use, by
+    polling until two consecutive reads agree. A title that never settles returns its last
+    read rather than hanging — _pin_end_title's own guards still apply to whatever comes
+    back, and the pin is demote-only regardless. An unreadable/empty title returns at once:
+    it pins nothing anyway, so polling it would be pure delay on every commit.
+    """
+    last = " ".join(str(await read() or "").split())
+    if not last:
+        return last
+    for _ in range(_SETTLE_TRIES - 1):
+        await asyncio.sleep(_SETTLE_DELAY)
+        now = " ".join(str(await read() or "").split())
+        if now == last:
+            return now
+        last = now
+    return last
+
+
 def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | None:
     """The document title to pin as this segment's end state, or None to pin nothing.
 
@@ -1881,6 +1956,11 @@ def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | 
     a recorded title can be a whole page stale: subtask 0's final `done` item records url
     ".../rti/payrun" next to title "Dashboard - …". Pinning that false-failed a correct
     segment on the first live run after it shipped.
+
+    Live is NECESSARY BUT NOT SUFFICIENT, as this docstring assumed until 2026-09-03: the
+    lag is the app's, not the capture's, so an immediate live read at segment end carries
+    the same stale value. The `end_title` handed in must come from _settled_title — see
+    there for the run that proved it.
 
     Pinned conservatively — this is an ADDITIVE gate, and a false-fail here is worse than
     the blind spot it closes:
@@ -2029,7 +2109,7 @@ async def _author_segment(
     findings: list[str] | None = None, commit: bool = True,
     run_values: dict[str, str] | None = None,
     start_url: str | None = None, start_title: str | None = None,
-    dynamic: bool = False,
+    dynamic: bool = False, next_conditional: str | None = None,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
 
@@ -2057,7 +2137,7 @@ async def _author_segment(
     seg = await hs.agent_segment(
         sub, sid, context, gate, completed=completed, remaining=remaining,
         dirty=dirty, prior_failure=prior_failure, findings=findings,
-        record_path=rec_tmp,
+        record_path=rec_tmp, next_conditional=next_conditional,
     )
     if not seg.ok:
         # Keep a FAILED authoring's trace for diagnosis, but OFF the canonical path. The
@@ -2312,7 +2392,8 @@ async def _author_segment(
             # there is no single title to pin — the same reasoning as a segment that
             # closed its own page.
             end_title=(None if any(st.get("optional") for st in steps)
-                       else _pin_end_title(start_title, await hs.current_title(),
+                       else _pin_end_title(start_title,
+                                           await _settled_title(hs.current_title),
                                            sstore.recording_path(sid))),
             marker_write=gate.kind == "marker", steps=len(steps), provenance="clean",
         )
@@ -2476,7 +2557,14 @@ async def run_hybrid_task(
 
             entry = sstore.load_manifest().get(sid)
             gate = segment_gate(sub, entry, context)
-            remaining = [s.instantiated_prompt for s in subtasks[i + 1:]]
+            next_conditional, n_cond = _describe_next_conditionals(subtasks, i)
+            # The probed successors are DESCRIBED to this slice as an expected outcome,
+            # so they must not ALSO appear in the still-ahead list: that line hands the
+            # agent the successor's action words verbatim ("click Cancel to close it")
+            # under a generic do-not-start rule it stops honouring the moment it believes
+            # its own step failed (run 20260901_151214). With no probed successor the
+            # slice is subtasks[i + 1:], byte-identical to before.
+            remaining = [s.instantiated_prompt for s in subtasks[i + 1 + n_cond:]]
             seg: Segment | None = None
             skip_reason: str | None = None   # why this subtask did not replay
 
@@ -2565,7 +2653,8 @@ async def run_hybrid_task(
                                 # wall, whose title is a raw URL full of digits, so the
                                 # wrong title can never be learned.
                                 learned = _pin_end_title(
-                                    raw_start_title, await hs.current_title(),
+                                    raw_start_title,
+                                    await _settled_title(hs.current_title),
                                     sstore.recording_path(sid))
                                 if learned:
                                     sstore.update_manifest(sid, sub.template_prompt,
@@ -2630,7 +2719,8 @@ async def run_hybrid_task(
                                 remaining=remaining, dirty=dirty, prior_failure=prior,
                                 findings=takeover_findings, run_values=run_values,
                                 start_url=raw_start_url,
-                                start_title=raw_start_title, dynamic=False)
+                                start_title=raw_start_title, dynamic=False,
+                                next_conditional=next_conditional)
                             seg.mode = "replay_failed->authored"
                             # Why the replay failed used to die with the rebound
                             # segment — stdout only, no artifact. Keep it on the record.
@@ -2687,6 +2777,7 @@ async def run_hybrid_task(
                                                 start_url=raw_start_url,
                                 start_title=raw_start_title,
                                                 dynamic=False,
+                                                next_conditional=next_conditional,
                                                 # A fallback blob never commits: a whole-
                                                 # task recording replayed blind is the
                                                 # pre-hybrid behavior this mode degrades

@@ -189,6 +189,8 @@ def transpile(sid: str, steps: list[dict[str, Any]], *, source_prompt: str = "",
         elif action == "scroll":
             tail = "" if step.get("down", True) else ", down=False"
             lines.append(f"    await api.scroll({float(step.get('pages', 0.5))!r}{tail})")
+        elif action == "close_tab":
+            lines.append("    await api.close_tab()")
         elif action == "find_click":
             expr = _value_expr(str(step.get("text", "")), param_set)
             lines.append(f"    await api.find_click({expr})")
