@@ -30,7 +30,9 @@ run 20260817_124339 paid AARAN instead of Harris Duncan off a stale positional i
 import pytest
 
 from automation.pipeline import agent_tools
-from tests.test_agent_tools import _FakeBrowserSession, _FakeDomNode, _registered_action
+from tests.test_agent_tools import (_FakeBrowserSession, _FakeClickSession,
+                                    _FakeDomNode, _registered_action,
+                                    _stamped_dialog)
 
 
 def _grid(*rows):
@@ -293,3 +295,94 @@ async def test_the_row_refusal_still_fires_when_candidates_DO_exist(monkeypatch)
 
     assert res.error and "sits in a row" in res.error
     assert "3 element(s)" in res.error
+
+
+# ------------------------------- scoping a LONE match -------------------------------
+#
+# Run 20260904_150433_366684 subtask 4, step 4 — the FPS submit button, five employees
+# already ticked:
+#
+#   find_by_text('FPS', near_text='Brooklyn Millar'): 1 element(s) carry 'FPS', but NONE
+#   of them sits in a row containing 'Brooklyn Millar' — nothing was clicked. Rows seen:
+#   none readable.
+#
+# The ONE candidate was the right button. It lives in the panel FOOTER, inside no
+# [role=row]/tr/li/List-cell at all, so its row text is empty and _row_matches fails
+# closed. Refused, the agent fell back to guessing indexes off the (truncated) element
+# listing and clicked the ms-Overlay, then the panel's close X — which closed the panel
+# and discarded all five ticks.
+#
+# The agent supplied near_text because it is TAUGHT to: the slice says "click FPS at the
+# bottom of the employee list", and both the prompt and this tool's own ambiguity refusal
+# advertise near_text as the way to narrow. A redundant scope must not be punished.
+#
+# Scoping picks one control out of SEVERAL identically-named ones. With a single candidate
+# there is nothing to pick, so scoping can only ever destroy a correct match — the same
+# reasoning the 0-match fall-through above already runs on ("the wrong-row hazard needs
+# several same-named controls to exist in the first place"), applied one case further.
+
+
+def _panel_footer_button():
+    """The FPS panel's submit button as run 20260904_150433 recorded it.
+
+    `ms-Button--primary`, accessible name = the Fluent icon glyph + "FPS", NO id and NO
+    aria-label, and it sits in the panel footer — in no row, so the row probe reads ''."""
+    node = _FakeDomNode("\uf548\nFPS",
+                        attributes={"class": "ms-Button ms-Button--primary btnMedium-1203"})
+    node.node_name = "BUTTON"
+    node.tag_name = "button"
+    return node
+
+
+def _rowless(monkeypatch):
+    async def no_row(_session, _node):
+        return None
+    monkeypatch.setattr(agent_tools, "_row_context_label", no_row)
+
+
+async def test_a_lone_match_is_clicked_not_scoped_away(monkeypatch):
+    _rowless(monkeypatch)
+    _stamped_dialog(monkeypatch, {"present": True, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    fn, pm = _registered_action("find_by_text")
+    session = _FakeClickSession({10218: _panel_footer_button()}, result=None)
+
+    res = await fn(params=pm(text="FPS", near_text="Brooklyn Millar", click_first=True),
+                   browser_session=session)
+
+    assert res.error is None, res.error
+    assert "clicked the single match" in (res.extracted_content or "")
+
+
+async def test_a_skipped_scope_is_declared_in_the_receipt(monkeypatch):
+    """Silently ignoring near_text would read as if the scope had been honoured — the
+    agent asked for something in Brooklyn Millar's row and got a control in no row."""
+    _rowless(monkeypatch)
+    _stamped_dialog(monkeypatch, {"present": True, "open": 1})
+    monkeypatch.setattr(agent_tools, "_LIVE_NETWORK", None)
+    monkeypatch.setattr(agent_tools, "ClickElementEvent", lambda node: ("click", node))
+    fn, pm = _registered_action("find_by_text")
+    session = _FakeClickSession({10218: _panel_footer_button()}, result=None)
+
+    res = await fn(params=pm(text="FPS", near_text="Brooklyn Millar", click_first=True),
+                   browser_session=session)
+
+    msg = res.extracted_content or ""
+    assert "Brooklyn Millar" in msg and "not applied" in msg
+
+
+async def test_two_matches_still_refuse_an_unmatched_row(monkeypatch):
+    """The guard itself is untouched at the boundary: the moment a SECOND same-named
+    control exists there is something to disambiguate, and an unmatched scope must still
+    refuse rather than click a row the agent did not ask for."""
+    session, row_of = _grid("Dec-26 £5,000.00 ", "Jan-27 £5,000.00 ")
+    _stub_rows(monkeypatch, row_of)
+    fn, pm = _registered_action("find_by_text")
+
+    res = await fn(params=pm(text="Net to gross", near_text="Aug-99", click_first=True),
+                   browser_session=session)
+
+    assert res.error and "sits in a row" in res.error
+    assert "2 element(s)" in res.error
+    assert (res.metadata or {}).get("no_click") is True

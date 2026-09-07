@@ -3578,15 +3578,35 @@ def build_tools() -> Tools:
         rows: dict[int, str] = {}
         if matches and (near_tokens or len(matches) > 1):
             rows = await _row_labels(browser_session, matches)
-        # `matches` guard: scoping may only NARROW candidates that exist. Without it a query
-        # that matched nothing returned "0 element(s) carry 'X', but NONE of them sits in a
-        # row containing 'Y'" — which blames the scope for a miss it did not cause — and,
-        # worse, returned BEFORE the 0-match path, so passing near_text silently disabled the
-        # raw-DOM search and its scroll hunt, the only way to reach a 0-size or off-screen
-        # control (run 20260903_122807_063006 subtask 16, steps 5 and 6). Falling through is
-        # safe: the raw path refuses ambiguity itself, and the wrong-row hazard needs several
-        # same-named controls to exist in the first place.
-        if near_tokens and matches:
+        # Scoping may only narrow candidates there is a CHOICE between — it picks one
+        # control out of several identically-named ones, so below two candidates it can
+        # only ever destroy a correct match. Two runs paid for the two halves of that:
+        #
+        #   0 matches (run 20260903_122807_063006 subtask 16, steps 5-6): "0 element(s)
+        #   carry 'X', but NONE of them sits in a row containing 'Y'" blamed the scope for
+        #   a miss it did not cause, and returned BEFORE the 0-match path — so passing
+        #   near_text silently disabled the raw-DOM search and its scroll hunt, the only
+        #   way to reach a 0-size or off-screen control.
+        #
+        #   1 match (run 20260904_150433_366684 subtask 4, step 4): the FPS panel's submit
+        #   button, five employees ticked, "1 element(s) carry 'FPS', but NONE of them sits
+        #   in a row containing 'Brooklyn Millar'". That ONE candidate was the right
+        #   button — it lives in the panel footer, in no row at all. Refused, the agent
+        #   guessed indexes off the listing and clicked the overlay, then the panel's close
+        #   X, discarding all five ticks. near_text was not a mistake to punish: the slice
+        #   says "click FPS at the bottom of the employee list", and both the prompt and
+        #   this tool's own ambiguity refusal advertise near_text as the way to narrow.
+        #
+        # Falling through is safe: the raw path refuses ambiguity itself, and the
+        # wrong-row hazard needs several same-named controls to exist in the first place.
+        # `rows` is still probed for a lone match — it labels the listing, not just scope.
+        # A skipped scope must be SAID, on whichever channel answers. Staying silent
+        # would read as if near_text had been honoured — the agent asked for something in
+        # a named row and got a control that may sit in no row at all.
+        scope_note = (f" (near_text='{near_text}' was not applied: only one control "
+                      f"carries this text, so there was nothing to narrow)"
+                      if near_tokens and len(matches) == 1 else "")
+        if near_tokens and len(matches) > 1:
             scoped = [m for m in matches if _row_matches(rows.get(m[0]), near_tokens)]
             if not scoped:
                 # FAILS CLOSED. Falling back to the unscoped candidates would click a row the
@@ -3915,7 +3935,7 @@ def build_tools() -> Tools:
             suffix, outcome = await _click_outcome_suffix(browser_session, t0, pre, node)
             meta = _with_write_outcome(meta, outcome)
             msg = (f"find_by_text('{query}'): clicked the single match "
-                   f"{_line(idx, node, label)}" + suffix)
+                   f"{_line(idx, node, label)}" + scope_note + suffix)
             logger.info("🔎 %s", msg)
             return ActionResult(extracted_content=msg, long_term_memory=msg,
                                 include_in_memory=True, metadata=meta)
@@ -3934,8 +3954,8 @@ def build_tools() -> Tools:
             else "Click your target with click(index) NOW — indexes are fresh but go stale on re-render."
         )
         content = (
-            f"find_by_text('{query}'): {len(matches)} match(es):\n" + "\n".join(lines) + tail
-            + f"\n{guidance}"
+            f"find_by_text('{query}'): {len(matches)} match(es)" + scope_note + ":\n"
+            + "\n".join(lines) + tail + f"\n{guidance}"
         )
         memory = (
             f"find_by_text('{query}'): {len(matches)} match(es); "

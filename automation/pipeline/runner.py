@@ -149,6 +149,66 @@ def _action_name(entry: dict[str, Any]) -> str:
     return next((k for k in entry if k != "interacted_element"), "")
 
 
+# browser-use serialises the clickable-element listing to at most this many characters
+# (its own default is 40000 — browser_use/agent/views.py:92) and CUTS MID-ELEMENT when the
+# page is denser, then prints "[End of page]" after the cut. Measured on the FPS bulk-upload
+# panel (run 20260904_160415, confirmed against the live DOM): 1055 interactive controls,
+# 956 printed in 40016 chars = 41.9 chars each, so the full listing is ~44.2k and the panel's
+# submit button — 94.2% of the way through the page's interactive order, behind 108 grid
+# rows — was in the dropped 99. The agent clicked the nameless panel close button that
+# happened to be listed under a loose "FPS" text label and lost five ticked employees.
+# Worst page anywhere in the recorded corpus is ~51.6k, so this clears it ~1.5x.
+# The cap only bites when exceeded and the state message lives in ONE REPLACED SLOT
+# (message_manager/service.py:559), never a growing history: the cost is a few thousand
+# characters on the minority of dense steps and zero on the rest. Keep it FINITE — this
+# app's grid grows by an employee every run (see _PANEL_SCROLL_ROUNDS) — and re-measure
+# with tests/test_element_listing_budget.py if a page ever passes ~1800 controls.
+CLICKABLE_LISTING_BUDGET = 80_000
+
+_LISTING_TRUNCATED_RE = re.compile(r"Interactive elements \(truncated to \d+ characters\)")
+_LISTING_INTERACTIVE_RE = re.compile(r"(\d+) interactive")
+_LISTING_INDEX_RE = re.compile(r"\[(\d+)\]")
+
+
+def truncated_listing_notice(state_message: str | None) -> str | None:
+    """The notice for a control listing that was cut short, or None when it was complete.
+
+    browser-use already prints "(truncated to N characters)" in the header and it did not
+    help: prompts.py:276 appends "[End of page]" AFTER the cut, so the last thing the model
+    reads is a severed attribute followed by a marker saying it has seen everything. Worse,
+    the cut leaves bare TEXT labels stranded next to whatever element was listed near them,
+    which is a direct invitation to the wrong inference — run 20260904_160415 read
+    "[2238]<button />" printed under a loose "FPS" label as the FPS button and clicked the
+    panel's close X instead.
+
+    So the notice does the two things the header does not: it says HOW MANY controls are
+    missing, and it routes to find_by_text, which searches the page rather than this list.
+    """
+    text = state_message or ""
+    if not _LISTING_TRUNCATED_RE.search(text):
+        return None
+    total_match = _LISTING_INTERACTIVE_RE.search(text)
+    total = int(total_match.group(1)) if total_match else 0
+    printed = len(set(_LISTING_INDEX_RE.findall(text)))
+    missing = max(total - printed, 0)
+    count = (f"{missing} of the page's {total} interactive controls are NOT in it"
+             if missing else "some of this page's interactive controls are NOT in it")
+    return (
+        f"\u26a0 THE CONTROL LIST BELOW IS INCOMPLETE — it was cut at a character limit, so "
+        f"{count}. The missing ones are the LAST in page order: the bottom of a long list, "
+        f"and a panel's or dialog's footer buttons. The cut lands mid-element and the "
+        f"\"[End of page]\" marker printed after it is NOT true.\n"
+        f"A control that is not listed has NO index, so you cannot click it by index. And "
+        f"the cut strands loose TEXT labels beside whatever element happened to be listed "
+        f"near them: an index printed under or beside a label is NOT necessarily that "
+        f"label's control. A listed control carries its own name on its own line.\n"
+        f"So if the control your step names is not in the list WITH ITS OWN NAME, do not "
+        f"pick a nearby index and do not infer one from an adjacent label. Reach it by name "
+        f"with find_by_text('<the text on it>', click_first=true), which searches the whole "
+        f"page instead of this list."
+    )
+
+
 def dropped_done_notice(action_names: list[str], finished: bool) -> str | None:
     """The notice for a `done` browser-use silently discarded, or None when nothing was.
 
@@ -419,6 +479,10 @@ class Runner:
             use_vision=self.config.use_vision,
             vision_detail_level=self.config.vision_detail_level,
             max_history_items=self.config.max_history_items,
+            # The clickable-element listing budget. See CLICKABLE_LISTING_BUDGET: the
+            # 40000 default silently dropped the FPS panel's submit button and the agent
+            # clicked a nameless neighbour instead.
+            max_clickable_elements_length=CLICKABLE_LISTING_BUDGET,
             # o4-mini needs an explicit per-call budget: browser-use's model-name
             # heuristic hands it the default 75s (only o3/claude/deepseek get 90),
             # which medium-effort thinks can exceed. step_timeout is ONE asyncio
@@ -528,6 +592,25 @@ class Runner:
                     logger.info("⚠ discovery-loop nudge injected")
             except Exception as exc:  # noqa: BLE001 - a nudge must never break a step
                 logger.debug("discovery-loop nudge skipped: %s", exc)
+
+        def _nudge_if_listing_truncated(_agent: "AgentType") -> None:
+            """Warn while the page is still dense enough to cut the listing short.
+
+            Read on_step_start, so this reflects the state message the agent was LAST
+            shown — which is the right one: a panel that overflowed the budget on the
+            previous step is still open on this one, and that is exactly when the agent is
+            picking indexes inside it. With CLICKABLE_LISTING_BUDGET raised this fires
+            rarely; it is the net under the budget, not a substitute for it."""
+            try:
+                mm = getattr(_agent, "_message_manager", None)
+                history = getattr(getattr(mm, "state", None), "history", None)
+                message = getattr(history, "state_message", None)
+                notice = truncated_listing_notice(getattr(message, "content", None))
+            except Exception as exc:  # noqa: BLE001 - never break a step
+                logger.debug("listing-truncation check skipped: %s", exc)
+                return
+            if notice and _inject_context(_agent, notice):
+                logger.info("\u26a0 truncated control listing surfaced to agent")
 
         def _nudge_if_done_dropped(_agent: "AgentType") -> None:
             """Tell the agent when its batched `done` was silently discarded, so it
@@ -655,6 +738,7 @@ class Runner:
             _nudge_if_done_dropped(_agent)
             _nudge_if_search_typed(_agent)
             _nudge_if_discovery_loop(_agent)
+            _nudge_if_listing_truncated(_agent)
             # Re-assert the reveal stylesheet on the current document each step (idempotent,
             # one cheap CDP eval; on_step_start, so it lands BEFORE this step's snapshot):
             # covers tabs created outside login.py's init-scripted context.

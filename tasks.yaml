@@ -882,7 +882,7 @@ payroll_detailed_review_fps_part2:
   tags: [payroll]
   subtasks:
     - prompt: >-
-        Go to the Payroll module, search for and select the business name Food Alchemy LTD.
+        Go to the Payroll module, search for and select the business name Food Limited.
     - prompt: >-
         Then go to Payroll & RTI and change the period to Apr-26 through the combobox in the
         nav bar.
@@ -894,85 +894,121 @@ payroll_detailed_review_fps_part2:
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the
         next employee to fully load after each click.
     - prompt: >-
-        Then click bulk uplaod FPS submission, click on Employees checkbox to uncheck it, and then select the first 5 employees checkbox, click upload FPS button, select the reason H - correction to earlier submission from the combobox, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to May-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Jun-26 through the combobox in the nav bar.
+        Change the period to May-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-       Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.    
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Jul-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Aug-26 through the combobox in the nav bar.
+        Change the period to May-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Sep-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit. 
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Oct-26 through the combobox in the nav bar.
+        Change the period to Jul-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Nov-26 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Dec-26 through the combobox in the nav bar.
+        Change the period to Aug-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Jan-27 through the combobox in the nav bar.
-    - prompt: >-
-        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
-    - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
-    - prompt: >-
-        Then go to Payroll & RTI and change the period to Feb-27 through the combobox in the nav bar.
+        Change the period to Sep-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
     - prompt: >-
-        Then go to Payroll & RTI and change the period to Mar-27 through the combobox in the nav bar.
+        Change the period to Oct-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then click FPS submission, click on Employees checkbox to uncheck it, select the first 5 employees checkbox, click upload FPS button, select the document New_Employees_List_-_WI_LTD.csv, and
-        click Submit.
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+    - prompt: >-
+        Change the period to Nov-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+    - prompt: >-
+        Change the period to Dec-26 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+    - prompt: >-
+        Change the period to Jan-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+    - prompt: >-
+        Change the period to Feb-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+    - prompt: >-
+        Change the period to Mar-27 through the combobox in the nav bar.
+    - prompt: >-
+        Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
+    - prompt: >-
+        Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
+        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
+        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
 
     
 payroll_client:
