@@ -2589,6 +2589,13 @@ _ROW_LABEL_JS = (
 # request from the day before. A positional path resolves confidently onto the wrong row
 # and nothing downstream can tell.
 #
+# It also records the dialog/panel the row lives in, because a row scope says WHICH ROW
+# and nothing about WHICH LIST. The FPS bulk-upload panel renders its DetailsList over the
+# page's own "Select Employee" DetailsList (run 20260904_162236): same id shape, same
+# employees, so neither the cell texts nor the "-{n}-checkbox" tail can separate them, and
+# replay ticked five rows in the BACKGROUND list. Recorded, never derived from the xpath —
+# Fluent's layer host sits at a body index that moves between runs (div[3] vs div[2]).
+#
 # PUA glyphs are stripped (Fluent renders its icons as literal text nodes — the 2026-08-21
 # pencil trap) and each cell is capped, because a cell text becomes a selector literal.
 _ROW_CELLS_JS = (
@@ -2596,10 +2603,14 @@ _ROW_CELLS_JS = (
     ".replace(/[\\uE000-\\uF8FF]/g, '').replace(/\\s+/g, ' ').trim(); };"
     " var SCOPES = [['[role=\"row\"]', '[role=\"row\"]'], ['tr', 'tr'], ['li', 'li'],"
     "               ['[class*=\"List-cell\"]', '[class*=\"List-cell\"]']];"
+    " var CONTAINERS = ['[role=\"dialog\"]', '.ms-Panel', '.ms-Modal'];"
     " var r = null, sel = '';"
     " for (var s = 0; s < SCOPES.length && !r; s++) {"
     "   r = this.closest(SCOPES[s][0]); if (r) sel = SCOPES[s][1]; }"
     " if (!r) return null;"
+    " var box = '';"
+    " for (var c = 0; c < CONTAINERS.length && !box; c++) {"
+    "   if (this.closest(CONTAINERS[c])) box = CONTAINERS[c]; }"
     " var out = [], push = function (v) { v = t(v);"
     "   if (v && out.indexOf(v) < 0 && v.length <= 60) out.push(v); };"
     " var cells = r.querySelectorAll("
@@ -2607,7 +2618,7 @@ _ROW_CELLS_JS = (
     " for (var i = 0; i < cells.length && out.length < 8; i++)"
     "   push(cells[i].innerText || cells[i].textContent);"
     " if (!out.length) push(r.innerText || r.textContent);"
-    " return { scope: sel, cells: out }; }"
+    " return { scope: sel, container: box, cells: out }; }"
 )
 
 
@@ -2633,8 +2644,14 @@ async def _row_cells(browser_session, node) -> dict[str, Any] | None:
         return None
     if not isinstance(got, dict) or not got.get("cells"):
         return None
-    return {"scope": str(got.get("scope") or ""),
-            "cells": [str(c) for c in got["cells"] if str(c).strip()]}
+    out = {"scope": str(got.get("scope") or ""),
+           "cells": [str(c) for c in got["cells"] if str(c).strip()]}
+    # Only when there IS one: absent must stay absent so recordings made before this
+    # landed compile byte-identically (see script_compile._row_container).
+    container = str(got.get("container") or "").strip()
+    if container:
+        out["container"] = container
+    return out
 
 
 def _is_anonymous_toggle(node: Any) -> bool:

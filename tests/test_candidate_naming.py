@@ -315,3 +315,67 @@ async def test_cb_identity_js_never_records_the_synthetic_resolver_id():
 
         assert "id" not in got["attributes"]
         assert got["x_path"] == "html/body/select"
+
+
+# --- two DetailsLists on screen at once (entry f2214d2e4d74c09b, run 20260904_162236) ---
+# The FPS bulk-upload panel renders its grid OVER the page's own "Select Employee" grid.
+# Both are Fluent DetailsLists, so both number their checkboxes "row{volatile}-{n}-checkbox"
+# — the exact tail the indexed-run collapse anchors on. The ids below are the real ones:
+# row5181 is the background list (seen when the panel is closed), row6194 the panel's.
+# At record time browser-use hides the occluded background list, so the selector looks
+# unambiguous; Playwright at replay sees both and takes the first in document order.
+
+_TWO_GRIDS_PAGE = """
+    <div id="app">
+      <div role="row"><div role="gridcell">Aaran Kerr</div>
+        <div id="row5181-0-checkbox" role="checkbox"
+             data-automationid="DetailsRowCheck">bg</div></div>
+    </div>
+    <div class="ms-Panel root-1153">
+      <div role="row"><div role="gridcell">Aaran Kerr</div>
+        <div id="row6194-0-checkbox" role="checkbox"
+             data-automationid="DetailsRowCheck">panel</div></div>
+    </div>
+"""
+
+
+async def _two_grids(pw):
+    page = await (await _launch(pw)).new_page()
+    await page.set_content(_TWO_GRIDS_PAGE)
+    return page
+
+
+async def test_row_cells_js_records_the_panel_a_click_happened_in():
+    from automation.pipeline import agent_tools
+
+    async with async_playwright() as pw:
+        page = await _two_grids(pw)
+        expr = "el => (" + agent_tools._ROW_CELLS_JS + ").call(el)"
+
+        panel = await page.locator("#row6194-0-checkbox").evaluate(expr)
+        assert panel["container"] == ".ms-Panel"
+
+        # No dialog ancestor -> no container, so nothing is prefixed and every recording
+        # made before this landed keeps compiling exactly as it did.
+        background = await page.locator("#row5181-0-checkbox").evaluate(expr)
+        assert not background.get("container")
+
+
+async def test_the_unscoped_suffix_really_does_match_both_grids():
+    """The bug, reproduced: without a container the tail cannot tell the lists apart."""
+    async with async_playwright() as pw:
+        page = await _two_grids(pw)
+
+        assert await page.locator('css=[id$="-0-checkbox"]').count() == 2
+
+
+async def test_the_panel_scoped_template_lands_on_the_panels_checkbox():
+    """And the fix: the same tail, scoped, resolves uniquely onto the panel's row."""
+    async with async_playwright() as pw:
+        page = await _two_grids(pw)
+
+        loc, sel, _healed = await sc._resolve(
+            page, {"selectors": ['css=.ms-Panel [id$="-0-checkbox"]']}, 2000)
+
+        assert await loc.get_attribute("id") == "row6194-0-checkbox"
+        assert await loc.inner_text() == "panel"

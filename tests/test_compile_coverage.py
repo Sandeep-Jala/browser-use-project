@@ -2071,6 +2071,97 @@ _LINK_EL = {
 }
 
 
+# --- the wrong LIST (entry f2214d2e4d74c09b, run 20260904_162236) ----------------------
+# The FPS bulk-upload panel renders a Fluent DetailsList on top of the page's OWN
+# "Select Employee" DetailsList. Both use the same id shape, so the durable tail the
+# indexed-run collapse anchors on — "-{n}-checkbox" — matches a row in EACH:
+#
+#   panel closed  -> row5181-0-checkbox   (the background list)
+#   panel open    -> row6194-0-checkbox   (the FPS grid)
+#   later steps   -> row7032 / row8028 / row8482 — THREE lists at once
+#
+# At record time browser-use hides the occluded background list, so the selector looks
+# unambiguous. At replay Playwright queries the raw DOM, sees both, and _resolve's
+# last-candidate concession takes the FIRST in document order — body/div[1], the
+# background list — while the panel is body/div[2]. Eight warnings, five wrong ticks:
+#
+#   ambiguous selector 'css=[id$="-0-checkbox"]': 2 visible matches; using the first
+#
+# The row's cell texts cannot separate them either: the same employees are in both lists.
+# Only the CONTAINER can, so the recording carries it and both selector forms are scoped
+# to it.
+
+_PANEL_CHK = {
+    "node_name": "div", "ax_name": None,
+    "attributes": {"id": "row6194-0-checkbox", "role": "checkbox",
+                   "data-automationid": "DetailsRowCheck"},
+    "x_path": "html/body/div[2]/div[1]/div/div/div/div[2]/div[2]/div/div[2]/div/div/div",
+    "row": {"scope": '[role="row"]', "container": ".ms-Panel",
+            "cells": ["Aaran Kerr 2DAD7CC2", "30/04/2026", "£3,500.00"]},
+}
+
+
+def _panel_chk(n):
+    el = {k: v for k, v in _PANEL_CHK.items() if k != "attributes"}
+    el["attributes"] = dict(_PANEL_CHK["attributes"], id=f"row{6194 + 13 * n}-{n}-checkbox")
+    return el
+
+
+def test_an_indexed_template_is_scoped_to_its_recorded_panel(tmp_path):
+    """The five FPS ticks. Unscoped, this template matches the background list too."""
+    history = [_item({"click": {"index": 1}}, element=_panel_chk(n)) for n in range(5)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    assert len(steps) == 1 and steps[0]["action"] == "click_indexed"
+    assert steps[0]["selector_template"] == 'css=.ms-Panel [id$="-{n}-checkbox"]'
+    assert steps[0]["start"] == 0 and steps[0]["count"] == 5
+
+
+def test_a_row_scoped_selector_is_scoped_to_its_recorded_panel(tmp_path):
+    """The row rung carries the identical hazard — the same employee names are in both
+    lists — so it must not be left behind when the indexed template is scoped."""
+    steps = compile_recording(
+        _write(tmp_path, [_item({"click": {"index": 1}}, element=_PANEL_CHK)]),
+        emit_start_goto=False)
+
+    sels = steps[0]["selectors"]
+    assert sels[0].startswith('css=.ms-Panel [role="row"]:has-text(')
+    assert all(not s.startswith('css=[role="row"]') for s in sels), sels
+
+
+def test_a_recording_without_a_container_compiles_exactly_as_before(tmp_path):
+    """Every recording in library/ predates the container, so an absent one must change
+    NOTHING. This is the regression guard for all of them."""
+    history = [_item({"click": {"index": 1}}, element=_chk(f"row{26102 + 13 * n}-{n}-checkbox"))
+               for n in range(5)]
+    steps = compile_recording(_write(tmp_path, history), emit_start_goto=False)
+
+    assert steps[0]["selector_template"] == 'css=[id$="-{n}-checkbox"]'   # unprefixed
+
+    # ...and the row rung likewise (_LINK_EL's row carries no container).
+    link = compile_recording(
+        _write(tmp_path, [_item({"click": {"index": 9}}, element=_LINK_EL)]),
+        emit_start_goto=False)
+    assert link[0]["selectors"][0] == (
+        'css=[role="row"]:has-text("PR/01797494/27/CDR072") '
+        'a[title="Open payroll review request as client"]')
+
+
+def test_the_scoped_template_separates_the_two_real_grids():
+    """The point of the whole change, against the two id prefixes actually recorded."""
+    import re
+    scoped = 'css=.ms-Panel [id$="-0-checkbox"]'
+    bare = 'css=[id$="-0-checkbox"]'
+    suffix = re.compile(r'\[id\$="(.+?)"\]')
+
+    # Both real ids end with the same tail, which is why the bare form cannot tell them
+    # apart — the container prefix is the only discriminator.
+    tail = suffix.search(bare).group(1)
+    assert "row5181-0-checkbox".endswith(tail)      # background list
+    assert "row6194-0-checkbox".endswith(tail)      # FPS panel grid
+    assert scoped.startswith("css=.ms-Panel ") and suffix.search(scoped).group(1) == tail
+
+
 def test_a_nameless_in_row_click_is_anchored_by_its_row(tmp_path):
     steps = compile_recording(
         _write(tmp_path, [_item({"click": {"index": 9}}, element=_LINK_EL)]),

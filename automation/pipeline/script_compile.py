@@ -117,6 +117,28 @@ def _leaf_sel(tag: str, attrs: dict[str, Any]) -> str:
     return tag or "*"
 
 
+def _row_container(element: dict[str, Any]) -> str:
+    """The dialog/panel the recorded row lived in, as a CSS prefix — "" when none.
+
+    A row scope and an id tail both identify a row WITHIN a list, and say nothing about
+    WHICH list. The FPS bulk-upload panel renders its DetailsList over the page's own
+    "Select Employee" DetailsList (run 20260904_162236): same id shape, same employees,
+    so neither the `-{n}-checkbox` tail nor the row's cell texts can separate them. The
+    panel is body/div[2] and the app is body/div[1], so replay's first-in-document-order
+    match is the BACKGROUND list — five ticks onto the wrong grid, and the FPS submitted
+    74 employees instead of 5.
+
+    Recorded, never derived: the xpath would give body/div[2], but Fluent mounts its layer
+    host at a body index that moves between runs (div[3] vs div[2]) — the same reason
+    _semantic_class_selectors exists. Absent on every recording made before this landed,
+    and absent must mean byte-identical output (test_a_recording_without_a_container_
+    compiles_exactly_as_before)."""
+    row = element.get("row")
+    if not isinstance(row, dict):
+        return ""
+    return str(row.get("container") or "").strip()
+
+
 def _row_scoped_selectors(element: dict[str, Any]) -> list[str]:
     """Locate a NAMELESS in-row control by the row's own data — "the external-link icon in
     the row that reads PR/…/CDR073" — instead of by the row's POSITION.
@@ -135,6 +157,8 @@ def _row_scoped_selectors(element: dict[str, Any]) -> list[str]:
     scope = str(row.get("scope") or "").strip()
     if not scope:
         return []
+    container = _row_container(element)
+    prefix = f"{container} " if container else ""
     leaf = _leaf_sel((element.get("node_name") or "").lower(),
                      element.get("attributes") or {})
     cells = [" ".join(str(c).split()) for c in (row.get("cells") or [])]
@@ -143,7 +167,7 @@ def _row_scoped_selectors(element: dict[str, Any]) -> list[str]:
     seen: set[str] = set()
     out = []
     for cell in cells:
-        sel = f'css={scope}:has-text("{_esc(cell)}") {leaf}'
+        sel = f'css={prefix}{scope}:has-text("{_esc(cell)}") {leaf}'
         if sel not in seen:
             seen.add(sel)
             out.append(sel)
@@ -832,10 +856,18 @@ def _fingerprint(element: dict[str, Any]) -> dict[str, Any]:
 
 
 def _attach_fp(step: dict[str, Any], element: dict[str, Any]) -> dict[str, Any]:
-    """Attach a self-healing fingerprint to a step (no-op if the element yields nothing useful)."""
+    """Attach the element-derived replay identity to a step: its self-healing fingerprint
+    and, when the recording captured one, the dialog/panel it lived in.
+
+    Both are no-ops when the element yields nothing. The container rides here rather than
+    on the element because `_collapse_indexed_runs` runs on compiled STEPS, and the row
+    (which carries it) is not copied onto them — see `_row_container` for what it is for."""
     fp = _fingerprint(element)
     if fp:
         step["fingerprint"] = fp
+    container = _row_container(element)
+    if container:
+        step["container"] = container
     return step
 
 
@@ -1012,9 +1044,15 @@ def _collapse_indexed_runs(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             i += 1
             continue
         last_end, indices, first, tail = best
+        # Scoped to the panel it was recorded in when the recording captured one: the id
+        # tail identifies a row within A list, and this app puts two same-shaped lists on
+        # screen at once (see _row_container).
+        container = str(first.get("container") or "")
+        prefix = f"{container} " if container else ""
         collapsed: dict[str, Any] = {
             "action": "click_indexed",
-            "selector_template": f'css=[id$="-{{n}}{("-" + tail) if tail else ""}"]',
+            "selector_template": (f'css={prefix}[id$="-{{n}}'
+                                  f'{("-" + tail) if tail else ""}"]'),
             "start": min(indices),
             "count": len(indices),
         }
