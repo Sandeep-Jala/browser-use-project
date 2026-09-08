@@ -672,6 +672,56 @@ in-app subtasks, and NEVER invent a URL the task does not imply.
 """
 
 
+def _replay_progress_block(progress: dict, prior_failure: str | None) -> str:
+    """The takeover brief: where the broken recording actually got to.
+
+    Built from the run's OWN ledger (skills.replay_progress), so every line is something
+    that happened this run. Two things it must never overstate: a dispatched action is not
+    a verified effect, and the action that BROKE is neither done nor not-done (a fill
+    raises on its read-back after having typed). The remaining list is the recording's
+    plan from an earlier run, not a promise about this page — it is offered as a hint to
+    verify, because an agent that knows only "something partially happened" cannot tell a
+    recording that died on its last action from one that died on its second.
+    """
+    failure = (f" It failed with: {sanitize_failure(prior_failure)}."
+               if prior_failure else "")
+    done, total = progress.get("done_count", 0), progress.get("total", 0)
+    if progress.get("ran_to_end"):
+        head = (f"\nREPLAY PROGRESS — a cached recording of THIS step ran ALL {total} of "
+                f"its actions, and then the end-state check did not hold.{failure} The "
+                f"work may already be complete, or complete but wrong. VERIFY the end "
+                f"state before you redo anything — repeating a save that already went "
+                f"through duplicates the record.")
+    else:
+        head = (f"\nREPLAY PROGRESS — a cached recording of THIS step ran {done} of its "
+                f"{total} actions and then broke.{failure}")
+    lines = [head]
+    if progress.get("done"):
+        lines.append(
+            "The actions it dispatched (each found its target, but their EFFECT is NOT "
+            "verified — confirm against the page, do not assume):")
+        if progress.get("elided"):
+            lines.append(f"  … ({progress['elided']} earlier action(s) not listed)")
+        lines.extend(f"  - {d}" for d in progress["done"])
+    if progress.get("attempted"):
+        lines.append(
+            f"It broke while attempting to {progress['attempted']} — that action may have "
+            f"partly happened, or not at all. Treat it as UNKNOWN and check.")
+    if progress.get("remaining"):
+        lines.append(
+            "What the recording had left to do (its plan from an EARLIER successful run — "
+            "the app may have changed since, so verify each one rather than replaying it "
+            "blindly, and follow YOUR OWN job above where the two disagree):")
+        lines.extend(f"  - {r}" for r in progress["remaining"])
+        if progress.get("remaining_more"):
+            lines.append(f"  - … ({progress['remaining_more']} further action(s))")
+    lines.append(
+        "Inspect the current page state FIRST — fields may already hold correct values, "
+        "menus or forms may already be open. Finish or correct the step from where it "
+        "stands; do not blindly redo actions already done.")
+    return "\n".join(lines)
+
+
 def scoped_subtask_prompt(
     subtask: str,
     completed: list[str],
@@ -686,6 +736,7 @@ def scoped_subtask_prompt(
     conditional: bool = False,
     aux_tab: str | None = None,
     next_conditional: str | None = None,
+    replay_progress: dict | None = None,
 ) -> str:
     """Build the agent prompt for ONE subtask of a workflow already in progress.
 
@@ -694,6 +745,10 @@ def scoped_subtask_prompt(
     subtasks are handled separately — so no re-navigation, no redoing, no running ahead.
     With `dirty`, a failed replay already half-executed this subtask and the agent must
     inspect current state and finish/correct it rather than start from scratch.
+    `replay_progress` (skills.replay_progress) makes that concrete: which actions the
+    broken recording dispatched, which one it broke on, and what it had left to do —
+    without it the agent cannot tell a recording that died on its LAST action from one
+    that died on its second. Absent/unalignable, the generic dirty paragraph stands.
 
     Carries the per-action verification discipline inline (segments are not expanded into
     numbered plans), plus `expected_end` — a concrete done-condition read from the
@@ -784,7 +839,9 @@ def scoped_subtask_prompt(
             f"do not repeat it more than twice: capture the enclosing block instead and "
             f"state the fact in your done message."
         )
-    if dirty:
+    if dirty and replay_progress:
+        lines.append(_replay_progress_block(replay_progress, prior_failure))
+    elif dirty:
         failure = (f" It failed with: {sanitize_failure(prior_failure)}."
                    if prior_failure else "")
         lines.append(
@@ -863,9 +920,22 @@ def scoped_subtask_prompt(
             "condition DOES hold, perform the stated actions and verify them as usual."
         )
     if next_conditional:
+        # "POSSIBLE", not "EXPECTED", and the absent branch stated FIRST. A probe exists
+        # precisely because the outcome is intermittent, but the original heading read as
+        # a prediction that it WOULD appear, and the block said only what to do when it
+        # did. Run 20260908_094852 subtask 4 is the cost: the agent finished its FPS
+        # submit at step 7 ("the dialog closed and the server accepted the write"), then
+        # spent steps 8-21+ polling search_page and find_elements for a popup that this
+        # cycle never raised — "awaiting synchronise prompt" — through five loop-detection
+        # nudges, until the run was killed. Waiting for a probed outcome is never this
+        # step's job: the framework checks for it deterministically before the next slice.
         lines.append(
-            f"\nEXPECTED OUTCOME ALREADY HANDLED BY THE NEXT STEP: "
-            f"{next_conditional}. If that appears, it is a KNOWN and ACCEPTED result "
+            f"\nPOSSIBLE OUTCOME ALREADY HANDLED BY THE NEXT STEP: "
+            f"{next_conditional}. It MAY OR MAY NOT appear, and most runs never see it. "
+            f"Do NOT wait for it, poll for it, or search the page for it: if it is not "
+            f"already in front of you once your own actions are done, your step is "
+            f"simply finished — report it in the ordinary way. If it IS there, it is a "
+            f"KNOWN and ACCEPTED result "
             f"of this step — not a failure, and not yours to clear. Your step is then "
             f"FINISHED: call done with success=true and state in your done message "
             f"exactly what appeared, quoting the message text you can read. Do NOT "

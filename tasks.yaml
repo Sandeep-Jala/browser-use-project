@@ -669,64 +669,26 @@ payroll_food_limited_e2e:
     click add request, click payroll review, click standard, select employee, click save, Now in this send email section, change from to no-reply, and click send, if the send email section is not closed, click save again. Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and click the blue Sent badge in its Status column to open the Payroll Status dialog. In that dialog set Status to Submitted, type well done in the Notes field, and click Save. Then click the ref. no. link on that same top row to open the Payroll Review panel, tick the Select Employee checkbox at the top of that panel so the Verify button becomes enabled, and click Verify.
   tags: [payroll]
 
-# RTI payrun-processing chain: run Save/Next through every employee, handle the min-wage-error
-# and pop-up branches, add an expenses/benefit + addition on employee 8, submit the FPS on the
-# 2nd-last employee, roll the pay date to next month, and set the client sort order. Multi-write
-# chain with conditional branches, so marker is omitted (no single fragment gates every write).
-payroll_rti_process_old:
-  prompt: >-
-    go to Payroll module, search and select FOOD LIMITED business name, go to Payroll & RTI, Set the date to May-26, click Save & Next. If a pop up appears, select 'don't show this again' and click Process.
-    Process the existing employees one at a time by clicking Save & Next, and after each click
-    check that the next employee has loaded, if the Save & Next button is disabled, Move on to the next employee. stopping as soon as Aran Allan is the employee shown. If you see an error
-    'The employer pay is lower than the minimum wage rate', click Add Payment, set Amount to
-    5000, and click Save & Next. With Aran Allan shown as the current employee, click Add
-    Expenses or Benefits, set Type to 'Assets transferred' from April 2026 to May 2026,
-    set Cost to 200,set Employee contribution to 100, and click Save, then select Addition or Deduction, set Type to
-    'Additions', amount is 500, period to is May 26, name is bonus and click Save. Continue
-    clicking Save & Next one employee at a time in the same way, if the Save and next is disabled move on to the next employee, until Bruce Wright
-    is the employee shown. Then select bulk upload FPS, click the FPS button next to Save & Next at the bottom of the employee list,click on employee checkbox, click on the checkbox of the employee we added earlier,Click on FPS, select document
-    New_Employees_List_-_WI_LTD.csv, and Submit. Then go to Payroll & RTI, change the date
-    to next month, and click Save & Next 3 times. Then go to clients, go to practice
-    settings, click edit, select alphabetic order A to Z, and save.
+Employee_Addition:
   tags: [payroll]
+  subtasks:
+    - prompt: >-
+        Go to the Payroll module, search for and select the business name CREAMOS LTD, then
+        go to the Employee section.
+    - prompt: >-
+        Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
+        URL directly shows a freshly generated identity: male, Scottish name set, United
+        Kingdom). From the generated identity, note and remember exactly these details for use
+        in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
+    - prompt: >-
+        Return to the Payroll tab and click Add Employee, then fill in the form using the
+        noted details: enter the noted name, address, and gender; enter the noted date of
+        birth converted to dd/mm/yyyy format; set the join date to 08/04/2026; set Join With
+        to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
+        with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
+        01/07/2027; then click Save and Next.
 
-payroll_rti_process:
-  prompt: >-
-    Go to the Payroll module, search for and select the business name FOOD
-    LIMITED, then go to Payroll & RTI, in the combobox select Monthly and the combobox next to it select May-26, and click
-    Save & Next. If a popup appears at any point after clicking Save & Next,
-    tick 'Don't show this again', click Process, and continue. Now process
-    the existing employees one at a time by repeating the following steps
-    for each employee: first read the name of the employee currently shown;
-    if the employee shown is Aran Allan, stop repeating and do not click
-    Save & Next again; otherwise, if the error 'The employer pay is lower
-    than the minimum wage rate' is shown, click Add Payment, set Amount to
-    5000, and click Save & Next; if Save & Next is disabled for this
-    employee, do not click it and instead select the next employee in the
-    list directly; in all other cases click Save & Next and wait until the
-    next employee has fully loaded before doing anything else. Keep
-    repeating those steps until Aran Allan is the employee shown. With
-    Aran Allan shown as the current employee, click Add Expenses or
-    Benefits, set Type to 'Assets transferred', set the period from April
-    2026 and set period to May 2026, set Cost to 200, set Employee contribution to 100,
-    and click Save; then select Addition or Deduction, set Type to
-    'Additions', set Amount to 500, set Period to May 26, set Name to
-    bonus, and click Save. After saving, continue processing employees one
-    at a time by repeating exactly the same steps as before: read the name
-    of the employee currently shown; if the employee shown is Bruce Wright,
-    stop repeating and do not click Save & Next again; otherwise handle the
-    minimum wage error and a disabled Save & Next the same way as before,
-    and in all other cases click Save & Next and wait for the next employee
-    to load. Keep repeating until Bruce Wright is the employee shown. With
-    Bruce Wright shown, select bulk upload FPS which is a button next
-    to Save & Next, click the the checkbox in the grid header row, left of 'Employees', click the checkbox of Aran Allan, click
-    FPS, select the document New_Employees_List_-_WI_LTD.csv, and click
-    Submit. Then go to Payroll & RTI,Go to Pay Runs tab, change the combobox value for period to Jun-26, and click Save & Next exactly 3 times, waiting for the
-    screen to update after each click and stopping after the third click.
-    Finally, go to Clients, go to Practice Settings, click Edit, select
-    alphabetic order A to Z, and click Save. The task is complete after
-    that final Save; take no further actions.
-  tags: [payroll]
+
 
 # payroll_food_limited_e2e followed by payroll_rti_process, as ONE run: the two halves are
 # concatenated verbatim (both keep their own "go to Payroll module, search and select FOOD
@@ -773,10 +735,21 @@ payroll_food_limited_e2e_rti:
         window of rows is rendered at once), until the noted employee's name comes into
         view, tick the checkbox on that employee's row, and click Save.
     - prompt: >-
-        In the Send Email section that opens, open the From dropdown and select the no-reply
-        option, then click Send; if the Send Email section has not closed after clicking Send, click Send again.
-        If the email was not sent, it is saved as Drafted; click the email button next to
-        the Drafted status to reopen the Send Email section,open the From dropdown and select the no-reply option, then click Send.
+        In the Send Email section that opens, open the From dropdown and select the
+        no-reply option, then click Send.
+    - prompt: >-
+        If a Send anyway confirmation appears, click Send anyway.
+      # The Send button BECOMES "Send anyway" when the app wants confirmation — same
+      # element, same id=mailbtn, only the label differs. Recorded inline it was
+      # unreplayable: on a run that sends first time the panel is already gone, so the
+      # second click has no target (run 20260908_152217 subtask 7, twice).
+      probe: {text_visible: "Send anyway"}
+    - prompt: >-
+        If the request is still showing Drafted, click the email button next to it, select
+        the no-reply option in the From dropdown, and click Send.
+      # Drafted shows only on a request that failed to send, so the page-wide probe is
+      # precise here.
+      probe: {text_visible: "Drafted"}
     - prompt: >-
         Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
         click the blue Sent badge in its Status column to open the Payroll Status dialog; in
@@ -818,7 +791,7 @@ payroll_food_limited_e2e_rti:
         Then click Save & Next for the next 5 employees in the same way: exactly 5 more
         clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
-        Then select FPS which is a button next to Save & Next. The checkbox in
+        Then select Bulk upload FPS which is a button next to Save & Next. The checkbox in
         the grid header row, left of 'Employees', selects or unselects all employees at
         once; use it to unselect all employees first, then click the 4th Employee checkbox in the grid, click FPS on the bottom, select the document New_Employees_List_-_WI_LTD.csv, and
         click Submit.
@@ -895,120 +868,213 @@ payroll_detailed_review_fps_part2:
         next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to May-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jun-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jul-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Aug-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Sep-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Oct-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Nov-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Dec-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jan-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Feb-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Mar-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
 
     
 payroll_client:
@@ -1059,10 +1125,21 @@ payroll_client:
         window of rows is rendered at once), until the noted employee's name comes into
         view, tick the checkbox on that employee's row, and click Save.
     - prompt: >-
-        In the Send Email section that opens, open the From dropdown and select the no-reply
-        option, then click Send; if the Send Email section has not closed after clicking Send, click Send again.
-        If the email was not sent, it is saved as Drafted; click the email button next to
-        the Drafted status to reopen the Send Email section,open the From dropdown and select the no-reply option, then click Send.
+        In the Send Email section that opens, open the From dropdown and select the
+        no-reply option, then click Send.
+    - prompt: >-
+        If a Send anyway confirmation appears, click Send anyway.
+      # The Send button BECOMES "Send anyway" when the app wants confirmation — same
+      # element, same id=mailbtn, only the label differs. Recorded inline it was
+      # unreplayable: on a run that sends first time the panel is already gone, so the
+      # second click has no target (run 20260908_152217 subtask 7, twice).
+      probe: {text_visible: "Send anyway"}
+    - prompt: >-
+        If the request is still showing Drafted, click the email button next to it, select
+        the no-reply option in the From dropdown, and click Send.
+      # Drafted shows only on a request that failed to send, so the page-wide probe is
+      # precise here.
+      probe: {text_visible: "Drafted"}
     - prompt: >-
         Then, in the Data Request list, go to the top row (S.No. 1, the newest request) and
         click the blue Sent badge in its Status column to open the Payroll Status dialog; in
@@ -1073,7 +1150,7 @@ payroll_client:
         tick the Select Employee checkbox at the top of that panel so that the Verify button
         becomes enabled, and click Verify. The task is complete after clicking Verify.
     - prompt: >-
-        then go to Payroll & RTI, in the combobox select Monthly and the combobox next to it
+        then go to Payroll & RTI, Refresh the page and then in the combobox select Monthly and the combobox next to it
         select Apr-26, and click Save & Next.
     - prompt: >-
         If a popup appears at any point after clicking Save & Next, tick 'Don't show this
@@ -1114,6 +1191,8 @@ payroll_client:
         Finally, go to Clients, go to Practice Settings, click Edit, select alphabetic order A
         to Z, and click Save. The task is complete after that final Save; take no further
         actions.
+    - prompt: >-
+        Go to the Payroll module, search for and select the business name CREAMOS LTD.   
     - prompt: >-
         Now Go to Data Request Section. Click + Request, click Payroll Review, click Detailed, change the date combobox to
         May-26, select only the first 12 employees in the list, and click Save.
@@ -1158,172 +1237,195 @@ payroll_client:
         next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jun-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jul-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Aug-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
         Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
         and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Sep-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Oct-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Nov-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Dec-26 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Jan-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Feb-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
+    - prompt: >-
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
+    - prompt: >-
+        Then click on the Payroll & RTI tab.
     - prompt: >-
         Change the period to Mar-27 through the combobox in the nav bar.
     - prompt: >-
         Click Save & Next for the first 5 employees: exactly 5 clicks, waiting for the next employee to fully load after each click.
     - prompt: >-
         Then select Bulk upload FPS, which sits next to Save & Next. The checkbox in the grid header row, left of 'Employees', 
-        selects or unselects all employees at once; use it to unselect all employees first, then tick the checkbox of each of the first 5 employees in the grid. 
-        Then click FPS at the bottom of the employee list. In the FPS Submission dialog the 'Late Submission?' row has a checkbox labelled Yes: it may already be ticked, 
-        and the late-reason dropdown beside it EXISTS ONLY while it is ticked — so tick it if it is not, then set the dropdown next to it to 'H - Correction to earlier submission'. 
-        Then select the document New_Employees_List_-_WI_LTD.csv and click Submit and then click on Payroll & RTI tab.
-
-    
-
-
-
-
-Employee_Addition:
-  tags: [payroll]
-  subtasks:
+        selects or unselects all employees at once, and the panel opens with every employee already ticked even though they are not really selected — so click it exactly 2 times, waiting for the list to update after each click: the first click clears every tick, the second selects every employee for real. 
+        Then click FPS at the bottom of the employee list. Then select the document New_Employees_List_-_WI_LTD.csv and click Submit.
     - prompt: >-
-        Go to the Payroll module, search for and select the business name CREAMOS LTD, then
-        go to the Employee section.
+        If a popup asks whether to synchronise with bookkeeping, click Yes.
+      # It only follows some submissions: the probe settles that deterministically, so
+      # the FALSE branch is a zero-LLM no-op and the TRUE branch records and replays.
+      # Its own slice, not a line inside the FPS slice above: the popup lands ON the
+      # FPS dialog and would otherwise block that slice's own last action.
+      probe: {text_visible: "synchronise with bookkeeping"}
     - prompt: >-
-        Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
-        URL directly shows a freshly generated identity: male, Scottish name set, United
-        Kingdom). From the generated identity, note and remember exactly these details for use
-        in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
-    - prompt: >-
-        Return to the Payroll tab and click Add Employee, then fill in the form using the
-        noted details: enter the noted name, address, and gender; enter the noted date of
-        birth converted to dd/mm/yyyy format; set the join date to 08/04/2026; set Join With
-        to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
-        with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
-        01/07/2027; then click Save and Next.
-    # - prompt: >-
-    #     Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
-    #     URL directly shows a freshly generated identity: male, Scottish name set, United
-    #     Kingdom). From the generated identity, note and remember exactly these details for use
-    #     in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
-    # - prompt: >-
-    #     Fill in the form using the noted details: enter the noted name, address, and gender; enter the noted date of
-    #     birth converted to dd/mm/yyyy format; set the join date to 07/04/2026; set Join With to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
-    #     with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
-    #     01/07/2027; then click Save and Next.
-    # - prompt: >-
-    #     Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
-    #     URL directly shows a freshly generated identity: male, Scottish name set, United
-    #     Kingdom). From the generated identity, note and remember exactly these details for use
-    #     in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
-    # - prompt: >-
-    #     Fill in the form using the noted details: enter the noted name, address, and gender; enter the noted date of
-    #     birth converted to dd/mm/yyyy format; set the join date to 08/04/2026; set Join With to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
-    #     with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
-    #     01/07/2027; then click Save and Next.
-    # - prompt: >-
-    #     Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
-    #     URL directly shows a freshly generated identity: male, Scottish name set, United
-    #     Kingdom). From the generated identity, note and remember exactly these details for use
-    #     in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
-    # - prompt: >-
-    #     Fill in the form using the noted details: enter the noted name, address, and gender; enter the noted date of
-    #     birth converted to dd/mm/yyyy format; set the join date to 08/04/2026; set Join With to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
-    #     with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
-    #     01/07/2027; then click Save and Next.
-    # - prompt: >-
-    #     Open a new tab and go to https://www.fakenamegenerator.com/gen-male-gd-uk.php (this
-    #     URL directly shows a freshly generated identity: male, Scottish name set, United
-    #     Kingdom). From the generated identity, note and remember exactly these details for use
-    #     in all later steps: the Name, the Gender (Male), the Address, and the Date of Birth.
-    # - prompt: >-
-    #     Fill in the form using the noted details: enter the noted name, address, and gender; enter the noted date of
-    #     birth converted to dd/mm/yyyy format; set the join date to 08/04/2026; set Join With to 'Existing employee'; set the NI number to AB124557C; set NI Category to A; set Gross Pay to 3500; select Student Loan
-    #     with loan start date as 06/04/2026; select Postgraduate Loan with loan start date as 05/04/2026 and with loan end date
-    #     01/07/2027; then click Save.
-    
+        Then click on the Payroll & RTI tab.
+
+
+
+

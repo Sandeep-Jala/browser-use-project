@@ -20,6 +20,7 @@ never replay wrong values.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 from dataclasses import dataclass, field
@@ -30,7 +31,8 @@ from playwright.async_api import Page
 
 from automation.pipeline import adapt
 from automation.pipeline import subtask_store as sstore
-from automation.pipeline.script_compile import (_FP_ATTRS, _atomic_write, _esc, _role_of,
+from automation.pipeline.script_compile import (_FP_ATTRS, _PUA, _atomic_write, _esc,
+                                                _is_dynamic_id, _role_of,
                                                 _selectors_from_parts,
                                                 merge_promoted_selectors, run_steps)
 from automation.skills import codegen
@@ -321,3 +323,344 @@ def promote_healed_anchors(anchors_path: str | Path,
     if promoted:
         _atomic_write(path, json.dumps(anchors, indent=2))
     return promoted
+
+
+# ------------------------------- the takeover brief -------------------------------
+#
+# When a replay breaks part-way the agent takes over IN PLACE, on the dirty page the
+# replay abandoned (hybrid._run_subtasks). It used to be told only "a previous attempt
+# partially completed this step and then stopped" — a boolean — so a recording that died
+# on its LAST action and one that died on its second produced the identical prompt, and
+# the agent had to reconstruct the boundary by inspection.
+#
+# The run's own ledger already knows: every executed verb is recorded (SkillApi._record /
+# run_steps' log), and the skill body says what the whole sequence was. `replay_progress`
+# turns those two into a truthful brief.
+#
+# TRUTHFULNESS: a ledger entry proves the action was DISPATCHED and its target resolved.
+# It does NOT prove the intended effect happened — a click can land on a re-rendered
+# control, a dialog can refuse a save. The wording (prompts.scoped_subtask_prompt) says
+# exactly that, and the step that BROKE is reported as attempted-outcome-unknown, never
+# as done or as not-done: a fill raises on its read-back after having typed.
+
+_BRIEF_DONE_CAP = 8        # the tail is what places the agent; older actions elide
+_BRIEF_REMAINING_CAP = 10
+_BRIEF_VALUE_CAP = 40
+
+# api verb -> the action name its ledger entry carries. Verbs missing here record
+# nothing (begin_optional) and are skipped on BOTH sides of the match.
+_VERB_ACTIONS = {
+    "click": "click", "repeat_click": "click", "repeat_until_done": "click",
+    "click_indexed": "click", "fill": "fill", "select": "select",
+    "select_option": "select_option", "paste": "paste", "upload": "upload",
+    "extract": "extract", "copy": "copy", "find_click": "find_click",
+    "type_text": "type", "press": "press", "wait": "wait", "scroll": "scroll",
+    "goto": "goto", "close_tab": "close_tab",
+}
+# Verbs that log one entry PER CLICK (api.repeat_click / repeat_until_done /
+# click_indexed), so the ledger is longer than the call list and index arithmetic lies.
+_REPEAT_VERBS = {"repeat_click", "repeat_until_done", "click_indexed"}
+# Which positional argument carries the verb's value (the typed/picked text, the extract
+# label, the url). Handle-bearing verbs put the handle at 0.
+_VALUE_ARG = {"fill": 1, "select": 1, "paste": 1, "upload": 1, "extract": 1, "copy": 1,
+              "select_option": 0, "find_click": 0, "type_text": 0, "press": 0,
+              "goto": 0, "wait": 0}
+_HANDLE_VERBS = {"click", "repeat_click", "repeat_until_done", "click_indexed", "fill",
+                 "select", "paste", "upload", "extract", "copy"}
+
+
+def _brief_text(value: Any) -> str:
+    """Trim a name for the brief. Fluent icon fonts draw glyphs as literal
+    Private-Use-Area TEXT NODES, so a raw name can be an invisible codepoint —
+    strip them (script_compile._PUA) or the brief names a control called nothing."""
+    return _PUA.sub("", str(value or "")).strip()
+
+
+def _brief_name(node: dict[str, Any]) -> str:
+    """The control's human name from an anchor or a compiled step: the recorded
+    expect_text first (already param-substituted at load), then the fingerprint's text,
+    then its labelling attributes. Empty when the control was genuinely nameless."""
+    expect = _brief_text(node.get("expect_text"))
+    if expect and "{{" not in expect:
+        return expect
+    fp = node.get("fingerprint") or {}
+    text = _brief_text(fp.get("text"))
+    if text:
+        return text
+    attrs = fp.get("attrs") or {}
+    for key in ("aria-label", "name", "placeholder", "title", "id"):
+        value = _brief_text(attrs.get(key))
+        if not value:
+            continue
+        if key == "id" and _is_dynamic_id(value):
+            # An auto-generated id ("react-select-11-input", "TextField99") is not a name
+            # and does not survive a re-render — printing it would send the agent hunting
+            # for a string that is not on this run's page. Observed live: run
+            # 20260908_091814 seg 19 broke on exactly such a control.
+            continue
+        return value
+    return ""
+
+
+def _brief_role(node: dict[str, Any]) -> str:
+    """What to call a control that has no name: its role/tag, so "an unnamed combobox"
+    beats "an unnamed control" for an agent that has to find it on the page."""
+    fp = node.get("fingerprint") or {}
+    role = _brief_text(fp.get("role")) or _brief_text((fp.get("attrs") or {}).get("role"))
+    if not role:
+        tag = _brief_text(fp.get("tag")).lower()
+        role = {"input": "input", "select": "dropdown", "textarea": "text box",
+                "a": "link", "button": "button"}.get(tag, "")
+    return role.lower()
+
+
+def _brief_value(value: Any) -> str:
+    text = _brief_text(value)
+    if not text:
+        return ""
+    return f'"{text[:_BRIEF_VALUE_CAP]}…"' if len(text) > _BRIEF_VALUE_CAP else f'"{text}"'
+
+
+def _brief_phrase(item: dict[str, Any], *, past: bool) -> str:
+    """One line of the brief. `past` narrates what ran; the present tense is used for the
+    recording's REMAINING actions, which are a plan, not a history."""
+    action = item.get("action")
+    name = item.get("name") or ""
+    where = f'"{name}"' if name else f"an unnamed {item.get('role') or 'control'}"
+    value = (_brief_text(item.get("value")) if item.get("value_phrase")
+             else _brief_value(item.get("value")))
+    label = _brief_text(item.get("label"))
+    if action in ("click", "find_click"):
+        repeat = item.get("count")
+        times = f" {int(repeat)}×" if repeat and int(repeat) > 1 else ""
+        return f"{'clicked' if past else 'click'} {where}{times}"
+    if action == "fill":
+        return (f"{'filled' if past else 'fill'} {where}"
+                + (f" with {value}" if value else ""))
+    if action == "paste":
+        return f"{'pasted' if past else 'paste'} {value or 'a value'} into {where}"
+    if action == "select":
+        return f"{'selected' if past else 'select'} {value or 'an option'} in {where}"
+    if action == "select_option":
+        return f"{'picked' if past else 'pick'} the option {value or '(unnamed)'}"
+    if action in ("extract", "copy"):
+        what = label or "a value"
+        got = f" = {value}" if past and value else ""
+        return f"{'captured' if past else 'capture'} {what} from {where}{got}"
+    if action == "upload":
+        return f"{'uploaded' if past else 'upload'} {value or 'a file'} to {where}"
+    if action == "type":
+        return f"{'typed' if past else 'type'} {value or 'text'}"
+    if action == "press":
+        return f"{'pressed' if past else 'press'} {_brief_text(item.get('value')) or 'a key'}"
+    if action == "scroll":
+        return "scrolled the page" if past else "scroll the page"
+    if action == "wait":
+        return "waited" if past else "wait"
+    if action == "goto":
+        return f"{'navigated to' if past else 'navigate to'} {_brief_text(item.get('value'))}"
+    if action == "close_tab":
+        return "closed the tab" if past else "close the tab"
+    return f"{action} {where}"
+
+
+def _step_item(step: dict[str, Any]) -> dict[str, Any]:
+    """A compiled tier-0 step as a brief item."""
+    action = step.get("action")
+    value = step.get("value")
+    if value is None:
+        value = step.get("text") or step.get("keys") or step.get("url")
+    return {"action": action, "name": _brief_name(step), "role": _brief_role(step),
+            "value": value, "label": step.get("label"), "count": step.get("count")}
+
+
+def _arg_text(node: Any, params: dict[str, str]) -> str:
+    """Render a call argument for the brief: a literal, a param (substituted with THIS
+    run's value), or api.noted('x') — which has no value until the run reaches it, so it
+    is named rather than guessed."""
+    if isinstance(node, ast.Constant):
+        return str(node.value)
+    if isinstance(node, ast.Name):
+        return str(params.get(node.id, node.id))
+    if isinstance(node, ast.Call):
+        fn = node.func
+        if (isinstance(fn, ast.Attribute) and fn.attr == "noted" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            return f"the value noted as {node.args[0].value}"
+        return ""
+    if isinstance(node, ast.JoinedStr):
+        return "".join(_arg_text(part.value if isinstance(part, ast.FormattedValue)
+                                 else part, params) for part in node.values)
+    return ""
+
+
+def _code_calls(code: str, anchors: dict[str, Any],
+                params: dict[str, str]) -> list[dict[str, Any]]:
+    """The skill's api.* calls in SOURCE order, as brief items. ast.walk is unordered, so
+    the nodes are sorted by position; codegen.lint_code already guarantees every call is
+    an `api.<verb>(...)`."""
+    tree = ast.parse(code)
+    nodes: list[Any] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name)
+                and fn.value.id == "api"):
+            continue
+        if fn.attr == "noted":
+            continue  # an ARGUMENT of another call, not a step in the sequence
+        nodes.append(node)
+    nodes.sort(key=lambda n: (n.lineno, n.col_offset))
+    calls: list[dict[str, Any]] = []
+    for node in nodes:
+        verb = node.func.attr
+        handle = None
+        if verb in _HANDLE_VERBS and node.args and isinstance(node.args[0], ast.Constant):
+            handle = str(node.args[0].value)
+        idx = _VALUE_ARG.get(verb)
+        arg = node.args[idx] if idx is not None and len(node.args) > idx else None
+        value = _arg_text(arg, params) if arg is not None else ""
+        # A {{noted:label}} value has no text until the run reaches it, so the
+        # brief names it in prose — quoting it would read as a literal to type.
+        phrase = isinstance(arg, ast.Call)
+        count = None
+        if verb in ("repeat_click", "click_indexed") and len(node.args) > 2:
+            arg = node.args[2] if verb == "click_indexed" else node.args[1]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                count = arg.value
+        anchor = (anchors.get(handle) or {}) if handle else {}
+        # No handle fallback for the name: a handle is DERIVED from the control's
+        # name (codegen._handle_for), so a nameless control gets a bare verb like
+        # "click"/"copy" — printing that would invent a control called "click".
+        calls.append({"verb": verb, "handle": handle, "count": count,
+                      "action": _VERB_ACTIONS.get(verb),
+                      "name": _brief_name(anchor), "role": _brief_role(anchor),
+                      "value": value if verb not in ("extract", "copy") else "",
+                      "value_phrase": phrase,
+                      "label": value if verb in ("extract", "copy") else None})
+    return calls
+
+
+def _split_code(calls: list[dict[str, Any]], log: list[dict[str, Any]]
+                ) -> tuple[list[dict], dict | None, list[dict]] | None:
+    """(done, attempted, remaining) for a code skill, matched by HANDLE SEQUENCE.
+
+    Not by index: repeat_click/repeat_until_done log one entry per click and
+    begin_optional logs none, so api.executed is not a position in the call list. Fails
+    CLOSED — a ledger that does not line up returns None and the caller falls back to the
+    generic wording rather than naming actions that may not be the ones that ran."""
+    pos = 0
+    for i, call in enumerate(calls):
+        action = call["action"]
+        if action is None:
+            continue  # begin_optional and friends record nothing
+        if pos >= len(log):
+            return calls[:i], call, calls[i + 1:]
+        entry = log[pos]
+        if entry.get("action") != action:
+            return None
+        if call["handle"] and entry.get("handle") and entry["handle"] != call["handle"]:
+            return None
+        pos += 1
+        if call["verb"] in _REPEAT_VERBS:
+            # One call, many entries. A literal count consumes at most that many, so a
+            # plain click on the SAME control right after a repeat is not swallowed.
+            want = int(call["count"]) if call.get("count") else None
+            got = 1
+            while (pos < len(log) and (want is None or got < want)
+                   and log[pos].get("action") == action
+                   and log[pos].get("handle") == entry.get("handle")):
+                pos += 1
+                got += 1
+            if want is not None and got < want:
+                # The repeat broke DURING its own clicks (2 of 3 landed). The action that
+                # was attempted is this call, not the one after it — and anything left in
+                # the ledger would mean the run continued past a call that raised, which
+                # is not a shape we can narrate.
+                return (calls[:i], call, calls[i + 1:]) if pos == len(log) else None
+    if pos != len(log):
+        return None  # more happened than the body accounts for: do not narrate
+    return calls, None, []
+
+
+def replay_progress(skill: Skill, outcome: dict[str, Any]) -> dict[str, Any] | None:
+    """Where a broken replay of `skill` got to, as material for the takeover prompt.
+
+    -> {"done": [phrase], "attempted": phrase|None, "remaining": [phrase],
+        "ran_to_end": bool, "done_count": int, "total": int, "elided": int,
+        "remaining_more": int, "summary": one-line}
+    None when the body is empty or the ledger cannot be aligned with it. A replay that
+    broke on its very FIRST action still gets a brief (nothing done, that action
+    attempted): the run is not dirty, so no prompt shows it, but it is what progress.json
+    keeps about why the entry stopped working.
+    """
+    try:
+        return _replay_progress(skill, outcome)
+    except Exception as exc:  # noqa: BLE001 - a brief must never break a recovery
+        logger.debug("replay progress brief unavailable: %s", exc)
+        return None
+
+
+def _replay_progress(skill: Skill, outcome: dict[str, Any]) -> dict[str, Any] | None:
+    log = list(outcome.get("log") or [])
+    failed_at = outcome.get("failed_at")
+    if skill.body == "steps":
+        steps = list(skill.steps)
+        if failed_at is None:
+            split: tuple[list[dict], dict | None, list[dict]] | None = (steps, None, [])
+        elif not isinstance(failed_at, int) or not 0 <= failed_at < len(steps):
+            split = None
+        else:
+            # Tier-0 index arithmetic IS exact: run_steps stamps the step index on every
+            # entry and counts `executed` once per step, repeats included.
+            split = (steps[:failed_at], steps[failed_at], steps[failed_at + 1:])
+        if split is None:
+            return None
+        raw_done, raw_attempted, raw_remaining = split
+        done_items = [_step_item(s) for s in raw_done]
+        attempted_item = _step_item(raw_attempted) if raw_attempted else None
+        remaining_items = [_step_item(s) for s in raw_remaining]
+        total = len(steps)
+    elif skill.body == "code":
+        calls = _code_calls(skill.code, skill.anchors, skill.params)
+        split = _split_code(calls, log) if failed_at is not None else (calls, None, [])
+        if split is None:
+            return None
+        done_items, attempted_item, remaining_items = split
+        total = len([c for c in calls if c["action"] is not None])
+    else:
+        return None
+
+    if not done_items and attempted_item is None and not remaining_items:
+        return None  # an empty body has nothing to narrate
+    # A replayed extract's value is real data the agent may need, and it is already in
+    # this run's values.json — naming it here saves a re-read of a page that may be gone.
+    extracted = outcome.get("extracted") or {}
+    for item in done_items:
+        if item.get("action") in ("extract", "copy") and item.get("label"):
+            item["value"] = extracted.get(str(item["label"]), item.get("value"))
+
+    # api.begin_optional() is a MARK, not an action (it records nothing and touches
+    # no control), so it never appears in the narration.
+    done = [_brief_phrase(i, past=True) for i in done_items if i.get("action")]
+    elided = max(0, len(done) - _BRIEF_DONE_CAP)
+    remaining = [_brief_phrase(i, past=False) for i in remaining_items
+                 if i.get("action")]
+    remaining_more = max(0, len(remaining) - _BRIEF_REMAINING_CAP)
+    attempted = _brief_phrase(attempted_item, past=False) if attempted_item else None
+    ran_to_end = failed_at is None
+    if ran_to_end:
+        summary = f"ran all {total} recorded action(s); the end check failed"
+    elif attempted:
+        summary = (f"ran {len(done)} of {total} recorded action(s); broke while "
+                   f"attempting: {attempted}")
+    else:
+        # Every call is accounted for by the ledger, yet the replay reported a
+        # failure: it broke after its last action, not on one of them.
+        summary = (f"ran all {total} recorded action(s); the failure came after "
+                   f"the last one")
+    return {"done": done[-_BRIEF_DONE_CAP:], "attempted": attempted,
+            "remaining": remaining[:_BRIEF_REMAINING_CAP], "ran_to_end": ran_to_end,
+            "done_count": len(done), "total": total, "elided": elided,
+            "remaining_more": remaining_more, "summary": summary}

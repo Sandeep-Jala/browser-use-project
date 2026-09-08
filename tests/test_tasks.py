@@ -373,7 +373,16 @@ FROZEN_TIDS = {
     # Re-pinned 2026-09-02 for edits ALREADY in the working tree before that day's
     # repeat-budget work: the FPS slice went back to "Bulk upload FPS" and the
     # already-submitted waiver comment was dropped. Not caused by the reword of part2.
-    "payroll_food_limited_e2e_rti": "abae6339e8b7484b",
+    # Re-pinned 2026-09-08: the Send Email slice's two "if it did not work" clauses became
+    # probe-gated slices of their own (20 -> 22). Recorded inline they were unreplayable —
+    # "Send anyway" is the SAME button as Send (id=mailbtn) with a changed label, so a run
+    # that sends first time has nothing to click and the replay died there twice
+    # (run 20260908_152217 subtask 7). This pin was already stale before the edit.
+    # Re-pinned again 2026-09-08: its FPS slice gained the words "Bulk upload" so it
+    # matches payroll_client's copy of the same step byte-for-byte — they had drifted
+    # by exactly those two words, which cost a second library entry for one step
+    # (identity is hash(wording + context)).
+    "payroll_food_limited_e2e_rti": "92fd68ac88b9b7ed",
     # Added 2026-08-11 (user-dictated): Detailed payroll-review data request for the
     # first 12 employees (May-26) + no-reply send, a Pay Elements bonus-row edit
     # open-and-close, Verify All on the new request, then a Jun-26 payrun pass of
@@ -468,7 +477,37 @@ FROZEN_TIDS = {
     # Re-pinned 2026-09-02 (later that day) for tasks.yaml edits made outside the prompt
     # work: the pass now opens on May-26 rather than Apr-26 and the slice count went
     # 38 -> 35.
-    "payroll_detailed_review_fps_part2": "e7bfe50d0f9c358f",
+    # Re-pinned 2026-09-08: each of the twelve FPS slices now ends at Submit and is
+    # followed by a probed "synchronise with bookkeeping" conditional and its own
+    # "click Payroll & RTI" slice — the popup lands ON the FPS dialog, so it used to
+    # block that slice's own last action. 38 -> 62 slices (the 35 pinned here was
+    # already stale by three from edits made outside the prompt work).
+    # Re-pinned 2026-09-08 (later): the FPS panel can open showing employees TICKED
+    # without their being selected, and the receipt cannot tell the two apart
+    # (browser-use reads checkbox-state off the pre-click snapshot). The twelve FPS
+    # slices now select the WHOLE list through the header checkbox — clicked
+    # "exactly 2 times", once to unselect everyone and once to select them for real
+    # — instead of ticking the first 5 rows. The "exactly N" form is load-bearing:
+    # without it _apply_repeat_hint dissolves the pair back to one click and every
+    # replay leaves the list in the opposite state. 62 slices either way.
+    # Re-pinned 2026-09-08 (again, run 20260908_125741 seg 9): "click it exactly 2
+    # times" alone let the agent fire BOTH clicks in one batched step against the
+    # same pre-batch snapshot. The header checkbox id is regenerated on every render
+    # (header12611-check -> header13145-check), so the first click re-rendered the
+    # grid and the second landed on a node that no longer existed — one effective
+    # click, the list left CLEARED, and FPS refused with "Select employee(s) to
+    # create a request". The wording now adds "waiting for the list to update after
+    # each click", the same anti-batching lever the Save & Next slices carry.
+    # Re-pinned 2026-09-08 (run 20260908_133727 forensics): the twelve FPS slices had
+    # silently drifted into FOUR wordings. Jan-27 and Feb-27 were missing the sentence
+    # "Then click FPS at the bottom of the employee list." entirely — which is why
+    # those cycles never opened the FPS Submission dialog — and Sep-26 was missing one
+    # SPACE ("employee list.Then select"), enough to mint a library entry of its own.
+    # Since a slice's identity is hash(wording + context), one step cost four entries
+    # and three live authorings in a single run (126s + 287s + 277s). Now two families,
+    # as designed: 5 Apr-Aug cycles carry the Late Submission paragraph (those periods
+    # ARE late), the 7 Sep-Mar cycles do not.
+    "payroll_detailed_review_fps_part2": "e3617f842ba6218b",
     # Added 2026-09-02: the full twelve-month payrun/FPS walk as one declared task, 64
     # slices. It shares its period and Save & Next wording with
     # payroll_detailed_review_fps_part2 — library entries key on wording + context, not
@@ -642,20 +681,23 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     assert joined == spec.prompt          # verbatim partition, no reword drift
 
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
+    # 2026-09-08: TWENTY-TWO slices (was 20 — the Send Email slice's inline 'click Send
+    # again' and 'still Drafted' recoveries became probe-gated slices; every index after
+    # slice 7 shifted by +2).
     # 2026-09-01: TWENTY slices. The RTI half was re-commented on 2026-08-24 (leaving six)
     # and uncommented for good two days later in 24dd5f3, restoring the Data Request +
     # Send Email + Sent-badge + Verify slices along with the payrun pass; 85c3709 then
     # split the FPS slice's trailing "if it shows an error, click cancel" into a probe-
     # gated slice of its own, taking 19 to 20. The e2e half is unchanged and still the
     # user's chosen shape: the fakenamegenerator aux producer, then two consumers.
-    assert len(subs) == 20                # Tier 1 won; no fallback blob
+    assert len(subs) == 22                # Tier 1 won; no fallback blob
     assert not any(getattr(s, "fallback", False) for s in subs)
     # Every slice is a recordable action — no judge, so every segment can cache. subs[9]
     # ("tick the Select Employee checkbox ... and click Verify") is the one to watch: its
     # kind: action is commented out in tasks.yaml, and it classifies action anyway only
     # because "click Verify" is an imperative on a control name. If this list ever grows
     # a "judge", that slice reworded into verification wording and stopped caching.
-    assert [s.kind for s in subs] == ["action"] * 20
+    assert [s.kind for s in subs] == ["action"] * 22
     assert subs[1].tab_url and "fakenamegenerator" in subs[1].tab_url   # aux producer
     # The producer-override keeps the noting slice OUT of the consumer net; the two
     # slices that USE the noted identity stay consumers (bindings-only replay).
@@ -666,8 +708,8 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     # The RTI half, back from the commented block: the probe-gated popup slice and the
     # probe-gated Submit-error slice are what make the pass deterministic, and the FPS
     # slice is the one that needs FOOD LIMITED reset.
-    assert subs[11].probe and subs[17].probe
-    assert subs[16].allow_write_refusal                # FPS submit may honestly refuse
+    assert subs[13].probe and subs[19].probe
+    assert subs[18].allow_write_refusal                # FPS submit may honestly refuse
 
 
 # --------------------- payroll_detailed_review_fps, split into parts ---------------------
@@ -681,9 +723,10 @@ FPS_PART_SLICE_COUNTS = {
     "payroll_detailed_review_fps_part1": 10,  # opener + request + email + bonus + OTP
                                               # portal + payment/expense/deduction + Next
                                               # + Verify all
-    # opener + Jun-26 period + the popup conditional, then one Save-&-Next-x5 + FPS pair
-    # for Jun-26 and a period + pair for each of Jul-26 .. Mar-26: 3 + 2 + 9*3 = 32.
-    "payroll_detailed_review_fps_part2": 35,
+    # opener + Apr-26 period + the Save-&-Next popup conditional (3), then Apr-26's
+    # Save-&-Next-x5 + FPS + sync conditional + Payroll-&-RTI quartet (4), then that
+    # quartet behind a period change for each of May-26 .. Mar-27 (11 * 5 = 55).
+    "payroll_detailed_review_fps_part2": 62,
 }
 FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business name "
                    "FOOD LIMITED")
@@ -696,7 +739,7 @@ FPS_PART_OPENER = ("Go to the Payroll module, search for and select the business
 # judge. All wording-driven otherwise; see decompose.node_kind.
 FPS_PART_SLICE_KINDS = {
     "payroll_detailed_review_fps_part1": ["action"] * 10,
-    "payroll_detailed_review_fps_part2": ["action"] * 35,
+    "payroll_detailed_review_fps_part2": ["action"] * 62,
 }
 
 

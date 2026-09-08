@@ -82,6 +82,7 @@ class FakeSession:
         self.replay_branch = []      # `branch` flag each replay was given
         self.agent_calls = 0
         self.findings_seen = []
+        self.replay_progress_seen = []
         self.remaining_seen = []      # still-ahead list each agent call received
         self.next_conditional_seen = []   # the successor-probe handoff each call received
         self.record_paths = []
@@ -140,9 +141,10 @@ class FakeSession:
 
     async def agent_segment(self, sub, sid, context, gate, *, completed, remaining,
                             dirty=False, prior_failure=None, record_path=None,
-                            findings=None, next_conditional=None):
+                            findings=None, next_conditional=None, replay_progress=None):
         self.events.append(("agent",))
         self.agent_calls += 1
+        self.replay_progress_seen.append(replay_progress)
         self.findings_seen.append(list(findings or []))
         self.remaining_seen.append(list(remaining or []))
         self.next_conditional_seen.append(next_conditional)
@@ -166,10 +168,11 @@ class FakeSession:
 
 
 def _seg(ok, *, executed=0, error=None, mode="replay", write_step=None, finding=None,
-         extracted=None):
+         extracted=None, replay=None, gate=None, steps_ok=None):
     return Segment(index=0, sid="", prompt="", context="", mode=mode, ok=ok,
                    steps_executed=executed, error=error, write_step=write_step,
-                   finding=finding, extracted=extracted)
+                   finding=finding, extracted=extracted, replay=replay,
+                   gate=gate or {}, steps_ok=steps_ok)
 
 
 def _runner():
@@ -1650,6 +1653,37 @@ async def test_failed_replay_keeps_its_extracts_and_records_why(stores, monkeypa
     assert values["identity_block"] == "Aaran Duncan"
 
 
+async def test_a_broken_replay_tells_the_takeover_agent_where_it_got_to(stores, monkeypatch,
+                                                                       tmp_path):
+    """The agent takes over on the page the replay abandoned. Handing it only "something
+    partially happened" cannot tell a recording that died on its LAST action from one
+    that died on its second, so the ledger-derived brief must reach the agent — and stay
+    on the record, since `seg` is rebound to the authored segment and the replay's own
+    log dies with it."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    sid = _sid_for(SPEC.subtasks[0].prompt)
+    _seed_entry(sid, steps=[{"action": "click", "expect_text": "Data Request"},
+                            {"action": "fill", "value": "3500",
+                             "fingerprint": {"attrs": {"aria-label": "Gross Pay"}}},
+                            {"action": "click", "expect_text": "Save"}])
+    replay = {"executed": 1, "failed_at": 1, "error": "boom", "extracted": {},
+              "log": [{"step": 0, "action": "click", "used": "css=#dr"}]}
+    fake = FakeSession(_runner(), run_dir=run_dir,
+                       replays=[_seg(False, executed=1, error="boom", replay=replay)],
+                       agents=[_seg(True, mode="authored"), _seg(True, mode="authored")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), PROMPT, spec=SPEC,
+                                   marker="Invoices")
+
+    brief = fake.replay_progress_seen[0]
+    assert brief["done"] == ['clicked "Data Request"']
+    assert brief["attempted"] == 'fill "Gross Pay" with "3500"'
+    assert brief["remaining"] == ['click "Save"']
+    assert result.subtasks[0]["replay_progress"] == brief["summary"]
+    assert "ran 1 of 3 recorded action(s)" in result.subtasks[0]["replay_progress"]
+
+
 # ---------------- producer slices: cacheable, but only with a real capture ----------------
 # node_kind now resolves NOTING wording ("note and remember the OTP") to an action rather
 # than a judge — its replay is a live extract, not a hollow assertion, exactly as the
@@ -2009,3 +2043,113 @@ async def test_probed_successors_are_dropped_from_remaining_and_described_instea
     assert _PROBE_COND_LINE not in " ".join(fake.remaining_seen[0])
     assert fake.next_conditional_seen[0] == (
         'the text "Don\'t show this again" visible on the page')
+
+
+# ---------------- the gate-side half of the probe handshake (2026-09-08) ----------------
+# `_describe_next_conditionals` tells the producing step that the successor's condition
+# "overrides the done condition and the end-state rule ... reporting it and stopping is a
+# PASS". Nothing implemented that. Run 20260908_100231 subtask 29: the FPS submit raised
+# the bookkeeping-sync popup, the agent stopped and quoted it exactly as instructed, and
+# the gate failed the segment because the popup held the page on Payroll & RTI instead of
+# the recorded Payroll Summary — 32 subtasks short, with the slice that clears the popup
+# sitting unrun on the very next line.
+
+_PLACE_FAILURE = "the page never reached its recorded end state: expected …"
+
+
+def _place_gate():
+    return {"kind": "postcondition", "end_context": "/x", "reached": "/y",
+            "end_title": {"expected": "Summary", "reached": "Payrun", "ok": False}}
+
+
+async def test_a_page_state_failure_is_waived_when_the_next_condition_is_on_screen(
+        stores, monkeypatch):
+    prompt, spec = _probe_spec()
+    fake = FakeSession(_runner(),
+                       agents=[_seg(False, mode="authored", error=_PLACE_FAILURE,
+                                    gate=_place_gate(), steps_ok=True, executed=6),
+                               _seg(True, mode="authored")],
+                       probes=[True, True])   # the waiver's read, then the branch's own
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    producer = result.subtasks[0]
+    assert producer["ok"] is True
+    assert producer["error"] is None
+    assert producer["gate"]["handoff"]["raised"] is True
+    assert "Don't show this again" in producer["gate"]["handoff"]["condition"]
+    # The waived verdict is kept, not erased — the run must still show what the gate saw.
+    assert producer["gate"]["handoff"]["waived"] == _PLACE_FAILURE
+    # And the run went ON to the slice that clears the condition.
+    assert result.subtasks[1]["ok"] is True
+    assert result.is_successful is True
+
+
+async def test_the_waiver_reads_the_page_not_the_agents_word_for_it(stores, monkeypatch):
+    """A FALSE probe means the condition is NOT there — whatever the agent said. The
+    segment fails exactly as before."""
+    prompt, spec = _probe_spec()
+    fake = FakeSession(_runner(),
+                       agents=[_seg(False, mode="authored", error=_PLACE_FAILURE,
+                                    gate=_place_gate(), steps_ok=True)],
+                       probes=[False])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.subtasks[0]["ok"] is False
+    assert result.subtasks[0]["error"] == _PLACE_FAILURE
+    assert result.is_successful is False
+
+
+async def test_only_a_page_state_failure_is_waivable(stores, monkeypatch):
+    """A failed declared check says the WORK was wrong, not that the page has not moved
+    on. The probe is never even read — `probes=[]` makes a read raise."""
+    prompt, spec = _probe_spec()
+    gate = {**_place_gate(), "checks": [{"kind": "text_visible", "arg": "Saved",
+                                         "ok": False}]}
+    fake = FakeSession(_runner(),
+                       agents=[_seg(False, mode="authored", error="check failed",
+                                    gate=gate, steps_ok=True)],
+                       probes=[])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.subtasks[0]["ok"] is False
+    assert result.is_successful is False
+
+
+async def test_a_segment_whose_own_work_failed_is_never_handed_off(stores, monkeypatch):
+    """steps_ok False — the agent itself reported failure, or a compiled step broke. The
+    popup being on screen says nothing about work that never completed."""
+    prompt, spec = _probe_spec()
+    fake = FakeSession(_runner(),
+                       agents=[_seg(False, mode="authored", error="agent gave up",
+                                    gate=_place_gate(), steps_ok=False)],
+                       probes=[])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.subtasks[0]["ok"] is False
+    assert result.is_successful is False
+
+
+async def test_a_replay_blocked_only_by_the_popup_does_not_buy_a_takeover(stores,
+                                                                         monkeypatch):
+    """The replay-side call. Every compiled step ran and only the closing navigation is
+    blocked, so paying an agent to redo the segment would redo an accepted submission."""
+    prompt, spec = _probe_spec()
+    ctx = ss.normalize_context("http://app/section")
+    _seed_entry(ss.subtask_id("go to the section.", ctx))
+
+    fake = FakeSession(_runner(),
+                       replays=[_seg(False, executed=3, error=_PLACE_FAILURE,
+                                     gate=_place_gate(), steps_ok=True)],
+                       agents=[_seg(True, mode="authored")],
+                       probes=[True, True])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    assert result.subtasks[0]["mode"] == "replay"      # NOT replay_failed->authored
+    assert result.subtasks[0]["ok"] is True
+    assert fake.agent_calls == 1                        # the branch slice only
+    assert result.is_successful is True

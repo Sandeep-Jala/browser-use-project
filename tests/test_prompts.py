@@ -239,14 +239,22 @@ def test_scoped_prompt_next_conditional_handoff():
     p = scoped_subtask_prompt(
         "click Submit", [], [],
         next_conditional='the text "already submitted" visible on the page')
-    assert "EXPECTED OUTCOME ALREADY HANDLED BY THE NEXT STEP" in p
+    assert "POSSIBLE OUTCOME ALREADY HANDLED BY THE NEXT STEP" in p
     assert "already submitted" in p
     # The outcome is a PASS for this step, reported and quoted (the quote is what hands
     # us the dialog's real text for repairing a stale probe arg).
     assert "success=true" in p and "quoting the message text" in p
-    # The two loop shapes measured, both named.
+    # The three loop shapes measured, all named.
     assert "Do NOT close, cancel, dismiss" in p
     assert "do NOT repeat, re-enter or retry" in p
+    # ...including WAITING for it. A probe's outcome is intermittent by definition, and
+    # a block that only said what to do when it appeared read as a promise that it would:
+    # run 20260908_094852 subtask 4 finished its submit at step 7 and then polled
+    # search_page / find_elements for the popup through step 21+, "awaiting synchronise
+    # prompt", until the run was killed.
+    assert "MAY OR MAY NOT appear" in p
+    assert "Do NOT wait for it, poll for it, or search the page for it" in p
+    assert "your step is simply finished" in p
     # And it must say what it overrides, or it just contradicts the blocks above it.
     assert "overrides the re-click rule" in p
     assert "overrides the done condition" in p
@@ -257,7 +265,7 @@ def test_scoped_prompt_next_conditional_handoff():
 def test_handoff_block_is_absent_by_default():
     """Every slice without a probed successor keeps its prompt byte-identical."""
     p = scoped_subtask_prompt("go to Estimates", [], ["step two"])
-    assert "EXPECTED OUTCOME ALREADY HANDLED" not in p
+    assert "POSSIBLE OUTCOME ALREADY HANDLED" not in p
 
 
 def test_handoff_block_follows_the_rules_it_overrides():
@@ -268,10 +276,10 @@ def test_handoff_block_follows_the_rules_it_overrides():
         "click Submit", [], ["a later step"],
         expected_end='the text "Submitted" visible on the page',
         next_conditional='the text "already submitted" visible on the page')
-    assert p.index("EXPECTED OUTCOME ALREADY HANDLED") > p.index("VERIFY EVERY ACTION")
-    assert p.index("EXPECTED OUTCOME ALREADY HANDLED") > p.index("DONE CONDITION")
-    assert p.index("EXPECTED OUTCOME ALREADY HANDLED") < p.index("Still ahead")
-    assert (p.index("EXPECTED OUTCOME ALREADY HANDLED")
+    assert p.index("POSSIBLE OUTCOME ALREADY HANDLED") > p.index("VERIFY EVERY ACTION")
+    assert p.index("POSSIBLE OUTCOME ALREADY HANDLED") > p.index("DONE CONDITION")
+    assert p.index("POSSIBLE OUTCOME ALREADY HANDLED") < p.index("Still ahead")
+    assert (p.index("POSSIBLE OUTCOME ALREADY HANDLED")
             < p.index("independently checks your end state"))
 
 

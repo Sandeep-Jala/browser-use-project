@@ -252,15 +252,81 @@ def _describe_next_conditionals(subtasks: list[Subtask],
     the whole run; the count is what lets the caller drop those slices from the
     still-ahead list, where their action words would otherwise be handed over verbatim.
     """
-    run = []
+    run = _next_probes(subtasks, i)
+    if not run:
+        return None, 0
+    return " or ".join(_describe_check(p) for p in run), len(run)
+
+
+def _next_probes(subtasks: list[Subtask], i: int) -> list[Any]:
+    """The probe checks of the conditional slices that immediately follow subtask `i`.
+
+    Read twice, for the two halves of one handshake: the wording handed to the producing
+    step (_describe_next_conditionals) and the gate-side waiver that has to honour it
+    (_waive_for_next_conditional)."""
+    run: list[Any] = []
     for sub in subtasks[i + 1:]:
         probe = getattr(sub, "probe", None)
         if probe is None:
             break
         run.append(probe)
-    if not run:
-        return None, 0
-    return " or ".join(_describe_check(p) for p in run), len(run)
+    return run
+
+
+def _only_page_state_failed(detail: dict[str, Any]) -> bool:
+    """True when a gate's verdict turned ONLY on where the page ended up — no refused
+    write, no failed declared check, no receipt roll-up. Those all say the WORK was
+    wrong; this says only that the page is not where the recording ended."""
+    if detail.get("kind") != "postcondition":
+        # marker gates fail on a missing create-write and download gates on a missing
+        # file: neither is a question of where the page is sitting.
+        return False
+    if detail.get("rollup"):
+        return False
+    if detail.get("write_rollup") and not detail.get("write_refusal_waived"):
+        return False
+    return all(c.get("ok") for c in (detail.get("checks") or []))
+
+
+async def _waive_for_next_conditional(hs: HybridSession, seg: Segment,
+                                      probes: list[Any], label: str) -> bool:
+    """Pass a segment that failed ONLY on page state while the NEXT slice's declared
+    condition is on the screen right now. True if waived.
+
+    The other half of the probe handshake. `_describe_next_conditionals` promises the
+    producing agent that this outcome "overrides the done condition and the end-state
+    rule ... the framework checks for this outcome deterministically before the next step
+    runs, so reporting it and stopping is a PASS" — and nothing implemented it. Run
+    20260908_100231 subtask 29 is the cost: the FPS submit raised the bookkeeping-sync
+    popup, the agent stopped and quoted it exactly as instructed, and the gate failed the
+    segment because the popup was holding the page on Payroll & RTI instead of the
+    recorded Payroll Summary. A failed segment breaks the run, so the conditional slice
+    that would have cleared the popup never ran, 32 subtasks short.
+
+    Deliberately narrow: the segment's own work must have completed (`steps_ok`), the
+    only failing gate component must be page state, and the condition must be READ OFF
+    THE LIVE PAGE — never inferred from the agent's word for it. A waived segment is not
+    committed to the library (the commit decision was made on the original verdict): its
+    trace ends with a popup on screen, which is not the end state the entry should pin.
+    """
+    if seg.ok or not probes or seg.steps_ok is not True:
+        return False
+    if not _only_page_state_failed(seg.gate or {}):
+        return False
+    for probe in probes:
+        if not await hs.probe_condition(probe):
+            continue
+        seg.ok = True
+        seg.gate = dict(seg.gate or {})
+        seg.gate["handoff"] = {"condition": f"{probe.kind} {probe.arg!r}",
+                               "raised": True, "waived": seg.error}
+        print(f"[*] {label}: gate failed on page state, but the NEXT slice's declared "
+              f"condition ({probe.kind} {probe.arg!r}) IS on the page -> handed off "
+              f"(not a failure)")
+        seg.finding = seg.finding or seg.error
+        seg.error = None
+        return True
+    return False
 
 
 def _describe_expected_end(gate: Gate) -> str | None:
@@ -561,6 +627,16 @@ class Segment:
     # "replay_failed->authored"). Without this the reason a library entry stopped
     # working left no artifact at all — only a stdout line nobody kept.
     replay_error: str | None = None
+    # How far that replay got before it broke (skills.replay_progress' one-line
+    # summary). The agent is told the long form; this keeps the same fact on the
+    # record, because `seg` is rebound to the authored segment and the replay's own
+    # steps_executed/log die with it.
+    replay_progress: str | None = None
+    # Did the segment's own work complete — every compiled step ran, or the agent called
+    # done(success=true)? Distinct from `ok`, which also carries the gate's verdict on
+    # WHERE the page ended up. Only a segment whose work completed can be handed off to a
+    # probed successor (_waive_for_next_conditional).
+    steps_ok: bool | None = None
     # Why this segment did NOT replay (None on replays): "fresh" | "reauthor" | "judge" |
     # "loop" | "conditional" | "probe_absent" | "dynamic" | "fallback" | "no_entry" |
     # "identity_fork" | "values_unresolved". The answer to "why didn't it use the
@@ -575,6 +651,7 @@ class Segment:
             "duration_seconds": round(self.duration_seconds, 1),
             "healed_steps": self.healed_steps, "tokens": self.tokens, "error": self.error,
             "replay_error": self.replay_error,
+            "replay_progress": self.replay_progress, "steps_ok": self.steps_ok,
             "finding": self.finding, "extracted": self.extracted,
             "downloads": self.downloads, "skip_reason": self.skip_reason,
         }
@@ -1226,6 +1303,7 @@ class HybridSession:
             # several facts, and truncating it would silently drop the later ones.
             seg.finding = _format_extracts(seg.extracted)[:800] or None
         steps_ok = outcome.get("failed_at") is None
+        seg.steps_ok = steps_ok
         seg.downloads = self.downloads_since(dl_mark)
         seg.ok, seg.gate = await evaluate_gate(
             gate, steps_ok=steps_ok, page=self.current_page(),
@@ -1245,6 +1323,7 @@ class HybridSession:
         dirty: bool = False, prior_failure: str | None = None,
         record_path: Path | None = None, findings: list[str] | None = None,
         next_conditional: str | None = None,
+        replay_progress: dict[str, Any] | None = None,
     ) -> Segment:
         """Run the LLM agent for ONE subtask on the shared live session. `findings` are the
         observations earlier segments recorded (each a "prompt: outcome" line) — the data
@@ -1261,7 +1340,8 @@ class HybridSession:
             findings=findings, observe=kind == "judge",
             conditional=getattr(sub, "probe", None) is not None,
             aux_tab=getattr(sub, "tab_url", None),
-            next_conditional=next_conditional)
+            next_conditional=next_conditional,
+            replay_progress=replay_progress)
         seg = Segment(index=sub.index, sid=sid, prompt=sub.instantiated_prompt,
                       context=context, mode="authored", kind=kind)
         try:
@@ -1307,6 +1387,7 @@ class HybridSession:
         if gate.kind == "marker" and gate.marker:
             await self.wait_for_inflight_write(gate.marker)
         steps_ok = bool(history.is_successful())
+        seg.steps_ok = steps_ok
         rollup = (receipt_rollup(history, self.requests_since(watermark),
                                  allow_write_refusal=gate.allow_write_refusal)
                   if _rollup_applies(gate) else None)
@@ -2163,6 +2244,7 @@ async def _author_segment(
     run_values: dict[str, str] | None = None,
     start_url: str | None = None, start_title: str | None = None,
     dynamic: bool = False, next_conditional: str | None = None,
+    replay_progress: dict[str, Any] | None = None,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
 
@@ -2191,6 +2273,7 @@ async def _author_segment(
         sub, sid, context, gate, completed=completed, remaining=remaining,
         dirty=dirty, prior_failure=prior_failure, findings=findings,
         record_path=rec_tmp, next_conditional=next_conditional,
+        replay_progress=replay_progress,
     )
     if not seg.ok:
         # Keep a FAILED authoring's trace for diagnosis, but OFF the canonical path. The
@@ -2623,6 +2706,7 @@ async def run_hybrid_task(
             entry = sstore.load_manifest().get(sid)
             gate = segment_gate(sub, entry, context)
             next_conditional, n_cond = _describe_next_conditionals(subtasks, i)
+            next_probes = _next_probes(subtasks, i)
             # The probed successors are DESCRIBED to this slice as an expected outcome,
             # so they must not ALSO appear in the still-ahead list: that line hands the
             # agent the successor's action words verbatim ("click Cancel to close it")
@@ -2702,16 +2786,27 @@ async def run_hybrid_task(
                               f"({len(skill)} steps, no LLM)")
                         seg = await hs.replay_segment(sub, sid, context, skill,
                                                       gate, branch=is_branch)
+                        # Checked BEFORE the failure branch below: every compiled step
+                        # may have run and only the closing navigation be blocked by the
+                        # successor's popup. Taking the takeover there would pay an agent
+                        # to redo an FPS submit that already went through.
+                        await _waive_for_next_conditional(
+                            hs, seg, next_probes, f"subtask {i} [{sid}]")
                         if seg.ok:
                             from_template = bool((entry or {}).get("params"))
                             _promote_segment_heals(sid, seg, from_template=from_template)
-                            if not (entry or {}).get("end_title"):
+                            if not (entry or {}).get("end_title") \
+                                    and not (seg.gate or {}).get("handoff"):
                                 # Learn the end-title pin the same way heals are promoted.
                                 # An entry committed before this gate existed replays
                                 # forever and would never otherwise gain one — including
                                 # library/07044b6a0dbf7988, the OTP slice this was built
                                 # for. A replay that PASSED demonstrably reached the
-                                # intended end state, so the live title is trustworthy
+                                # intended end state, so the live title is trustworthy —
+                                # EXCEPT one passed by the successor-conditional waiver,
+                                # whose page is sitting under the popup the next slice
+                                # clears. Learning there would pin the popup's page as
+                                # this slice's end state.
                                 # (and better evidence than a recorded one, which lags —
                                 # see _pin_end_title). _pin_end_title's digit rule is what
                                 # makes it safe: a false pass leaves the page on the OTP
@@ -2730,9 +2825,17 @@ async def run_hybrid_task(
                         else:
                             sstore.bump_meta(sid, fail_count=1)
                             dirty = seg.steps_executed > 0
+                            # Where the replay actually got to, from its OWN ledger. The
+                            # agent takes over on the page the replay abandoned, and used
+                            # to be told only that "something partially happened" — which
+                            # cannot tell a recording that died on its LAST action from
+                            # one that died on its second. Built before `seg` is rebound
+                            # below: the replay outcome dies with it.
+                            progress = skills.replay_progress(skill, seg.replay or {})
                             print(f"[*] subtask {i} [{sid}]: replay FAILED "
                                   f"({seg.error}) -> agent takes over in place"
-                                  f"{' (dirty state)' if dirty else ''}")
+                                  f"{' (dirty state)' if dirty else ''}"
+                                  + (f"\n    {progress['summary']}" if progress else ""))
                             if not dirty and route_values is None:
                                 # Failed before touching the page: the recovery run starts
                                 # from the entry's declared context, so it IS a clean
@@ -2785,11 +2888,14 @@ async def run_hybrid_task(
                                 findings=takeover_findings, run_values=run_values,
                                 start_url=raw_start_url,
                                 start_title=raw_start_title, dynamic=False,
-                                next_conditional=next_conditional)
+                                next_conditional=next_conditional,
+                                replay_progress=progress)
                             seg.mode = "replay_failed->authored"
                             # Why the replay failed used to die with the rebound
                             # segment — stdout only, no artifact. Keep it on the record.
                             seg.replay_error = prior
+                            if progress:
+                                seg.replay_progress = progress["summary"]
                     else:
                         skip_reason = "values_unresolved"
                         print(f"[*] subtask {i} [{sid}]: library hit but values did not "
@@ -2859,6 +2965,11 @@ async def run_hybrid_task(
                     # from. close_aux_tab never raises.
                     await hs.close_aux_tab()
 
+            # The authored/takeover twin of the replay-side call above: the agent did its
+            # work, stopped on the successor's condition exactly as its prompt instructed,
+            # and must not be failed for the page not having moved on yet.
+            await _waive_for_next_conditional(hs, seg, next_probes,
+                                              f"subtask {i} [{sid}]")
             segments.append(seg)
             _write_progress(hs, task=task, tid=tid, subtasks=subtasks, segments=segments,
                             status="running")
