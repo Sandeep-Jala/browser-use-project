@@ -259,6 +259,53 @@ async def test_replay_fail_dirty_recovery_does_not_commit(stores, monkeypatch):
     assert not (ss.LIBRARY_DIR / "archive").exists()
 
 
+async def test_a_failed_dirty_recovery_still_retires_a_failing_entry(stores, monkeypatch):
+    """Run 20260907_152222 / library/50410b61b2e42519: an entry that cannot pass and
+    cannot retire.
+
+    Its committed end_title pinned the title of the page the segment had already LEFT
+    (see _pin_end_title), so the replay failed on the pin — and the takeover agent is
+    judged by the SAME gate object, so it failed on the pin too. `_author_segment` returns
+    at `if not seg.ok:`, above the dirty-path archive, and the call site skips archiving
+    whenever `dirty`. Result: fail_count 4 against a threshold of 2, no `uses` key, and
+    five consecutive runs dead at subtask 0.
+
+    A wrong pin from ANY cause must be able to age out. Consecutive failures already reset
+    on any success (bump_meta), so a healthy entry is untouched.
+    """
+    ctx = ss.normalize_context("http://app/section")
+    sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
+    _seed_entry(sid0)
+    ss.bump_meta(sid0, fail_count=1)          # one failure already on the record
+
+    # Dirty replay failure -> takeover -> the takeover fails on the same bad gate.
+    fake = FakeSession(_runner(), replays=[_seg(False, executed=2, error="bad pin")],
+                       agents=[_seg(False, mode="authored", error="bad pin")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    result = await _run(fake)
+
+    assert result.subtasks[0]["mode"] == "replay_failed->authored"
+    assert sid0 not in ss.load_manifest()
+    assert list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
+
+
+async def test_a_single_failed_dirty_recovery_does_not_retire(stores, monkeypatch):
+    """The threshold still binds: one bad run must not delete a recording that worked
+    yesterday — the same reasoning as test_replay_fail_at_step_zero_is_clean_reauthor."""
+    ctx = ss.normalize_context("http://app/section")
+    sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
+    _seed_entry(sid0)
+
+    fake = FakeSession(_runner(), replays=[_seg(False, executed=2, error="boom")],
+                       agents=[_seg(False, mode="authored", error="boom")])
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await _run(fake)
+
+    assert ss.load_meta(sid0)["fail_count"] == 1
+    assert sid0 in ss.load_manifest()
+    assert not (ss.LIBRARY_DIR / "archive").exists()
+
+
 async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
     """A clean (page-untouched) failure re-authors in place and REPLACES the entry —
     but it does not retire the old one on a single miss. One transient failure (a slow

@@ -1980,7 +1980,32 @@ def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | 
         not WHICH PAGE. An `acted_urls` lens was designed for that gate on 2026-08-21 and
         never reached a commit on any branch;
       - never for a segment that closed its own page — its surviving title is the same coin
-        flip as its surviving url (see _recording_closed_its_page).
+        flip as its surviving url (see _recording_closed_its_page);
+      - never for a segment whose FINAL action navigated (see
+        _recording_ended_on_a_navigation), which is what run 20260907_152222 forced.
+
+    That last guard is what makes the whole gate safe, and it is why _settled_title's
+    budget is not the lever it looked like. A title read can only be a WHOLE PAGE wrong
+    when the last action moved the page — and there the url postcondition already proves
+    the move, so the pin was never carrying the verdict. Where the pin IS load-bearing the
+    url does not move at all: the OTP wall and the accepted view share
+    /links/*/c/*/r/*/calcdatarequest byte for byte (library/07044b6a0dbf7988), and a
+    dialog save changes nothing but the page it is on.
+
+    Run 20260907_152222 / library/50410b61b2e42519 is the case: "…select the business name
+    CREAMOS LTD, then go to the Employee section" ends on api.click('employees'), and the
+    commit pinned "Payroll & RTI - …", the title of the page it had just LEFT. Five
+    consecutive runs died at subtask 0 — all eight steps ran, end_context matched
+    /paye/clients/*/, only the pin disagreed — and the takeover agent was re-gated against
+    that same pin, so the entry could not retire itself either (see _author_segment).
+    _settled_title did not catch it: it returns as soon as two consecutive reads agree
+    (~0.5s), and the app had not begun updating, so two identical STALE reads read as
+    settled. Stability is not correctness when the update has not started.
+
+    Not a one-off. Across the 46 retained reports this gate failed 32 times on 3 entries and
+    every one is this artifact — including 92c267f7c8f0f0cc, the SAME slice with "Best
+    LIMITED" on 09-04, while its FOOD LIMITED twin 554251a2e00b9757 pinned "Employees - …"
+    correctly. Same wording, same app: a coin flip re-rolled by every company-name edit.
     """
     start = " ".join(str(start_title or "").split())
     end = " ".join(str(end_title or "").split())
@@ -1990,7 +2015,35 @@ def _pin_end_title(start_title: Any, end_title: Any, record_path: Any) -> str | 
         return None
     if record_path is not None and _recording_closed_its_page(record_path):
         return None
+    if record_path is not None and _recording_ended_on_a_navigation(record_path):
+        return None
     return end
+
+
+def _recording_ended_on_a_navigation(path: Any) -> bool:
+    """Did the authoring history's FINAL action move the page — i.e. do its last two
+    recorded urls differ?
+
+    The third reader of the same `state` blob, after _recording_closed_its_page (tabs) and
+    script_compile._stamp_opens_tab. browser-use captures each item's state BEFORE that
+    item's actions, so the last two urls straddle the deciding action exactly.
+
+    Used only by _pin_end_title, which is where the reasoning lives: a title pin is
+    information only when the url held still, and this SPA's async title update can only
+    put a WHOLE PAGE between the two when the url moved.
+
+    Fails OPEN (unreadable, or fewer than two items carrying a url -> False): the same
+    convention as _recording_closed_its_page. A diagnosis we could not make must never
+    silently drop a legitimate pin — the OTP wall is the only thing standing between a dead
+    code and a false pass.
+    """
+    try:
+        history = json.loads(Path(path).read_text()).get("history") or []
+    except Exception:  # noqa: BLE001 - never fail the commit path over a diagnosis
+        return False
+    urls = [str((item.get("state") or {}).get("url") or "") for item in history]
+    urls = [u for u in urls if u]              # items that recorded no url say nothing
+    return len(urls) >= 2 and urls[-1] != urls[-2]
 
 
 def _recording_closed_its_page(path: Any) -> bool:
@@ -2152,6 +2205,18 @@ async def _author_segment(
                             sid, failed.name)
         except OSError as exc:
             logger.debug("could not set aside failed recording for %s: %s", sid, exc)
+        if commit and dirty:
+            # The recovery failed too — and an entry that cannot pass must still be able to
+            # age out, or it blocks every future run. Run 20260907_152222 is what this is
+            # for: library/50410b61b2e42519's committed end_title pinned the title of the
+            # page its segment had already left, the replay failed on that pin, and the
+            # takeover agent — judged by the SAME gate object — failed on it too. Because
+            # the only archive calls were here-but-below and at the call site under
+            # `if not dirty`, neither ever ran: fail_count reached 4 against a threshold of
+            # 2, with no `uses` key, and five consecutive runs died at subtask 0.
+            # Consecutive failures reset on any success (bump_meta), so a healthy entry is
+            # untouched and one bad run still retires nothing.
+            sstore.archive_if_failing(sid, threshold=_ARCHIVE_AFTER_FAILURES)
         return seg
     if not commit:
         return seg

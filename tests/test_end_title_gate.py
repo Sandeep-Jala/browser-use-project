@@ -94,6 +94,69 @@ def test_a_segment_that_closed_its_own_page_pins_nothing(tmp_path):
                           _rec(tmp_path, tabs=(2, 1))) is None
 
 
+def _nav_rec(tmp_path, *urls):
+    """A recording whose items sit on `urls` in order — the last two decide whether the
+    segment's final action navigated."""
+    p = tmp_path / "nav.json"
+    p.write_text(json.dumps({"history": [
+        {"state": {"url": u, "interacted_element": [], "title": "",
+                   "tabs": [{"url": u}]},
+         "model_output": {"action": [{"click": {"index": 1}}]}, "result": []}
+        for u in urls]}))
+    return p
+
+
+def test_a_segment_that_ended_on_a_navigation_pins_nothing(tmp_path):
+    """Regression for run 20260907_152222 / library/50410b61b2e42519.
+
+    "…select the business name CREAMOS LTD, then go to the Employee section" ends with
+    api.click('employees'). This SPA updates document.title a whole navigation late, so the
+    commit read "Payroll & RTI - …" — the title of the page it had just LEFT — and pinned
+    it. Five consecutive runs then died at subtask 0: all eight steps ran, the url
+    postcondition matched /paye/clients/*/, and only the pin disagreed.
+
+    The lag can only mislead a segment whose last action navigated, and there the url gate
+    already proves the move. Same trap, same slice, on 09-04 with "Best LIMITED"
+    (92c267f7c8f0f0cc) — every company-name edit re-keys the slice and re-rolls the coin.
+    """
+    rec = _nav_rec(tmp_path, "http://app/paye", "http://app/c/x/rti/payrun",
+                   "http://app/c/x/")
+
+    assert _pin_end_title("Dashboard - Acting Office", "Payroll & RTI - Acting Office",
+                          rec) is None
+
+
+def test_a_segment_that_ended_in_place_still_pins(tmp_path):
+    """The case the pin exists for — library/07044b6a0dbf7988, the OTP slice.
+
+    Its last three states are all on /links/10/c/*/r/*/calcdatarequest: the anonymous wall
+    sets no <title> so it shows the raw URL, and only after Proceed Securely does the title
+    become "Acting Office - Live Test". end_context matches BOTH sides, so the title is the
+    only thing that can tell an accepted OTP from a dead one.
+    """
+    rec = _nav_rec(tmp_path, "http://app/links/10/c/x/r/y/calcdatarequest",
+                   "http://app/links/10/c/x/r/y/calcdatarequest")
+
+    assert _pin_end_title("Setting - Acting Office", "Acting Office",
+                          rec) == "Acting Office"
+
+
+def test_an_unreadable_recording_does_not_block_the_pin(tmp_path):
+    """Fail-open, in parity with _recording_closed_its_page: an unreadable diagnosis must
+    never silently drop a legitimate pin."""
+    bad = tmp_path / "broken.json"
+    bad.write_text("{{ not json")
+
+    assert _pin_end_title("Setting", "Acting Office", bad) == "Acting Office"
+    assert _pin_end_title("Setting", "Acting Office", None) == "Acting Office"
+
+
+def test_a_recording_with_one_readable_url_cannot_tell_and_pins(tmp_path):
+    """Nothing to compare the final url against — same fail-open reading."""
+    assert _pin_end_title("Setting", "Acting Office",
+                          _nav_rec(tmp_path, "http://app/only")) == "Acting Office"
+
+
 def test_a_missing_title_pins_nothing(tmp_path):
     assert _pin_end_title("Dashboard", "", _rec(tmp_path)) is None
     assert _pin_end_title("", "Dashboard", _rec(tmp_path)) is None
@@ -375,3 +438,38 @@ async def test_the_commit_pins_the_settled_title_not_the_lagging_one(stores, mon
 
     sid = ss.subtask_id(prompt, ss.normalize_context("http://app/section"))
     assert ss.load_manifest()[sid]["end_title"] == "Employees - Acting Office"
+
+
+def _navigating_away(*titles):
+    """`_navigating`, but the LAST item sits on a different url — the segment's final
+    action moved the page. `_hist` otherwise keeps every item on http://app/p."""
+    doc = _navigating(*titles)
+    doc["history"][-1]["state"]["url"] = "http://app/moved"
+    return doc
+
+
+async def test_the_commit_pins_nothing_when_the_last_action_navigated(stores,
+                                                                     monkeypatch):
+    """The live shape of run 20260907_152222 / library/50410b61b2e42519, end to end.
+
+    The authoring run passed and committed "Payroll & RTI - …" for a segment that had
+    already reached the Employees page — the title lags a whole navigation. Five runs then
+    died on it, and the takeover agent was re-gated against the same pin, so the entry
+    could never retire itself either.
+    """
+    monkeypatch.setattr(hybrid, "_SETTLE_DELAY", 0)
+    prompt = "go to the Payroll module and then to the Employee section"
+    spec = TaskSpec(key="n", prompt=prompt, subtasks=(SubtaskDecl(prompt=prompt),))
+    fake = _EndsAt(_runner(), agents=[_seg(True, mode="authored")],
+                   urls=["http://app/section", "http://app/moved"],
+                   titles=["Dashboard - Acting Office",
+                           "Payroll & RTI - Acting Office",
+                           "Payroll & RTI - Acting Office",
+                           "Payroll & RTI - Acting Office"])
+    fake.recording = _navigating_away("Dashboard - Acting Office",
+                                      "Payroll & RTI - Acting Office")
+    monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
+    await run_hybrid_task(fake.runner or _runner(), prompt, spec=spec)
+
+    sid = ss.subtask_id(prompt, ss.normalize_context("http://app/section"))
+    assert ss.load_manifest()[sid].get("end_title") is None
