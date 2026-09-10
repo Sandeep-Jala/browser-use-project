@@ -72,11 +72,17 @@ def test_a_refused_close_compiles_nothing(tmp_path):
 
 def test_the_real_recording_keeps_its_close():
     """Fixture from the live recording rather than a hand-written belief about the shape:
-    repeat_click Next x11, find_by_text Submit, close."""
+    repeat_click Next x11, find_by_text Submit, close.
+
+    The waits are filtered out before the shape is compared. `wait` steps are cadence, not
+    structure — the compiler separates repeated clicks with them — so pinning them here
+    would fail this test over a settle-time change that leaves the close intact.
+    """
     steps = sc.compile_recording("library/7320039db9ba7e26.recording.json",
                                  emit_start_goto=False)
-    assert [s["action"] for s in steps] == ["click", "click", "close_tab"]
-    assert steps[0]["count"] == 11
+    acting = [s for s in steps if s["action"] != "wait"]
+    assert [s["action"] for s in acting] == ["click", "click", "close_tab"]
+    assert acting[0]["count"] == 11
 
 
 # ------------------------------- replay -------------------------------

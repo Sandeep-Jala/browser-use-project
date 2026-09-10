@@ -328,7 +328,7 @@ def promote_healed_anchors(anchors_path: str | Path,
 # ------------------------------- the takeover brief -------------------------------
 #
 # When a replay breaks part-way the agent takes over IN PLACE, on the dirty page the
-# replay abandoned (hybrid._run_subtasks). It used to be told only "a previous attempt
+# replay abandoned (hybrid.run_hybrid_task). It used to be told only "a previous attempt
 # partially completed this step and then stopped" — a boolean — so a recording that died
 # on its LAST action and one that died on its second produced the identical prompt, and
 # the agent had to reconstruct the boundary by inspection.

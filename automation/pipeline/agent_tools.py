@@ -1,7 +1,7 @@
 """Custom agent tools the prompts rely on, registered on a browser-use ``Tools`` registry.
 
-The system/expander prompts (see prompts.py) instruct the agent to call custom actions that are
-NOT part of browser-use's built-in set:
+The system and per-subtask prompts (see prompts.py) instruct the agent to call custom actions
+that are NOT part of browser-use's built-in set:
 
   * skip_step(reason)          — escape hatch: abandon the current objective, keep going.
   * fail_and_stop(reason)      — escape hatch: terminate the whole run as a failure.
@@ -888,8 +888,9 @@ _REPEAT_READY_JS = """function () {
 
 # The control's OWN name, read in the page. Visible text first: that is what the task and
 # the user call the control by ("click Next", "then click submit"), and it is what changes
-# when an app swaps a button's job on the last row. PUA glyphs are stripped because Fluent
-# renders icons as literal text nodes inside the control (see _CAND_ROW_NAME_JS).
+# when an app swaps a button's job on the last row. PUA glyphs are stripped (below, and by
+# _pua_strip on the Python side) because Fluent renders icons as literal text nodes inside
+# the control — a pencil is a real U+E70F text node, not a CSS ::before.
 _CONTROL_NAME_JS = """function () {
   var t = function (s) { return (s || '').replace(/[\\uE000-\\uF8FF]/g, ' ')
                                          .replace(/\\s+/g, ' ').trim(); };

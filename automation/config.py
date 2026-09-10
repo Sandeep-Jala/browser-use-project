@@ -9,7 +9,7 @@ Two groups of settings live here:
   * Login settings consumed by `browser/login.py` (login_url, credentials, headless,
     cdp_port, errors_dir).
   * Framework settings for the browser-use agent and telemetry (provider/model/key,
-    use_vision, artifacts_dir, prompt expansion).
+    use_vision, artifacts_dir, the non-agent model).
 """
 from __future__ import annotations
 
@@ -23,13 +23,17 @@ from dotenv import load_dotenv
 # --- LLM providers ---
 # Azure OpenAI (gpt-4.1-mini) is the active provider. Its /openai/v1 endpoint is
 # OpenAI-compatible, so browser-use's ChatOpenAI drives it with just a custom base_url.
-# ONE model everywhere: gpt-4.1-mini runs the agent loop, the prompt expander, AND the
-# QA judge, so behaviour stays consistent. Groq remains available as an alternate
-# (LLM_PROVIDER=groq in .env).
+# ONE model everywhere: gpt-4.1-mini runs the agent loop AND the non-agent work below
+# (decomposer / router verify / parameterization), so behaviour stays consistent. Groq
+# remains available as an alternate (LLM_PROVIDER=groq in .env).
 DEFAULT_AZURE_MODEL = "gpt-4.1-mini"
 AZURE_BASE_URL = "https://actingoffice-foundry.openai.azure.com/openai/v1"
 DEFAULT_GROQ_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
-# Prompt-expander / QA-judge model: same Azure deployment, independent of LLM_PROVIDER.
+# The NON-AGENT model: same Azure deployment, independent of LLM_PROVIDER. Its consumers
+# are the decomposer's LLM tier, the router's verify tier, and adapt.parameterize.
+# The name is historical — the prompt expander it was built for (EXPAND_SYSTEM_PROMPT +
+# expand_task in prompts.py) was deleted with the whole-task execution path, and
+# decompose.py is a separate, older component that outlived it, not its replacement.
 DEFAULT_EXPANDER_MODEL = DEFAULT_AZURE_MODEL
 
 

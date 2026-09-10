@@ -12,7 +12,7 @@ tiers, cheapest first:
      degrades to alias-only when unavailable) ranks same-context library entries by
      cosine similarity of their value-stripped prompts. A candidate must clear a floor
      AND a margin over the runner-up — lookalikes with close scores are refused here.
-  3. LLM VERIFY (one call, once per new wording): the expander model confirms "same
+  3. LLM VERIFY (one call, once per new wording): the non-agent model confirms "same
      procedure" and maps the new tokens onto the canonical params
      (ROUTER_VERIFY_SYSTEM_PROMPT). Values are then re-keyed to the canonical param
      names, so the skill's template alignment binds them by NAME. A yes is written to

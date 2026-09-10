@@ -171,7 +171,10 @@ def task_id(prompt: str) -> str:
 
     Keys the cached decomposition (decompositions/<tid>.json) and labels runs. Identity is
     the ORIGINAL user prompt, so editing a task's wording by even one word gives it a new id
-    and orphans its cached decomposition — see tests/test_tasks.py::test_task_ids_stable.
+    and orphans its cached decomposition, along with the library reuse that came with it.
+    (tests/test_tasks.py used to pin every registry prompt's id here to catch an accidental
+    reword; that pin was removed on 2026-09-09 because prompts are now edited deliberately
+    and it fired on every intentional change.)
     """
     norm = " ".join(prompt.split()).lower()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]

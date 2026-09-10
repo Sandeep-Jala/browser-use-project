@@ -256,10 +256,13 @@ async def test_replay_fail_dirty_recovery_does_not_commit(stores, monkeypatch):
 
     assert result.is_successful is True
     assert result.subtasks[0]["mode"] == "replay_failed->authored"
-    # Dirty recovery: fail_count bumped, entry NOT archived (threshold 2), steps unchanged.
-    assert ss.load_meta(sid0)["fail_count"] == 1
-    assert json.loads(ss.steps_path(sid0).read_text()) == original
-    assert not (ss.LIBRARY_DIR / "archive").exists()
+    # Dirty recovery must not COMMIT over the entry. Under _ARCHIVE_AFTER_FAILURES = 1
+    # (2026-09-09) the failure also retires it, so the proof that nothing was written is
+    # the ARCHIVED copy: it still holds the original steps, not the recovery's.
+    archived = list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
+    assert len(archived) == 1
+    assert json.loads(archived[0].read_text()) == original
+    assert sid0 not in ss.load_manifest()
 
 
 async def test_a_failed_dirty_recovery_still_retires_a_failing_entry(stores, monkeypatch):
@@ -292,9 +295,15 @@ async def test_a_failed_dirty_recovery_still_retires_a_failing_entry(stores, mon
     assert list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
 
 
-async def test_a_single_failed_dirty_recovery_does_not_retire(stores, monkeypatch):
-    """The threshold still binds: one bad run must not delete a recording that worked
-    yesterday — the same reasoning as test_replay_fail_at_step_zero_is_clean_reauthor."""
+async def test_a_single_failed_dirty_recovery_retires_the_entry(stores, monkeypatch):
+    """One failure is now enough (user decision 2026-09-09, _ARCHIVE_AFTER_FAILURES = 1).
+
+    This test asserted the opposite until then — that a single miss must not delete a
+    recording that worked yesterday. The reasoning that overturned it: a stale recording
+    costs a whole extra run to discover, and the failures that most needed retiring never
+    tripped a two-strike counter at all, because a recording that ticks the WRONG row
+    still PASSES and never increments fail_count.
+    """
     ctx = ss.normalize_context("http://app/section")
     sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
     _seed_entry(sid0)
@@ -304,17 +313,16 @@ async def test_a_single_failed_dirty_recovery_does_not_retire(stores, monkeypatc
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake))
     await _run(fake)
 
-    assert ss.load_meta(sid0)["fail_count"] == 1
-    assert sid0 in ss.load_manifest()
-    assert not (ss.LIBRARY_DIR / "archive").exists()
+    assert sid0 not in ss.load_manifest()
+    assert list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
 
 
 async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
-    """A clean (page-untouched) failure re-authors in place and REPLACES the entry —
-    but it does not retire the old one on a single miss. One transient failure (a slow
-    render, a cookie banner, a list that had not populated yet) used to delete the
-    recording outright, so a recording that worked yesterday was gone today and every
-    later run paid for the LLM again."""
+    """A clean (page-untouched) failure re-authors in place and REPLACES the entry.
+
+    It also retires the old one on that single miss now (_ARCHIVE_AFTER_FAILURES = 1,
+    2026-09-09) — which costs nothing here, because the fresh authoring in the same run
+    replaces the entry anyway. What matters is the re-author, not the archive."""
     ctx = ss.normalize_context("http://app/section")
     sid0 = ss.subtask_id(SPEC.subtasks[0].prompt, ctx)
     _seed_entry(sid0, [{"action": "click", "selectors": ["text=Gone"]}])
@@ -325,8 +333,9 @@ async def test_replay_fail_at_step_zero_is_clean_reauthor(stores, monkeypatch):
     result = await _run(fake)
 
     assert result.is_successful is True
-    # Not archived on the first miss — the fresh authoring simply replaces it.
-    assert not list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
+    # Retired on the miss, then re-authored in the same run: the live entry is the fresh
+    # one, and the stale steps are in the archive rather than still on the shelf.
+    assert list((ss.LIBRARY_DIR / "archive").glob(f"{sid0}.steps.*.json"))
     assert "await api.goto('http://app/section')" in ss.code_path(sid0).read_text()
     assert not ss.steps_path(sid0).exists()
 

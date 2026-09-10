@@ -61,8 +61,8 @@ def _pinned_ladder(step: dict[str, Any], sel: str) -> list[str]:
 
     The repeat verbs pin whatever resolved first so later iterations skip the ladder,
     but collapsing to a single selector also makes that selector `last` in
-    _resolve_step, which is what enables its ambiguity concession: act on the first
-    visible match. That concession exists for when the durable candidates are
+    script_compile._resolve, which is what enables its ambiguity concession: act on the
+    first visible match. That concession exists for when the durable candidates are
     EXHAUSTED, and a one-element cache fakes exhaustion.
 
     Measured (run 20260901_160947, subtask 8, entry 7320039db9ba7e26 "click Next for

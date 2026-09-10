@@ -139,8 +139,10 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
         print(f"[*] Login complete (CDP {cdp_url}) | model: {config.active_model} "
               f"vision={config.use_vision}")
 
-        # Always built: the subtask decomposer, the end-of-run judge, and adapt.parameterize
-        # all need this LLM (it is not optional the way the old prompt-expander was).
+        # Always built: the subtask decomposer's LLM tier, the semantic router's verify
+        # tier, and adapt.parameterize all need this LLM (it is not optional the way the
+        # old prompt-expander was). NOT the end-of-run judge — that is off, see
+        # runner.py's use_judge=False.
         expander_llm = build_expander_llm(config)
         try:
             runner = Runner(

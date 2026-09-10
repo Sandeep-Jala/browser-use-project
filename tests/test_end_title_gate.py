@@ -335,7 +335,10 @@ async def _replay_once(monkeypatch, *, titles, seg_ok=True):
                     urls=["http://app/section", "http://app/portal"], titles=list(titles))
     monkeypatch.setattr(hybrid, "HybridSession", FakeSession.make_opener(fake2))
     await run_hybrid_task(fake2.runner or _runner(), prompt, spec=spec)
-    return ss.load_manifest()[sid]
+    # A FAILED replay retires the entry outright now (_ARCHIVE_AFTER_FAILURES = 1,
+    # 2026-09-09), so there may be no manifest row left to read. An absent entry carries
+    # no pin either, which is exactly what the failing-replay case asserts.
+    return ss.load_manifest().get(sid) or {}
 
 
 async def test_a_passed_replay_teaches_the_entry_its_end_title(stores, monkeypatch):
@@ -360,6 +363,9 @@ async def test_a_FAILED_replay_teaches_nothing(stores, monkeypatch):
                                titles=["Setting - Acting Office", "Acting Office"])
 
     assert not entry.get("end_title")
+    # Stronger than it used to be: the failing replay does not merely decline to pin a
+    # title, it takes the entry off the shelf (see _replay_once).
+    assert not entry
 
 
 # ------------------------------- settling the read -------------------------------

@@ -21,10 +21,11 @@ Composition nodes are TYPED (decompose.node_kind): "action" nodes replay from th
 "judge" nodes are cognitive — their success is a judgment (verify/compare/observe) that
 cannot survive compilation into a selector script, so they always run as agent segments and
 are never committed (a replayed judge would walk the clicks with nobody looking and report
-a hollow pass). "loop" nodes repeat an action until a stated stop condition holds ("Save &
-Next ... until X is shown"): they get ACTION framing plus an extended step budget — judge's
-observation framing made the agent declare a loop done after one iteration — but are just
-as uncacheable, because the iteration count is live page state. A leading-"If" conditional
+a hollow pass). There was a third kind, "loop", for an action repeated until a stated stop
+condition held ("Save & Next ... until X is shown"); it was removed on 2026-08-28, because a
+repeat is now stated by the repeat_click tool, which carries its own count instead of
+leaving the compiler to guess whether adjacent same-target clicks were iterations or
+slow-app retries. node_kind returns only "action" or "judge". A leading-"If" conditional
 guard (a slice that declares a `probe:`) also always runs live and uncommitted: a recording
 could only capture ONE branch. Observations flow FORWARD: each completed segment's finding
 (its distilled final result) is handed to every later agent segment, so a note-then-verify
@@ -74,7 +75,11 @@ logger = logging.getLogger("framework.hybrid")
 
 # A library entry that fails this many CONSECUTIVE replays is stale by definition: archive
 # it so the next run authors a clean replacement (see subtask_store.archive_if_failing).
-_ARCHIVE_AFTER_FAILURES = 2
+# Set to 1 (user decision 2026-09-09): a recording that fails ONCE is retired immediately.
+# The cost of the old value of 2 was a whole extra run spent re-fighting a stale recording
+# — and, worse, a silent wrong-row replay counts as a "pass" and never trips the counter
+# at all, so waiting for a second failure protected far less than it looked like it did.
+_ARCHIVE_AFTER_FAILURES = 1
 
 # Ad/tracker hosts blocked in HELPER TABS ONLY (open_aux_tab): foreign sites the aux
 # machinery visits are ad-saturated (fakenamegenerator's ad iframes pushed every DOM
@@ -142,7 +147,7 @@ class Gate:
     postcondition: dict[str, Any] | None = None   # {"url_contains": ...} | {"visible": ...}
     end_context: str | None = None  # recorded end context (normalized URL) to compare
     end_title: str | None = None    # recorded end document title, demote-only (see
-                                    # _recording_end_title); rides on any base kind
+                                    # _pin_end_title); rides on any base kind
     checks: tuple = ()              # declared verify checks (tuple of checks.Check)
     # Declared exemption from the window write rule — see Subtask.allow_write_refusal.
     allow_write_refusal: bool = False
@@ -394,9 +399,20 @@ def segment_step_budget(gate: Gate, base: int, kind: str = "action",
 
 
 # Postcondition settle window: an SPA can still be re-rendering/navigating when a
-# segment's last step returns, so every page-state check gets a few short re-polls before
-# a miss counts as a failure. (Gate tests shrink the delay to keep the suite fast.)
-_SETTLE_TRIES = 6
+# segment's last step returns, so every page-state check gets short re-polls before a miss
+# counts as a failure. (Gate tests shrink the delay to keep the suite fast.)
+#
+# 21 tries = a 10s window (2026-09-09, was 6 = 2.5s). Run 20260909_121025 subtask 19: the
+# FPS submit POST took 4794 ms server-side and the app only routed to
+# /reports/payrollsummary once it answered. The old window gave up mid-flight, recorded
+# "reached /rti/payrun", and failed a segment that had in fact succeeded — the takeover
+# agent's own first receipt reports the page as /reports/payrollsummary. A submit this app
+# takes ~5s to answer could never pass a 2.5s window, so the failure was structural, not
+# flaky. Widening is close to free: _settled returns the instant the check passes, so a
+# passing segment never waits longer than it does today; only a segment already headed for
+# failure spends the extra seconds, and it buys back a false failure that leaves the agent
+# re-submitting an accepted FPS.
+_SETTLE_TRIES = 21
 _SETTLE_DELAY = 0.5
 
 
@@ -452,7 +468,7 @@ async def evaluate_gate(
         # Demote-only, like the roll-up and the declared checks below. A segment whose
         # recording CHANGED the document title must change it the same way on replay —
         # the only readable difference between an accepted and a refused in-page
-        # submission (see _recording_end_title). Fails OPEN on an unreadable title: an
+        # submission (see _pin_end_title). Fails OPEN on an unreadable title: an
         # additive gate must never become a new false-fail source.
         reached: str | None = None
 
@@ -603,7 +619,7 @@ class Segment:
     context: str
     mode: str                       # "replay" | "authored" | "replay_failed->authored"
                                     # | "probe" (conditional resolved by a FALSE probe)
-    kind: str = "action"            # composition node kind: "action" | "judge" | "loop"
+    kind: str = "action"            # composition node kind: "action" | "judge"
     ok: bool = False
     gate: dict[str, Any] = field(default_factory=dict)
     steps_executed: int = 0
@@ -638,9 +654,11 @@ class Segment:
     # probed successor (_waive_for_next_conditional).
     steps_ok: bool | None = None
     # Why this segment did NOT replay (None on replays): "fresh" | "reauthor" | "judge" |
-    # "loop" | "conditional" | "probe_absent" | "dynamic" | "fallback" | "no_entry" |
+    # "conditional" | "probe_absent" | "dynamic" | "fallback" | "no_entry" |
     # "identity_fork" | "values_unresolved". The answer to "why didn't it use the
     # recording?" without archaeology — surfaced in the report row and the run summary.
+    # ("loop" was a value here until the kind was removed on 2026-08-28; old run JSON
+    # may still carry it.)
     skip_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -2489,7 +2507,7 @@ async def _author_segment(
         # it only after the segment commits), but an ANNOUNCED tab that adopt_announced_tab
         # declined has already been swept by agent_segment, so current_url() would read the
         # app tab that survived. Committing THAT as end_context is worse than a failed
-        # segment: _gate_for turns a stored end_context into the next run's postcondition
+        # segment: _base_gate_kind turns a stored end_context into the next run's postcondition
         # gate, so one such commit bakes a wrong gate into every future run of this subtask.
         # Prefer the URL captured before the sweep, for the same reason the gate does.
         normalize = (sstore.normalize_aux_context if getattr(sub, "tab_url", None)

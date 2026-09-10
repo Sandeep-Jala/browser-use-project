@@ -322,9 +322,9 @@ class Subtask:
     # The tab closes when the subtask ends; the main app page is never navigated.
     tab_url: str | None = None
     # "action" (replayable from the library) | "judge" (cognitive: always LLM, never
-    # cached) | "loop" (repeat-until: action framing; cached since 2026-08-25, storing the
-    # authoring run's iteration count — see node_kind). Assigned by _build_subtasks after
-    # markers are settled.
+    # cached). Those are the only two node_kind can return — the third, "loop", was
+    # removed on 2026-08-28 in favour of the repeat_click tool stating its own count
+    # (see node_kind). Assigned by _build_subtasks after markers are settled.
     kind: str = "action"
     # True only for the whole-prompt fallback blob: the entire task as one subtask.
     # Downstream it degrades gating/framing to neutral (steps gate, no download block,
@@ -548,12 +548,14 @@ def whole_prompt_fallback(prompt: str, marker: str | None) -> list[Subtask]:
     whole-task behavior when decomposition is unavailable or invalid.
 
     The judge verdict is kept (a markerless verification task falls back to ONE judge
-    node, never hollow-replayed), but "loop" collapses to "action": repeat+stop cues
-    ANYWHERE in a mega-task's text classified the whole blob a loop, and the loop
-    framing — "you are mid-iteration; done when the stop condition holds" — made the
-    agent skip the task's opening and once declare the entire task complete because the
-    FIRST embedded repeat-until's stop condition held on a page it wandered onto
-    (runs 20260805_155515/161958). A blob is a whole procedure, not an iteration."""
+    node, never hollow-replayed). It used to also collapse "loop" to "action", back when
+    kind was inferred from wording: repeat+stop cues ANYWHERE in a mega-task's text
+    classified the whole blob a loop, and the loop framing — "you are mid-iteration; done
+    when the stop condition holds" — made the agent skip the task's opening and once
+    declare the entire task complete because the FIRST embedded repeat-until's stop
+    condition held on a page it wandered onto (runs 20260805_155515/161958). A blob is a
+    whole procedure, not an iteration. Moot since the kind was removed on 2026-08-28, but
+    it is why a blob must never inherit iteration framing."""
     template = " ".join(prompt.split())
     k = node_kind(template, marker)
     return [Subtask(index=0, template_prompt=template, marker=marker,

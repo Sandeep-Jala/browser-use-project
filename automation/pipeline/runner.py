@@ -523,7 +523,7 @@ class Runner:
             # 2026-07-30 decision: the hybrid engine's segment gates are the verdict, and
             # the judge never overrides the agent's self-reported success.
             # Found regressed to True on 2026-08-07: every authored segment ended with a
-            # full-trace judgement on the medium-effort expander deployment (240s timeout,
+            # full-trace judgement on the medium-effort non-agent deployment (240s timeout,
             # 5 retries) — minutes of dead air between subtasks, verdict thrown away.
             use_judge=False,
             # We own SIGINT ourselves (see _prompt_and_inject) to offer a human-in-the-loop

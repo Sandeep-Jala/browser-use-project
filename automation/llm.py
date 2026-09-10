@@ -57,7 +57,9 @@ def build_llm(config: Config) -> BaseChatModel:
 
 
 def build_expander_llm(config: Config) -> BaseChatModel | None:
-    """Build the model used for one-shot prompt expansion and the QA judge.
+    """Build the NON-AGENT model: the decomposer's LLM tier, the router's verify tier,
+    and adapt.parameterize. (Not the QA judge — browser-use's is off, see use_judge in
+    runner.py. Not a prompt expander either; that was deleted, and the name stuck.)
 
     Always on the Azure endpoint (same gpt-4.1-mini deployment as the agent), independent of
     the agent's LLM_PROVIDER. Returns None if no Azure key is configured.

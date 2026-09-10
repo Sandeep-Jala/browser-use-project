@@ -110,8 +110,11 @@ def test_the_real_otp_recording_stamps_its_external_link_click():
     # link, so the stamp is still read off a real trace and not off this file.
     steps = sc.compile_recording("library/07044b6a0dbf7988.recording.json",
                                  emit_start_goto=False)
-    assert [s.get("opens_tab") for s in steps] == [
-        None, None, None, None, None, True, None, None, None, None, None]
+    # Asserted as "exactly one stamp, and it sits at index 5" rather than as a full-length
+    # list: this fixture is a LIVE library entry, so re-authoring the slice legitimately
+    # changes how many steps trail the stamp (it has been 11 and is now 9) without touching
+    # the thing under test.
+    assert [i for i, s in enumerate(steps) if s.get("opens_tab")] == [5]
     # The one stamp is on the external link itself, and the steps after it are the ones
     # that only exist in the tab it opened.
     assert steps[5]["fingerprint"]["tag"] == "a"
