@@ -1,254 +1,268 @@
-"""Declarative task registry: one TaskSpec per task (prompt + ground-truth marker + tags).
+"""Declarative task registry, loaded from tasks.yaml at the repo root.
 
-Adding a task is ONE entry in `TASKS`. The `marker` is the network ground-truth URL fragment
-(a successful POST/PUT/PATCH to a URL containing it proves the record saved); `None` means
-read-only (the gate is disabled). `assertions` holds per-task overrides for the assertion
-engine (see pipeline/assertions.py); `tags` group tasks for suite selection (`tag:sales`).
+Adding a task is ONE entry in tasks.yaml — no Python change. Per entry: `prompt` (written
+like a user would type it, WITHOUT login steps — the framework logs in itself); `marker`,
+the network ground-truth URL fragment (a successful POST/PUT/PATCH to a URL containing it
+proves the record saved) — OMITTED for tasks with no known create-write (verification /
+read-only flows), which then run with the gate disabled instead of being force-failed;
+`tags` as free grouping metadata; `assertions` for per-task assertion overrides (see
+pipeline/assertions.py); and `subtasks` as an escape hatch when the LLM decomposer keeps
+splitting a specific task wrongly.
 
-CRITICAL: prompts are identity. task_store.task_id hashes the prompt to find a task's golden
-script, so editing a prompt's text (even whitespace is normalized, but words are not) orphans
-its recording. tests/test_tasks.py pins every prompt's task id for exactly this reason.
+A task that declares `subtasks:` may OMIT `prompt:` entirely — the prompt is then DERIVED
+by joining the instantiated slices, making the subtask blocks the single edit surface (no
+prompt/slice lockstep to maintain). Keeping both is allowed only while they agree
+verbatim; a mismatch fails the load loudly, because silent drift between the two texts
+would fork the task's identity.
+
+CRITICAL: prompts are identity. subtask_store.task_id hashes the prompt to key the task's
+cached subtask decomposition, so editing a prompt's text (whitespace is normalized, words are
+not) orphans that cache and forces a fresh LLM decomposition — which may cut the task into
+different subtasks and so miss the library entries the old split used.
+tests/test_tasks.py pins every prompt's task id for exactly this reason.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+import yaml
+
+from automation.pipeline.checks import Check, parse_probe, parse_verify
+from automation.pipeline.subtask_store import is_absolute_http_url
+
+
+@dataclass(frozen=True)
+class SubtaskDecl:
+    """One declared subtask of a task (hybrid subtask engine, see pipeline/hybrid.py).
+
+    `prompt` may carry {{tokens}} whose concrete values live in `values` — the tokenized
+    prompt is the subtask's LIBRARY identity, so two tasks that differ only in values share
+    one library recording. `marker` marks the save-owning subtask (the parent's create-write
+    fires here); `postcondition` is an optional cheap success check for subtasks with no
+    write: {"url_contains": "..."} or {"visible": "<selector>"}. `kind` declares the node
+    classification — "action" (replayable, the default) or "judge" (a verification, which
+    always runs LLM-live and is never cached). It is the ONLY way to mark a verification:
+    nothing infers kind from the prompt's wording, so an undeclared slice is an action and
+    is recorded. Validated on load; "loop" was removed on 2026-08-28 (a repeat is stated
+    with the repeat_click tool). `tab_url` runs the
+    subtask in a separate helper tab opened at that URL (same browser context) — the tab is
+    closed when the subtask ends and the main app page is never navigated. `verify` is the
+    slice's declared deterministic checks (pipeline/checks.py), parsed and token-substituted
+    at load time; they gate the segment on top of its base gate and never touch identity.
+    `probe` (leading-"If" conditional slices only) is ONE declared check that stands in
+    for the agent's live presence judgment: absent resolves the segment as a zero-LLM
+    no-op, present runs the branch like a normal action (replayable/committable) —
+    recorded TRUE-branch steps only ever run behind a TRUE probe. Like verify, it is
+    parsed and token-substituted at load, never touches identity, and is ignored on
+    non-conditional slices. `allow_write_refusal` exempts the slice from the window write
+    rule (checks.window_write_rollup): a slice whose own wording declares an error branch
+    ("click Submit. if it shows an error, click cancel") ends legitimately on a REFUSED
+    write, and the rule cannot know that — it judges observed traffic and never reads
+    prose, which is exactly what makes it hold for every undeclared task. The refusal is
+    still reported under the segment's write_rollup; it just stops failing the segment.
+    """
+    prompt: str
+    values: dict[str, str] | None = None
+    marker: str | None = None
+    postcondition: dict[str, Any] | None = None
+    kind: str | None = None
+    tab_url: str | None = None
+    verify: tuple[Check, ...] | None = None
+    probe: Check | None = None
+    allow_write_refusal: bool = False
 
 
 @dataclass(frozen=True)
 class TaskSpec:
     key: str
     prompt: str
-    marker: str | None = None          # ground-truth URL fragment; None = read-only task
+    marker: str | None = None          # ground-truth URL fragment; None = gate disabled
     assertions: dict[str, Any] | None = None  # per-task assertion overrides; None = defaults
     tags: tuple[str, ...] = ()
+    # Escape-hatch override for the hybrid engine; normally None — subtask decomposition
+    # is the LLM decomposer's job (computed once per prompt, cached under
+    # decompositions/<tid>.json, regenerable with --redecompose). Declare subtasks here
+    # only when the decomposer keeps splitting a specific task wrongly.
+    subtasks: tuple[SubtaskDecl, ...] | None = None
 
 
-# Terse, high-level task prompts (the app-aware expander turns these into concrete steps).
-# Markers are best guesses based on the app's REST conventions — verify against real network
-# captures if a task fails the ground-truth gate unexpectedly.
-TASKS: dict[str, TaskSpec] = {t.key: t for t in (
-    # ------------------------------------------------------------------ Sales
-    TaskSpec(
-        key="invoice",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. go to inputs section,select sales,go to Invoices,add invoice,select a customer Suresh Gopi,select an item bike, set product description 'buying a new bike', set Qty 5, Unit price 500 and click on save""",
-        marker="Invoices",
-        tags=("sales",),
-    ),
-    TaskSpec(
-        key="credit_notes",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to inputs section,select sales,go to Credit Notes,add credit note,select any customer,select any invoice ref from the dropdown, and click on save.""",
-        marker="Refunds",  # sales credit notes are committed via the /Refunds endpoint
-        tags=("sales",),
-    ),
-    TaskSpec(
-        key="estimates",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Estimates,add estimate,select customer Mr Jones, select an item from the dropdown and click on save.""",
-        marker="Invoices",  # estimates are persisted via the /Invoices endpoint
-        tags=("sales",),
-    ),
-    # NOTE: run 20260707_143005 saved a receipt yet only POST /Payments fired — if receipts
-    # show up in the app despite FAIL verdicts here, the marker is wrong: change to "Payments".
-    TaskSpec(
-        key="receipt",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Receipts,add receipt,enter Suresh Gopi in receipts from filed,enter amount 1000,save receipt.""",
-        marker="Receipts",
-        tags=("sales", "flaky-ui"),  # UI issue while saving
-    ),
-    TaskSpec(
-        key="item",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select sales,go to Item,add item,enter name Office Expences, set purchases description to 'buying a new item', set sales description to 'selling a new item',enter unit price purchase 100,enter unit price sell 150,create item.""",
-        marker="Items",
-        tags=("sales",),
-    ),
-    # -------------------------------------------------------------- Purchases
-    TaskSpec(
-        key="purchase",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,add invoice,select customer Le Marche,select an item car from dropdown, set Qty 5, Unit price 500,set vat to No VAT and click on save.""",
-        marker="Purchase",
-        tags=("purchases",),
-    ),
-    TaskSpec(
-        key="purchase_credit_notes",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Credit Notes,add credit note,select a supplier Lina,set invoice ref PUR-0071 and click on save.""",
-        marker="Purchase",
-        tags=("purchases",),
-    ),
-    TaskSpec(
-        key="purchase_po",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Purchase Orders,add purchase order,select contact name John,select an item furniture and click on save.""",
-        marker="PurchaseOrders",
-        tags=("purchases",),
-    ),
-    TaskSpec(
-        key="purchase_payment",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select purchases,go to Payments Section,add payment,enter Gabriel Dobson in Paid to field,enter amount 500,save payment.""",
-        marker="Payment",
-        tags=("purchases", "flaky-ui"),  # UI issue while saving
-    ),
-    # --------------------------------------------------------- Expense Claims
-    TaskSpec(
-        key="reimbursements",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Reimbursements Section,click add reimbursement,select an user name in 'Reimbursed To' field, select an account, enter amount 200,and click on save.""",
-        marker="Reimbursements",
-        tags=("expense_claims",),
-    ),
-    # Verified from run 20260708_161610: the commit is POST .../MileageClaims ("Mileages"
-    # is NOT a substring of it and falsely failed a saved record).
-    TaskSpec(
-        key="mileage",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Mileages Section,click add mileage,select a director from user dropdown,enter 'Mileages Business Trip' in Remarks field,select engine type Petrol,enter description mileage London to Manchester,enter mileage 200,select rate 45p,and click on save.""",
-        marker="MileageClaims",
-        tags=("expense_claims",),
-    ),
-    TaskSpec(
-        key="expense_claims",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,click add expense button,select director,enter Office Equipment in remarks field,enter bill no EXP123,enter description Buying New Desks,select account Eu services - 3/4,enter base amount 1500,select vat 5% standard,and click on save.""",
-        marker="ExpenseClaims",
-        tags=("expense_claims",),
-    ),
-    TaskSpec(
-        key="refund",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select expense claims,go to Refunds Section,click add refund,select a value in refund from field,select an account,Enter amount 1000 and click on save.""",
-        marker="Refunds",
-        tags=("expense_claims", "flaky-ui"),  # UI issue while saving
-    ),
-    # ------------------------- Journals / Assets / Banking / Budget / Dividends
-    TaskSpec(
-        key="journals",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select journals,click add journal button,enter JRN001 in journal reference field,select an account,enter value in debit 1000,and click on save.""",
-        marker="Journals",
-        tags=("journals", "flaky-ui"),  # UI issue while saving
-    ),
-    TaskSpec(
-        key="fixed_asset",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select assets,click add Fixed assets,enter asset name MacBook Pro,select an account,set purchase price 100,select supplier AO, enter rate 1200 and click on save.""",
-        marker="Assets",
-        tags=("assets",),
-    ),
-    TaskSpec(
-        key="disposed_asset",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select assets,go to disposed,add dispose asset,select an asset,enter sales proceeds 800,select payment method Customer,select customer Suresh Raina and click on save.""",
-        marker="Assets",
-        tags=("assets",),
-    ),
-    TaskSpec(
-        key="banking",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to banking section,click add account,account type savings, select bank CAF, enter account no 126525678, enter sort code 77-26-89,enter IBAN RB003GSD, Make it as Primary account.and click on save.""",
-        marker="Banking",  # commits via POST /Banking/ — known issue with IBAN field
-        tags=("banking",),
-    ),
-    TaskSpec(
-        key="budget_manager",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name. Go to Budget manager and click add budget.Enter name Q4 Marketing,date 5th Dec,2027.select Frequency yearly,duration 1 year. and click on save.""",
-        marker="Budget",
-        tags=("budget",),
-    ),
-    TaskSpec(
-        key="dividend",
-        prompt="""go to Bookkeeping module, search and select 290 CREW LIMITED business name.go to inputs section,select dividends section,click dividends,select an authorised director from dropdown,select a type,enter dividend per share 10,enter payment date 10/10/2026,save asset,save.""",
-        marker="Dividends",
-        tags=("dividends",),
-    ),
-    # ------------------ Full end-to-end sample with new contact and item creation
-    TaskSpec(
-        key="invoice_full_creation",
-        prompt="""go to Bookkeeping module.search for MAK NOTTINGHAM LTD business name and select it.go to inputs section,select sales,go to Invoices,add invoice,create a new Contact name 'DamBro' in customer field. set address jodhpur, rajasthan, 342015. set supplier address barmer, rajasthan, india, 325486. Supplier Set Due Date 01/01/2027. Set invoice no INV123425. set p.o. reference abdf435, create an item 'IT Services',set product description 'service provider', set qty 10 and unit price 5000, set vat to No Vat, set discount 10% and click on save.""",
-        marker="Invoices",
-        tags=("sales", "e2e"),
-    ),
-    # -------------------------------------------------------------------- CRM
-    TaskSpec(
-        key="crm_create_invoice",
-        prompt="""Go to clients section.Search for Zachary Spencer and select it. Go to "create invoice", select a service. set amount to 5000 and set discount to 10%. create a discount note.Select a collection method and click on save.""",
-        marker="Invoices",
-        tags=("crm",),
-    ),
-)}
+TASKS_FILE = Path("tasks.yaml")
 
 
-# Verbs that mean the task WRITES something (create/modify/remove a record). A free-text task
-# containing none of these is read-only — it will legitimately produce no create-write, so it
-# must not get a marker (the ground-truth gate would force-fail an honest success otherwise).
-_WRITE_VERBS = re.compile(
-    r"\b(add|create|save|submit|enter|set|make|new|record|update|edit|modify|change|delete|"
-    r"remove|upload|import|approve|pay|dispose|generate)\b", re.IGNORECASE)
+_DECL_TOKEN = re.compile(r"\{\{(\w+)\}\}")
 
 
-def _infer_marker(prompt: str) -> str | None:
-    """Best-guess success marker for a free-text task, or None for a read-only task.
+def _instantiated(decl: SubtaskDecl) -> str:
+    """The slice's concrete text: {{tokens}} replaced from its values (unknown tokens are
+    left verbatim — _validate rejects them later with the closure error)."""
+    values = decl.values or {}
+    return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), decl.prompt)
 
-    None disables the network ground-truth gate: a task that only reads/verifies (check a
-    balance, confirm a record exists) fires no create-write, so success falls back to the
-    agent's self-report + the judge. Write tasks map to a marker by record type (ordered most
-    specific first — e.g. invoice tasks mention items, so "invoice" is checked before "item").
-    """
-    p = prompt.lower()
-    if not _WRITE_VERBS.search(p):
+
+def _parsed_verify(key: str, i: int, d: dict[str, Any]) -> tuple[Check, ...] | None:
+    """One slice's `verify:` block → validated Check tuple, {{tokens}} substituted from
+    the slice's values. Substitution happens HERE (load time) because the downstream
+    token grammar (sstore.TOKEN_RE) is lowercase-only and would silently skip uppercase
+    names; a token that stays unresolved fails loud — a verify arg has no later closure
+    validation, and probing for literal braces would be a silent always-fail."""
+    raw = d.get("verify")
+    if raw is None:
         return None
-    checks = [
-        ("purchase order", "PurchaseOrders"),
-        ("credit note", "Purchase" if "purchase" in p else "Refunds"),
-        ("reimbursement", "Reimbursements"),
-        ("mileage", "MileageClaims"),
-        ("refund", "Refunds"),
-        ("expense", "ExpenseClaims"),
-        ("journal", "Journals"),
-        ("asset", "Assets"),
-        ("bank", "Banking"),
-        ("budget", "Budget"),
-        ("dividend", "Dividends"),
-        ("receipt", "Receipts"),
-        ("payment", "Payment"),
-        ("estimate", "Invoices"),
-        ("invoice", "Invoices"),
-        ("item", "Items"),
-        ("purchase", "Purchase"),
-    ]
-    for keyword, marker in checks:
-        if keyword in p:
-            return marker
-    return "Invoices"
+    values = d.get("values") or {}
+
+    def _sub(text: str) -> str:
+        return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), text)
+
+    if isinstance(raw, (list, tuple)):
+        raw = [
+            {k: (_sub(v) if isinstance(v, str) else v) for k, v in item.items()}
+            if isinstance(item, dict) else item
+            for item in raw
+        ]
+    checks = parse_verify(raw, where=f"tasks.yaml entry {key!r} subtask {i} verify")
+    for c in checks:
+        if _DECL_TOKEN.search(c.arg):
+            raise ValueError(
+                f"tasks.yaml entry {key!r} subtask {i} verify: unresolved token in "
+                f"{c.kind} {c.arg!r} — add it to the subtask's values")
+    return checks
+
+
+def _parsed_probe(key: str, i: int, d: dict[str, Any]) -> Check | None:
+    """One slice's `probe:` mapping → validated Check, {{tokens}} substituted from the
+    slice's values — same load-time substitution contract (and rationale) as
+    _parsed_verify."""
+    raw = d.get("probe")
+    if raw is None:
+        return None
+    values = d.get("values") or {}
+    if isinstance(raw, dict):
+        raw = {k: (_DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), v)
+                   if isinstance(v, str) else v)
+               for k, v in raw.items()}
+    check = parse_probe(raw, where=f"tasks.yaml entry {key!r} subtask {i} probe")
+    if check is not None and _DECL_TOKEN.search(check.arg):
+        raise ValueError(
+            f"tasks.yaml entry {key!r} subtask {i} probe: unresolved token in "
+            f"{check.kind} {check.arg!r} — add it to the subtask's values")
+    return check
+
+
+def _parsed_write_waiver(key: str, i: int, d: dict[str, Any]) -> bool:
+    """One slice's `allow_write_refusal:` → bool. A non-bool fails loud for the same
+    reason a bad `kind` does: silently ignoring the typo would re-fail the run for the
+    exact reason the declaration exists to prevent, and it would look like it worked."""
+    raw = d.get("allow_write_refusal", False)
+    if not isinstance(raw, bool):
+        raise ValueError(
+            f"tasks.yaml entry {key!r} subtask {i}: allow_write_refusal must be true or "
+            f"false, got {raw!r}")
+    return raw
+
+
+def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
+    """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
+    registry must be caught at load, not as a silent no-marker/no-prompt run."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"tasks.yaml entry {key!r} must be a mapping")
+    subtasks = None
+    if entry.get("subtasks"):
+        subtasks = tuple(
+            SubtaskDecl(prompt=str(d["prompt"]), values=d.get("values"),
+                        marker=d.get("marker"), postcondition=d.get("postcondition"),
+                        kind=d.get("kind"), tab_url=d.get("tab_url"),
+                        verify=_parsed_verify(key, i, d),
+                        probe=_parsed_probe(key, i, d),
+                        allow_write_refusal=_parsed_write_waiver(key, i, d))
+            for i, d in enumerate(entry["subtasks"])
+        )
+        for i, s in enumerate(subtasks):
+            # `kind` is the only mechanism now — decompose.node_kind reads the declaration
+            # and nothing else — so an unrecognised value must be LOUD. Before 2026-08-28 a
+            # typo fell through to wording inference and looked like it worked; today it
+            # would silently become a recorded action, which for a verification slice is
+            # exactly the bug the declaration exists to prevent.
+            if s.kind is not None and s.kind not in ("action", "judge"):
+                raise ValueError(
+                    f"tasks.yaml entry {key!r} subtask {i}: kind must be 'action' or "
+                    f"'judge', got {s.kind!r}"
+                    + (" — the 'loop' kind was removed on 2026-08-28; state a repeat with "
+                       "the repeat_click tool instead" if str(s.kind).lower() == "loop"
+                       else ""))
+            if s.tab_url is not None and not is_absolute_http_url(s.tab_url):
+                raise ValueError(
+                    f"tasks.yaml entry {key!r} subtask {i}: tab_url must be an absolute "
+                    f"http(s) URL, got {s.tab_url!r}")
+    # Collapse the YAML block-scalar line wrapping. task_id normalizes whitespace the
+    # same way, so re-wrapping a prompt in the file can never change its identity.
+    prompt = " ".join(str(entry.get("prompt") or "").split())
+    if subtasks:
+        # Declared slices are the single source of truth: the whole-task prompt is their
+        # join, so rewording a slice IS rewording the prompt (same identity semantics).
+        derived = " ".join(" ".join(_instantiated(s).split()) for s in subtasks)
+        if prompt and prompt != derived:
+            diverge = next((i for i, (a, b) in enumerate(
+                zip(prompt.split(), derived.split())) if a != b),
+                min(len(prompt.split()), len(derived.split())))
+            context_p = " ".join(prompt.split()[max(0, diverge - 3):diverge + 5])
+            context_d = " ".join(derived.split()[max(0, diverge - 3):diverge + 5])
+            raise ValueError(
+                f"tasks.yaml entry {key!r}: prompt and subtasks disagree around word "
+                f"{diverge}: prompt says '…{context_p}…' but the slices join to "
+                f"'…{context_d}…'. Drop the 'prompt:' key (it is derived from the "
+                f"slices) or fix the diverging slice.")
+        prompt = derived
+    if not prompt:
+        raise ValueError(
+            f"tasks.yaml entry {key!r} must have a non-empty 'prompt' or 'subtasks'")
+    return TaskSpec(
+        key=key,
+        prompt=prompt,
+        marker=entry.get("marker") or None,
+        assertions=entry.get("assertions"),
+        tags=tuple(str(t) for t in (entry.get("tags") or ())),
+        subtasks=subtasks,
+    )
+
+
+def load_tasks(path: str | Path | None = None) -> dict[str, TaskSpec]:
+    """Read the YAML registry -> {key: TaskSpec}, keys lowercased.
+
+    A missing file is an EMPTY registry, not an error — free-text prompts still run. A
+    malformed file or entry raises ValueError so the CLI fails before logging in.
+    """
+    p = Path(path) if path is not None else TASKS_FILE
+    if not p.exists():
+        return {}
+    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{p} must be a YAML mapping of task-key -> fields")
+    return {str(key).strip().lower(): _spec_from_entry(str(key).strip().lower(), entry)
+            for key, entry in data.items()}
 
 
 def resolve_task(raw: str) -> TaskSpec:
-    """Resolve --task input to a TaskSpec: a known key, or a free-text prompt (must contain a
-    space so a typo'd key is not silently run as a one-word prompt). Raises ValueError for an
-    unknown key so the CLI can print the known keys."""
+    """Resolve --task input to a TaskSpec: a key from tasks.yaml, or a free-text prompt
+    (must contain a space so a typo'd key is not silently run as a one-word prompt).
+
+    A free-text prompt gets NO marker: a new task may legitimately fire no create-write
+    (verification / read-only flows), and a guessed marker would force-fail an honest
+    success. Pass --marker <fragment> to enable the network gate for an ad-hoc write task.
+    Raises ValueError for an unknown key so the CLI can print the known keys.
+    """
+    tasks = load_tasks()
     key = raw.strip().lower()
-    if key in TASKS:
-        return TASKS[key]
+    if key in tasks:
+        return tasks[key]
     if " " in raw:
-        prompt = raw.strip()
-        return TaskSpec(key="adhoc", prompt=prompt, marker=_infer_marker(prompt))
+        return TaskSpec(key="adhoc", prompt=raw.strip(), marker=None)
+    known = ", ".join(sorted(tasks)) or f"(none — is {TASKS_FILE} missing?)"
     raise ValueError(
-        f"Unknown TASK key {raw!r}. Known keys: {', '.join(sorted(TASKS))}.\n"
+        f"Unknown TASK key {raw!r}. Known keys: {known}.\n"
         'Or pass a full prompt: --task "go to Bookkeeping module, ..."'
     )
 
 
-def select_tasks(selector: str) -> list[TaskSpec]:
-    """Expand a suite selector into TaskSpecs: 'all', 'tag:<tag>', or a comma-list of keys.
-    Raises ValueError for an unknown key/tag so the CLI can fail before logging in."""
-    sel = selector.strip().lower()
-    if sel == "all":
-        return list(TASKS.values())
-    if sel.startswith("tag:"):
-        tag = sel[len("tag:"):].strip()
-        specs = [t for t in TASKS.values() if tag in t.tags]
-        if not specs:
-            known = sorted({tag for t in TASKS.values() for tag in t.tags})
-            raise ValueError(f"No tasks tagged {tag!r}. Known tags: {', '.join(known)}.")
-        return specs
-    specs = []
-    for part in sel.split(","):
-        key = part.strip()
-        if not key:
-            continue
-        if key not in TASKS:
-            raise ValueError(f"Unknown task key {key!r}. Known keys: {', '.join(sorted(TASKS))}.")
-        specs.append(TASKS[key])
-    if not specs:
-        raise ValueError("Empty suite selector.")
-    return specs

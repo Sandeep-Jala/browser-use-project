@@ -46,95 +46,6 @@ def _result_to_dict(result: "RunResult") -> dict[str, Any]:
     return data
 
 
-def build_suite_report(summary: dict[str, Any], out_dir: Path) -> Path:
-    """Write suite.html (KPI row + one linked table row per task) into `out_dir`."""
-    out_path = Path(out_dir) / "suite.html"
-    out_path.write_text(_render_suite_html(summary), encoding="utf-8")
-    return out_path
-
-
-_SUITE_STATUS_BADGE = {
-    "PASS": "b-ok", "PASS*": "b-warn", "DONE": "b-warn",
-    "FAIL": "b-error", "ERROR": "b-error", "SKIPPED": "b-muted",
-}
-
-
-def _render_suite_html(summary: dict[str, Any]) -> str:
-    totals = summary.get("totals", {})
-    ok = summary.get("ok")
-    verdict = "PASS" if ok else "FAIL"
-    verdict_color = "var(--success)" if ok else "var(--error)"
-
-    p: list[str] = []
-    p.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>")
-    p.append(f"<title>Suite {_esc(summary.get('suite_id'))}</title>")
-    p.append(
-        "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap' rel='stylesheet'>"
-    )
-    p.append("<link href='https://fonts.googleapis.com/icon?family=Material+Icons' rel='stylesheet'>")
-    p.append(f"<style>{_CSS}</style>")
-    # The run-report CSS lays out a sidebar grid; the suite page is a single column.
-    p.append("<style>body{display:block;padding:32px;} .content-wrapper{max-width:1200px;margin:0 auto;}"
-             ".suite-table{width:100%;border-collapse:collapse;font-size:0.85rem;}"
-             ".suite-table th{text-align:left;color:var(--text-muted);font-size:0.72rem;"
-             "text-transform:uppercase;letter-spacing:0.06em;padding:10px 12px;"
-             "border-bottom:1px solid var(--border);}"
-             ".suite-table td{padding:10px 12px;border-bottom:1px solid var(--border);"
-             "vertical-align:top;}"
-             ".suite-table a{color:var(--primary);text-decoration:none;}"
-             ".suite-table a:hover{text-decoration:underline;}</style></head><body>")
-    p.append("<div class='content-wrapper'>")
-    p.append(
-        f"<div class='main-title' style='margin-bottom:6px;'>Suite Report "
-        f"<span class='badge {_SUITE_STATUS_BADGE['PASS' if ok else 'FAIL']}' "
-        f"style='font-size:0.8rem;vertical-align:middle;'>{verdict}</span></div>"
-    )
-    p.append(f"<div class='header-meta' style='margin-bottom:24px;'>"
-             f"<span>suite {_esc(summary.get('suite_id'))}</span>"
-             f"<span>selector: {_esc(summary.get('selector') or 'all')}</span>"
-             f"<span>{summary.get('duration_seconds', 0)}s</span></div>")
-
-    p.append("<div class='kpi-grid'>")
-    p.append(_kpi("checklist", totals.get("tasks", 0), "Tasks", "in this suite", "var(--text-main)"))
-    p.append(_kpi("check", totals.get("pass", 0), "Passed", "flow + assertions",
-                  "var(--success)" if not (totals.get("fail") or totals.get("error")) else "var(--text-main)"))
-    failures = (totals.get("fail", 0) + totals.get("error", 0) + totals.get("done", 0)
-                + totals.get("skipped", 0))
-    p.append(_kpi("report", failures, "Not Passed", "fail / error / done / skipped",
-                  "var(--error)" if failures else "var(--success)"))
-    p.append(_kpi("rule", totals.get("assertion_failures", 0), "Assertion Failures",
-                  "tasks with failed checks",
-                  "var(--error)" if totals.get("assertion_failures") else "var(--success)"))
-    p.append(_kpi("timer", f"{totals.get('tokens') or 0:,}" if totals.get("tokens") else "—",
-                  "LLM Tokens", f"${totals.get('cost') or 0:.4f}", "var(--primary)"))
-    p.append("</div>")
-
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>table_rows</span>"
-             " Tasks</div>")
-    p.append("<table class='suite-table'><tr><th>Task</th><th>Status</th><th>Mode</th>"
-             "<th>Duration</th><th>Assertions</th><th>Healed</th><th>Report</th></tr>")
-    for t in summary.get("tasks", []):
-        status = t.get("status", "?")
-        display = "PASS*" if status == "PASS" and t.get("assertions_ok") is False else status
-        badge = f"<span class='badge {_SUITE_STATUS_BADGE.get(display, 'b-muted')}'>{_esc(display)}</span>"
-        a = t.get("assertions") or {}
-        checks = (f"{a.get('passed', 0)}✓ {a.get('failed', 0)}✗"
-                  + (f" — {', '.join(a.get('failed_names', []))}" if a.get("failed") else ""))
-        healed = ", ".join(str(s) for s in t.get("healed_steps") or []) or "—"
-        if t.get("reauthored"):
-            healed = "re-authored"
-        link = (f"<a href='{_esc(t['report_html'])}'>report</a>"
-                if t.get("report_html") else "—")
-        error = f"<div class='obs-reason'>{_esc(str(t.get('error'))[:200])}</div>" if t.get("error") else ""
-        p.append(f"<tr><td><code>{_esc(t.get('key'))}</code>{error}</td><td>{badge}</td>"
-                 f"<td>{_esc(t.get('mode') or '—')}</td>"
-                 f"<td>{t.get('duration_seconds', 0)}s</td><td>{_esc(checks)}</td>"
-                 f"<td>{_esc(healed)}</td><td>{link}</td></tr>")
-    p.append("</table></div></div></body></html>")
-    return "".join(p)
-
-
 # --------------------------- HTML rendering ---------------------------
 
 _CSS = (Path(__file__).parent.parent / "templates" / "report_styles.css").read_text(encoding="utf-8")
@@ -188,13 +99,13 @@ def _render_html(result: "RunResult") -> str:
     if result.is_successful and getattr(result, "assertions_passed", None) is False:
         # The flow completed and saved, but telemetry assertions failed (5xx, console
         # errors, ...): a distinct state so a "green" run with an unhealthy app stands out.
-        status, ring, ring_color = "PASS*", "var(--warning)", "var(--warning)"
+        status, ring = "PASS*", "var(--warning)"
     elif result.is_successful:
-        status, ring, ring_color = "PASS", "var(--success)", "var(--success)"
+        status, ring = "PASS", "var(--success)"
     elif result.is_done:
-        status, ring, ring_color = "DONE", "var(--warning)", "var(--warning)"
+        status, ring = "DONE", "var(--warning)"
     else:
-        status, ring, ring_color = "FAIL", "var(--error)", "var(--error)"
+        status, ring = "FAIL", "var(--error)"
 
     p: list[str] = []
     p.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>")
@@ -283,8 +194,6 @@ def _render_html(result: "RunResult") -> str:
     p.append(f"<div class='detail-label'>Run ID</div><div class='detail-val'>{_esc(result.run_id)}</div>")
     p.append(f"<div class='detail-label'>Status</div><div class='detail-val'>{status} "
              f"(done={result.is_done}, success={result.is_successful})</div>")
-    final_url = result.urls[-1] if result.urls else None
-    p.append(f"<div class='detail-label'>Final URL</div><div class='detail-val'>{_esc(final_url)}</div>")
     if usage:
         tokens_detail = (
             f"{usage.get('total_tokens', 0):,} total — "
@@ -309,23 +218,21 @@ def _render_html(result: "RunResult") -> str:
                  " Agent Final Findings</div>"
                  f"<div class='result-box'>{findings}</div></div>")
 
+    # ---- Hybrid subtask segments (pipeline/hybrid.py) ----
+    p.append(_render_subtasks(getattr(result, "subtasks", None)))
+
     # ---- Ground-truth network check (did the record actually get saved?) ----
     p.append(_render_ground_truth(result.ground_truth))
 
     # ---- Telemetry assertions (pipeline/assertions.py) ----
     p.append(_render_assertions(assertion_results))
 
-    # ---- Judge verdict (browser-use's built-in judge) ----
-    p.append(_render_judgement(result.judgement, result.is_successful))
-
     # ---- UI & Accessibility scans (detect_layout_issues / run_accessibility_scan) ----
     p.append(_render_ui_scans(result.extracted_content))
 
-    # ---- Agent steps (per-step progress timeline) ----
-    p.append(_render_steps(result.steps, result.model_actions, result.n_steps))
+    # ---- Run video (--record) ----
+    p.append(_render_video(result))
 
-    # ---- Screenshots gallery ----
-    p.append(_render_screenshots(result.screenshots))
 
     # ---- Console logs ----
     p.append(_render_console(con))
@@ -364,15 +271,13 @@ def _render_html(result: "RunResult") -> str:
 def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
     """Render the network ground-truth check: was the record actually saved?
 
-    This is the objective counterweight to the agent's self-report and the LLM judge (both of
-    which can be fooled). When a create-write was expected but never hit the network, it flags
-    that the reported success was overridden to failure.
+    This is the objective counterweight to the agent's self-report (which can be fooled):
+    when a marker is configured, the run verdict itself requires this create-write.
     """
     if not ground_truth:
         return ""
     marker = ground_truth.get("marker")
     seen = ground_truth.get("create_write_seen")
-    overrode = ground_truth.get("overrode_success")
     if seen:
         icon, color, label, badge = "check", "var(--success)", "SAVED", "background:var(--success);color:#fff"
     else:
@@ -388,13 +293,57 @@ def _render_ground_truth(ground_truth: dict[str, Any] | None) -> str:
         f"<span class='obs-title'>Create-write to <code>{_esc(marker)}</code> seen in network</span>"
         f"<span class='badge' style='{badge}'>{label}</span></div>"
     )
-    if overrode:
-        p.append("<div class='obs-reason'><em>Note:</em> the run reported success but no matching "
-                 "create-write was sent — nothing was actually saved. <em>Reported success was "
-                 "overridden to FAIL.</em></div>")
-    elif not seen:
+    if not seen:
         p.append("<div class='obs-reason'>No matching create-write was sent during this run.</div>")
     p.append("</div></div></div>")
+    return "".join(p)
+
+
+def _render_subtasks(subtasks: list[dict[str, Any]] | None) -> str:
+    """Render a hybrid run's per-segment outcomes: one row per subtask with its mode
+    (library replay vs agent-authored), gate verdict, and cost."""
+    if not subtasks:
+        return ""
+    replayed = sum(1 for s in subtasks if s.get("mode") == "replay")
+    p: list[str] = []
+    p.append("<div class='section'><div class='section-title'>"
+             "<span class='material-icons' style='color:var(--primary)'>account_tree</span>"
+             f" Subtasks ({replayed} replayed / {len(subtasks) - replayed} authored)"
+             "</div><div class='obs-list'>")
+    for s in subtasks:
+        ok = s.get("ok")
+        if ok:
+            icon, color, label, badge = ("check", "var(--success)", "OK",
+                                         "background:var(--success);color:#fff")
+        else:
+            icon, color, label, badge = ("close", "var(--error)", "FAIL",
+                                         "background:var(--error);color:#fff")
+        gate = s.get("gate") or {}
+        detail = (f"{s.get('mode')} · {s.get('steps_executed', 0)} steps · "
+                  f"{s.get('duration_seconds', 0)}s · gate: {gate.get('kind', '—')}")
+        if s.get("tokens"):
+            detail += f" · {s['tokens']:,} tokens"
+        if s.get("healed_steps"):
+            detail += f" · healed {s['healed_steps']}"
+        p.append("<div class='obs-row'><div class='obs-head'>"
+                 f"<span class='material-icons' style='color:{color}'>{icon}</span>"
+                 f"<span class='obs-title'>{s.get('index')}. "
+                 f"{_esc((s.get('prompt') or '')[:120])}<br>"
+                 f"<span style='color:var(--text-muted)'>{_esc(detail)}</span></span>"
+                 f"<span class='badge' style='{badge}'>{label}</span></div>")
+        for c in gate.get("checks") or []:
+            mark = "✓" if c.get("ok") else "✗"
+            why = (c.get("evidence") if c.get("ok")
+                   else c.get("error") or c.get("evidence") or "not satisfied")
+            line = f"{mark} {c.get('kind')} \"{c.get('arg')}\" — {why}"
+            p.append(f"<div class='obs-reason'><code>{_esc(line[:300])}</code></div>")
+        for reason in gate.get("rollup") or []:
+            p.append(f"<div class='obs-reason'><code>{_esc(('✗ ' + str(reason))[:300])}"
+                     "</code></div>")
+        if s.get("error"):
+            p.append(f"<div class='obs-reason'><code>{_esc(str(s['error'])[:300])}</code></div>")
+        p.append("</div>")
+    p.append("</div></div>")
     return "".join(p)
 
 
@@ -432,43 +381,6 @@ def _render_assertions(assertion_results: list[dict[str, Any]]) -> str:
             p.append(f"<div class='obs-reason'><code>{_esc(line[:300])}</code></div>")
         p.append("</div>")
     p.append("</div></div>")
-    return "".join(p)
-
-
-def _render_judgement(judgement: dict[str, Any] | None, agent_success: Any) -> str:
-    """Render browser-use's built-in judge verdict, flagging agent-vs-judge disagreement."""
-    if not judgement:
-        return ""
-    verdict = judgement.get("verdict")
-    if verdict is True:
-        icon, color, label, badge = "check", "var(--success)", "PASS", "background:var(--success);color:#fff"
-    elif verdict is False:
-        icon, color, label, badge = "close", "var(--error)", "FAIL", "background:var(--error);color:#fff"
-    else:
-        icon, color, label, badge = "help", "var(--text-muted)", "N/A", "background:#1e293b;color:var(--text-muted)"
-
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>gavel</span>"
-             " Judge Verdict</div><div class='obs-list'><div class='obs-row'>")
-    p.append(
-        "<div class='obs-head'>"
-        f"<span class='material-icons' style='color:{color}'>{icon}</span>"
-        "<span class='obs-title'>Independent judge (browser-use)</span>"
-        f"<span class='badge' style='{badge}'>{label}</span></div>"
-    )
-    # Surface disagreement between the agent's self-report and the judge.
-    if verdict is False and agent_success is True:
-        p.append("<div class='obs-reason'><em>Note:</em> the agent reported success but the "
-                 "judge disagreed.</div>")
-    if judgement.get("failure_reason"):
-        p.append(f"<div class='obs-reason'><em>Failure reason:</em> "
-                 f"{_esc(judgement.get('failure_reason'))}</div>")
-    if judgement.get("reasoning"):
-        p.append(f"<div class='obs-reason'>{_esc(judgement.get('reasoning'))}</div>")
-    if judgement.get("reached_captcha"):
-        p.append("<div class='obs-reason'><em>⚠️ Captcha encountered during the run.</em></div>")
-    p.append("</div></div></div>")
     return "".join(p)
 
 
@@ -572,66 +484,24 @@ def _render_a11y_block(text: str) -> str:
     return "".join(p)
 
 
-def _render_steps(
-    steps: list[dict[str, Any]], model_actions: list[dict[str, Any]] | None, n_steps: int
-) -> str:
-    """Per-step progress timeline (the agent's own goal/eval per step). Falls back to the raw
-    action list if the timeline is unavailable."""
-    reached = len(steps) or n_steps
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons'>list</span> Agent Steps "
-             f"<span class='muted' style='font-weight:400; font-size:0.85rem'>"
-             f"(reached step {reached} of {n_steps})</span></div>")
-    if steps:
-        last = len(steps)
-        p.append("<div class='steps-table'>")
-        for s in steps:
-            n = s.get("n")
-            border = "border-left:3px solid var(--primary);" if n == last else ""
-            p.append(
-                f"<div class='step-row' style='align-items:start; {border}'>"
-                f"<div class='step-num'>#{_esc(n)}</div><div class='step-desc'>"
-                f"{_esc(s.get('next_goal') or '(no goal recorded)')}"
-            )
-            if s.get("evaluation"):
-                p.append(f"<div class='muted' style='font-size:0.78rem; margin-top:3px;'>"
-                         f"<em>eval:</em> {_esc(s.get('evaluation'))}</div>")
-            if s.get("url"):
-                p.append(f"<div class='req-url' style='margin-top:3px;'>{_esc(s.get('url'))}</div>")
-            p.append("</div></div>")
-        p.append("</div>")
-    elif model_actions:
-        p.append("<div class='steps-table'>")
-        for i, a in enumerate(model_actions, 1):
-            p.append(f"<div class='step-row'><div class='step-num'>#{i}</div>"
-                     f"<div class='step-desc'>{_esc(_action_label(a))}</div></div>")
-        p.append("</div>")
-    else:
-        p.append("<div class='result-box muted'>No steps recorded.</div>")
-    p.append("</div>")
-    return "".join(p)
+def _render_video(result: "RunResult") -> str:
+    """Player for the run's .mp4 (--record), or "" when the run wasn't recorded.
 
-
-def _render_screenshots(screenshots: list[str | None]) -> str:
-    shots = [(i + 1, s) for i, s in enumerate(screenshots) if s]
-    if not shots:
+    Referenced RELATIVELY: report.html and run.mp4 are written to the same run directory,
+    so the page stays portable if the folder is copied or zipped."""
+    video = (result.artifacts or {}).get("video")
+    if not video or not Path(video).exists():
         return ""
-    p: list[str] = []
-    p.append("<div class='section'><div class='section-title'>"
-             "<span class='material-icons' style='color:var(--primary)'>photo_camera</span>"
-             f" Screenshots <span class='muted' style='font-weight:400; font-size:0.85rem'>"
-             f"({len(shots)} captured)</span></div><div class='gallery'>")
-    for step, b64 in shots:
-        src = b64 if str(b64).startswith("data:") else f"data:image/png;base64,{b64}"
-        cap = f"Step {step}"
-        p.append(
-            f"<div class='shot-card' onclick='openShot(this)' data-cap='{cap}'>"
-            f"<img src='{src}' alt='{cap}' loading='lazy'>"
-            f"<div class='cap'>{cap}</div></div>"
-        )
-    p.append("</div></div>")
-    return "".join(p)
+    return (
+        "<div class='section'><div class='section-title'>"
+        "<span class='material-icons' style='color:var(--primary)'>movie</span>"
+        " Run Recording <span class='muted' style='font-weight:400; font-size:0.85rem'>"
+        "(time-lapse — the browser emits frames only when the page changes, so waits "
+        "between steps are skipped)</span></div>"
+        f"<video src='{_esc(Path(video).name)}' controls preload='metadata' "
+        "style='width:100%; max-width:1100px; border-radius:8px; background:#000'>"
+        "</video></div>"
+    )
 
 
 def _render_console(con: dict[str, Any]) -> str:
@@ -732,16 +602,3 @@ def _render_network(net: dict[str, Any]) -> str:
     return "".join(p)
 
 
-def _action_label(action: dict[str, Any]) -> str:
-    """Turn a model action dict into a short readable label."""
-    if not isinstance(action, dict):
-        return str(action)
-    # actions look like {"<action_name>": {..params..}, "interacted_element": ...}
-    for key, val in action.items():
-        if key == "interacted_element":
-            continue
-        params = ""
-        if isinstance(val, dict):
-            params = ", ".join(f"{k}={v}" for k, v in val.items() if k != "interacted_element")
-        return f"{key}: {params}" if params else str(key)
-    return str(action)

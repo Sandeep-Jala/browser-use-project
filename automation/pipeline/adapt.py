@@ -7,15 +7,17 @@ parameter (one LLM call: fill step 13 types "5" → param "qty"), producing a te
      "params": {"client": "290 CREW LIMITED", "customer": "Suresh Gopi", "qty": "5", ...},
      "steps": [... fill values and value-bearing selectors carry {{param}} tokens ...]}
 
-When a new prompt later has no script of its own, `match_template()` (one LLM call) picks the
+When a new prompt later has no script of its own, `match_template()` picks the
 template with the same procedure and reads the new prompt's value for EVERY parameter into a
 dictionary; `instantiate()` then swaps the tokens. Because each token was placed at a specific
 step at parameterize time, substitution is purely mechanical and per-field — two fields that
 happen to share a value (two "5"s) are separate parameters and can never cross-contaminate,
 which is the weakness of diff-based old→new string replacement this replaces.
 
-The caller replay-validates the instantiated script against the network ground-truth gate
-before committing it (plus the inherited template) under the new prompt's own id.
+There is no pre-commit replay validation: a template is committed as soon as its authoring
+run passes the segment gate, and an instantiated script is judged by that same gate the
+moment it replays (hybrid.replay_segment). A wrong instantiation therefore fails its
+replays and the entry self-evicts (subtask_store.archive_if_failing).
 """
 from __future__ import annotations
 
@@ -82,6 +84,10 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
     def _field_key(step: dict[str, Any]) -> str | None:
         if step.get("field_id"):  # synthetic dropdown type-steps carry an explicit identity
             return str(step["field_id"])
+        if step.get("action") == "find_click":
+            # Semantic clicks are grouped by their label: retried find_clicks of the same
+            # target become one parameter.
+            return f"find_click:{step.get('text', '')}"
         selectors = step.get("selectors") or []
         for s in reversed(selectors):
             if s.startswith("xpath="):
@@ -91,9 +97,12 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
     groups: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for i, step in enumerate(steps):
-        if step.get("action") not in ("fill", "type"):
+        if step.get("action") not in ("fill", "select", "type", "find_click", "upload"):
             continue
-        value = str(step.get("value") if step.get("action") == "fill"
+        # An upload step's `value` is the file's BASENAME (compile drops the folder —
+        # files.UPLOADS_DIR is implied), which is exactly the string the prompt spells,
+        # so the standard verbatim-in-prompt lift rule applies.
+        value = str(step.get("value") if step.get("action") in ("fill", "select", "upload")
                     else step.get("text") or "").strip()
         if not value:
             continue
@@ -215,7 +224,7 @@ async def parameterize(prompt: str, steps: list[dict[str, Any]], llm: Any) -> di
             ]})
             continue
         if i in step_param:
-            if new_step.get("action") == "type":
+            if new_step.get("action") in ("type", "find_click"):
                 new_step["text"] = _token(step_param[i])
             else:
                 new_step["value"] = _token(step_param[i])
@@ -272,11 +281,11 @@ def _template_regex(template_prompt: str, params: dict[str, str]) -> re.Pattern 
 
 
 def match_template(
-    new_prompt: str, candidates: list[dict[str, Any]], llm: Any = None
+    new_prompt: str, candidates: list[dict[str, Any]]
 ) -> TemplateMatch | None:
     """Match `new_prompt` against recorded templates; None means no value-only match.
 
-    Fully deterministic (`llm` is accepted for API compatibility but unused): a candidate
+    Fully deterministic: a candidate
     matches iff the new prompt equals its recorded prompt with only parameter values swapped,
     and the values are read straight out of the alignment. An earlier LLM-based matcher was
     unreliable in both directions — it matched prompts whose changes the template could not
@@ -306,6 +315,74 @@ def match_template(
     return matches[0][0]
 
 
+def _has_text_scopes(selector: str) -> list[tuple[int, int]]:
+    """The (start, just-past-the-close-paren) span of every `:has-text(...)` in `selector`.
+    Quote- and nesting-aware, because a row's text can itself contain parentheses."""
+    spans: list[tuple[int, int]] = []
+    marker, i = ":has-text(", 0
+    while (j := selector.find(marker, i)) >= 0:
+        k, depth, quote = j + len(marker), 1, ""
+        while k < len(selector) and depth:
+            c = selector[k]
+            if quote:
+                if c == "\\":
+                    k += 1
+                elif c == quote:
+                    quote = ""
+            elif c in "\"'":
+                quote = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            k += 1
+        spans.append((j, k))
+        i = k
+    return spans
+
+
+def _token_names_the_target(raw_selectors: list[str], token: str) -> bool:
+    """Does `{{token}}` identify the element these selectors ACT ON, rather than only the
+    row they are scoped to?
+
+    The single-token stamp below reads a click's lone parameter as "the element NAMED
+    <value>" and makes _resolve verify the landed element against it. That is right when
+    the token names the target (`role=link[name="{{business}}"]` — the FOOD LIMITED /
+    FUNFOOD LIMITED wrong-row bug it was built for) and WRONG when the token sits in a
+    `:has-text(...)` ROW SCOPE with a descendant part after it: there the value names the
+    row and the target is deliberately anonymous. Run 20260828_153xxx died exactly there —
+    `[role="row"]:has-text("Preston Alexander") div[data-automationid="DetailsRowCheck"]`
+    resolved to the ONE correct checkbox and the stamp then rejected it, because a Fluent
+    DetailsRowCheck div carries no readable name at all. The scope is already the wrong-row
+    guard (see script_compile._is_row_scoped, which denies that selector family the
+    ambiguity concession for the same reason), so no name gate is owed on top of it.
+
+    One occurrence anywhere that names the target is enough to keep the stamp: a candidate
+    ladder that mixes `... :has-text("{{x}}") button` with `role=link[name="{{x}}"]` still
+    needs the gate for the second candidate's sake.
+    """
+    needle = "{{%s}}" % token
+    for sel in raw_selectors:
+        scopes = _has_text_scopes(sel)
+        start = 0
+        while (p := sel.find(needle, start)) >= 0:
+            start = p + len(needle)
+            in_row_scope = False
+            for a, b in scopes:
+                if not a < p < b:
+                    continue
+                tail = sel[b:]
+                # A descendant part after the scope means the target lives INSIDE the
+                # matched row. A chained pseudo-class (`:visible`) still targets the row.
+                if tail.strip() and (tail[:1].isspace()
+                                     or tail.lstrip()[:1] in (">", "+", "~")):
+                    in_row_scope = True
+                    break
+            if not in_row_scope:
+                return True
+    return False
+
+
 def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[str, Any]] | None:
     """Fill a template's {{param}} tokens from `values` (defaults fill the gaps).
 
@@ -330,12 +407,33 @@ def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[s
             new_step["value"] = _sub(new_step["value"], escape=False)
         if isinstance(new_step.get("text"), str):
             new_step["text"] = _sub(new_step["text"], escape=False)
+            if new_step.get("action") == "find_click" and _TOKEN.search(step["text"]):
+                # The click's text IS an instantiated value: the semantic replay must
+                # refuse a wrong-named best match (see _find_click verify_name).
+                new_step["verify_name"] = True
+        if isinstance(new_step.get("expect_text"), str):
+            # A compile-time landed-name guard the parameterizer may have tokenized;
+            # raw value — it is compared against rendered text, not used as a selector.
+            new_step["expect_text"] = _sub(new_step["expect_text"], escape=False)
         if new_step.get("selectors"):
+            token_names = {m.group(1) for s in step.get("selectors") or []
+                           for m in _TOKEN.finditer(s)}
             new_step["selectors"] = [_sub(s, escape=True) for s in new_step["selectors"]]
+            if new_step.get("action") == "click" and len(token_names) == 1:
+                (name,) = token_names
+                if name in merged and _token_names_the_target(
+                        step.get("selectors") or [], name):
+                    # This click means "the element NAMED <value>" — selector fallbacks
+                    # (positional xpaths, stale hrefs) resolve confidently to the WRONG
+                    # row when the value changed (observed live: business FOOD LIMITED
+                    # clicked FUNFOOD LIMITED). _resolve verifies every acted-on
+                    # candidate against this value.
+                    new_step["expect_text"] = merged[name]
         steps.append(new_step)
 
     for step in steps:
-        leftovers = ([str(step.get("value", "")), str(step.get("text", ""))]
+        leftovers = ([str(step.get("value", "")), str(step.get("text", "")),
+                      str(step.get("expect_text", ""))]
                      + list(step.get("selectors") or []))
         if any(_TOKEN.search(text) for text in leftovers):
             logger.warning("unresolved template tokens in step %r; refusing to instantiate", step)

@@ -1,43 +1,41 @@
-"""Entry point: authenticate, then run each task through the Runner.
+"""Entry point: authenticate, then run each task through the hybrid subtask engine.
 
 login.py launches Chromium (CDP open) and logs in; the Runner attaches browser-use to that
 same browser per task. Telemetry (network/console) and an HTML report are produced per run.
 
-Replay-or-author is the default: a recorded task replays its selector script (fast, no LLM);
-a new one is authored by the agent and recorded. Pass --no-auto to force a plain agent run
-that ignores recordings, or --fresh to re-author a known task.
+Every task runs subtask-by-subtask (pipeline/hybrid.py): each subtask the shared library
+already knows replays from its recording with no LLM, and only the gaps are authored by the
+agent — then committed to the library so the next run replays them too. --fresh re-authors
+every subtask; --reauthor re-authors only the ones you name.
 
-Task selection: --task <key from automation.tasks.TASKS> (or a full free-text prompt), also
-settable via the TASK env var.
+Task selection: --task <key from tasks.yaml> (or a full free-text prompt), also settable via
+the TASK env var. Tasks are defined declaratively in tasks.yaml at the repo root.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import subprocess
-from datetime import datetime
+from functools import partial
 
 import psutil
 
 from playwright.async_api import async_playwright
 
 from automation.browser.login import login
-from automation.pipeline import adapt
+from automation.browser.session import launch_session
 from automation.pipeline import assertions as asserts
+from automation.pipeline import files as pfiles
 from automation.collectors.console import ConsoleCollector
 from automation.collectors.network import NetworkCollector
 from automation.config import Config
 from automation.llm import build_expander_llm
-from automation.pipeline import task_store as ts
 from automation.pipeline.agent_tools import build_tools
+from automation.pipeline.hybrid import run_hybrid_task
 from automation.pipeline.prompts import SPEED_OPTIMIZATION_PROMPT
 from automation.pipeline.report import build_report
 from automation.pipeline.runner import Runner
-from automation.pipeline.script_compile import promote_healed, save_steps
-from automation.pipeline.suite import run_suite
-from automation.tasks import resolve_task, select_tasks
+from automation.tasks import resolve_task
 
 log = logging.getLogger("framework.main")
 
@@ -57,235 +55,28 @@ def _kill_stale_browser(port: int) -> None:
         pass
 
 
-async def _save_template(tid: str, task: str, steps: list, llm) -> None:
-    """Best-effort: parameterize a just-committed golden script into <tid>.template.json
-    (values bound to named params, e.g. customer/qty/unit_price) so future prompts that only
-    change values can reuse it via _try_adaptation. Never blocks the run on failure."""
-    try:
-        template = await adapt.parameterize(task, steps, llm)
-        if not template:
-            return
-        adapt.save_template(ts.template_path(tid), template)
-        ts.update_manifest(tid, task, params=template["params"])
-        print(f"[*] task {tid}: template saved — params: "
-              f"{json.dumps(template['params'])}")
-    except Exception as exc:  # noqa: BLE001 - a template is a bonus, not a requirement
-        log.warning("could not save template for %s: %s", tid, exc)
+async def run_task(runner: Runner, task: str, fresh: bool, marker: str | None, spec=None,
+                   redecompose: bool = False, reauthor: str | None = None):
+    """Execute `task` through the hybrid subtask engine — the only execution path.
 
+    Every run goes subtask-by-subtask (pipeline/hybrid.py): a subtask the library knows
+    replays with no LLM, a miss is authored by the agent and committed to the library. A
+    failed replay hands the same live page to the agent for in-place recovery.
 
-async def _try_adaptation(runner: Runner, task: str, tid: str, script_path, marker: str):
-    """Template tier: match `task` against recorded templates, fill each template parameter
-    with the value read from the new prompt, and replay the instantiated script. Returns the
-    RunResult if the replay passed the ground-truth gate (script + inherited template
-    committed under `tid`), else None so the caller falls back to agent authoring."""
-    if runner.expander_llm is None:
-        return None
-    candidates = [
-        {"id": t, "prompt": entry["prompt"], "params": entry["params"]}
-        for t, entry in ts.load_manifest().items()
-        if t != tid and entry.get("prompt") and entry.get("params")
-        and ts.template_path(t).exists()
-    ]
-    if not candidates:
-        return None
-
-    print(f"[*] task {tid}: no exact script — matching against "
-          f"{len(candidates)} recorded template(s)...")
-    match = adapt.match_template(task, candidates)
-    if match is None:
-        print(f"[*] task {tid}: no template match -> authoring")
-        return None
-
-    tmp_path = script_path.with_suffix(".tmp.json")
-    try:
-        template = adapt.load_template(ts.template_path(match.source_tid))
-        new_steps = adapt.instantiate(template, match.values)
-        if new_steps is None:
-            print(f"[*] task {tid}: match left template params unresolved -> authoring")
-            return None
-        changed = {k: v for k, v in match.values.items()
-                   if template["params"].get(k) != v}
-        tmp_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path.write_text(json.dumps(new_steps, indent=2))
-        print(f"[*] task {tid}: instantiated template {match.source_tid} with "
-              f"{json.dumps(changed) if changed else 'unchanged values'} -> validating replay...")
-        result = await runner.run_script(tmp_path, success_marker=marker)
-        if result.is_successful:
-            os.replace(tmp_path, script_path)
-            # Persist heals into the just-committed script. The TEMPLATE is deliberately not
-            # rewritten: templates tokenize values, not selectors, and _try_adaptation
-            # replay-validates every instantiation anyway.
-            _promote_heals(tid, task, script_path, result)
-            # The new task inherits the template: same tokenized steps, its own defaults.
-            new_params = {**template["params"],
-                          **{k: v for k, v in match.values.items() if k in template["params"]}}
-            adapt.save_template(ts.template_path(tid), {
-                "source_prompt": task, "params": new_params, "steps": template["steps"],
-            })
-            ts.update_manifest(tid, task, steps=len(new_steps),
-                               adapted_from=match.source_tid, params=new_params)
-            print(f"[*] task {tid}: adapted replay PASSED -> committed "
-                  f"{len(new_steps)}-step golden script + template")
-            return result
-        print(f"[*] task {tid}: adapted replay FAILED ({result.final_result}) "
-              f"-> falling back to authoring")
-        tmp_path.unlink(missing_ok=True)
-        return None
-    except Exception as exc:  # noqa: BLE001 - adaptation must never block the authoring path
-        log.exception("adaptation error for %s: %s", tid, exc)
-        print(f"[*] task {tid}: adaptation error: {exc} -> falling back to authoring")
-        tmp_path.unlink(missing_ok=True)
-        return None
-
-
-async def _reset_app_state(runner: Runner) -> None:
-    """Best-effort reset between runs on the same browser: navigate the driven page back to
-    the app origin (an SPA reload clears stuck modals/flyouts a failed replay can leave
-    behind) and close extra tabs so run_script's "first non-blank page" pick stays
-    deterministic. Never raises — a reset failure just means the next run starts dirtier."""
-    from urllib.parse import urlsplit
-    try:
-        pw_browser = await runner.playwright.chromium.connect_over_cdp(runner.cdp_url)
-        try:
-            pages = [p for ctx in pw_browser.contexts for p in ctx.pages]
-            real_pages = [p for p in pages if p.url != "about:blank"]
-            keep = real_pages[0] if real_pages else (pages[0] if pages else None)
-            if keep is None:
-                return
-            for p in pages:
-                if p is not keep:
-                    await p.close()
-            parts = urlsplit(runner.config.login_url)
-            await keep.goto(f"{parts.scheme}://{parts.netloc}",
-                            wait_until="domcontentloaded", timeout=15000)
-            await keep.wait_for_timeout(1000)
-        finally:
-            await pw_browser.close()  # detach CDP; the login-owned browser stays alive
-    except Exception as exc:  # noqa: BLE001 - reset is best-effort by contract
-        log.warning("app-state reset failed: %s", exc)
-
-
-def _promote_heals(tid: str, task: str, script_path, result) -> None:
-    """Persist any fingerprint healings a SUCCESSFUL replay used into the golden script, so
-    the next replay resolves directly instead of re-healing (or eventually failing). Only
-    ever called on a passed run — a failed replay must never rewrite its script."""
-    log_entries = (result.replay or {}).get("log") or []
-    if not any(e.get("healed") for e in log_entries):
-        return
-    try:
-        promoted = promote_healed(script_path, log_entries)
-        if promoted:
-            ts.update_manifest(tid, task,
-                               healed=datetime.now().isoformat(timespec="seconds"),
-                               healed_steps=promoted)
-            print(f"[*] task {tid}: promoted healed selectors into steps {promoted}")
-    except Exception as exc:  # noqa: BLE001 - promotion is a bonus; the run already passed
-        log.warning("heal promotion failed for %s: %s", tid, exc)
-
-
-async def run_task(runner: Runner, task: str, auto: bool, fresh: bool, marker: str,
-                   fallback: bool = True):
-    """Replay the task's compiled script if one exists (AUTO), else author + validate + commit.
-
-    With `fallback` (default), a broken golden-script replay archives the script and
-    re-authors the task with the agent instead of failing the run — the app changed, so the
-    recording is stale by definition. `--no-fallback` keeps the failure as the result.
+    `fresh` re-authors (and re-records) EVERY subtask, ignoring the library. `reauthor` names
+    subtasks — indexes and/or prompt substrings — to re-author while the rest still replay.
     """
-    if not auto:
-        result = await runner.run(task, max_steps=90, success_marker=marker)
-        result.mode = "agent"
-        return result
-
-    tid = ts.task_id(task)
-    script_path = ts.steps_path(tid)
-    if script_path.exists() and not fresh:
-        print(f"[*] task {tid}: script found -> fast run (no LLM)")
-        result = await runner.run_script(script_path, success_marker=marker)
-        result.mode = "replay"
-        if result.is_successful:
-            _promote_heals(tid, task, script_path, result)
-            return result
-        if not fallback:
-            return result
-        # Broken replay: keep its report as evidence, retire the stale script, and re-author
-        # from scratch. From scratch (not resume-from-failed-step): the page is mid-flow with
-        # a half-filled form, and only a whole run can pass the ground-truth gate honestly.
-        build_report(result)
-        print(f"[*] task {tid}: replay FAILED ({result.final_result}) -> archiving script "
-              f"and re-authoring with the agent")
-        archived = ts.archive_script(tid)
-        for path in archived:
-            print(f"[*] task {tid}: archived {path}")
-        ts.update_manifest(
-            tid, task,
-            reauthored=datetime.now().isoformat(timespec="seconds"),
-            reauthor_count=ts.load_manifest().get(tid, {}).get("reauthor_count", 0) + 1,
-        )
-        await _reset_app_state(runner)
-        result = await _author_and_commit(runner, task, tid, marker)
-        result.mode = "replay_failed->authored"
-        return result
-
-    # No exact script: before paying for a full agent authoring run, try adapting a recorded
-    # task that is the same procedure with different values (one cheap LLM call + a replay).
-    # FRESH skips this tier too — it means "re-author, period". (No fallback wrapper here:
-    # a failed adaptation already falls through to authoring inside _try_adaptation's caller.)
-    if not fresh:
-        adapted = await _try_adaptation(runner, task, tid, script_path, marker)
-        if adapted is not None:
-            adapted.mode = "adapted"
-            return adapted
-
-    return await _author_and_commit(runner, task, tid, marker)
+    return await run_hybrid_task(runner, task, spec=spec, marker=marker, fresh=fresh,
+                                 redecompose=redecompose, reauthor=reauthor)
 
 
-async def _author_and_commit(runner: Runner, task: str, tid: str, marker: str):
-    """Author the task with the agent (recording it), then compile + commit the golden
-    script and its template if the run passed the ground-truth gate."""
-    print(f"[*] task {tid}: authoring with the agent (recording it)")
-    # 90 steps: with max_actions_per_step=1 every fill/click is its own step, so a full create
-    # task legitimately needs ~35-40 steps; 90 leaves room to recover from missteps (run
-    # 20260710_094628 hit the old 60-step ceiling mid-form). The ground-truth gate still
-    # decides success, so a longer leash can't fake a pass.
-    result = await runner.run(
-        task, max_steps=90, record_path=ts.recording_path(tid), success_marker=marker
-    )
-    result.mode = "authored"
-    gt = result.ground_truth or {}
-    if not result.is_successful and not gt.get("create_write_seen"):
-        print(f"[*] task {tid}: run did not succeed (no create-write) -> NOT recording a script")
-        return result
-
-    # Rescue path: the agent reported failure, but the network says the record WAS saved
-    # (e.g. it flailed on a follow-up form after an unnoticed successful save). Compile the
-    # recording anyway, truncated at the step the create-write fired on, so the post-save
-    # flailing never reaches the script.
-    truncate_at = None
-    if not result.is_successful:
-        truncate_at = gt.get("write_step")
-        print(f"[*] task {tid}: agent reported failure but the create-write DID fire "
-              f"(step {truncate_at}) -> compiling anyway, truncated at that step")
-
-    # Author run passed the network ground-truth gate: compile and commit the golden script
-    # directly. (No proof-replay: the workflow is author once with the LLM, then replay with
-    # different values/names via the template tier — that first value-swapped replay is the
-    # real test, and a broken script simply fails there and can be re-authored with --fresh.)
-    try:
-        steps = save_steps(ts.recording_path(tid), script_path, max_steps=truncate_at)
-        n = len(steps)
-        ts.update_manifest(tid, task, steps=n)
-        print(f"[*] task {tid}: compiled {n} steps -> committed golden script")
-        await _save_template(tid, task, steps, runner.expander_llm)
-    except Exception as exc:  # noqa: BLE001 - compile failure must not crash the session
-        log.exception("compile error for %s: %s", tid, exc)
-        print(f"[*] task {tid}: compile error: {exc} -> golden script NOT saved")
-    return result
-
-
-async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | None = None,
-               fallback: bool = True) -> bool:
+async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
+               redecompose: bool = False, reauthor: str | None = None,
+               log_all_hosts: bool = False, record: bool = False) -> bool:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
+    if record:  # the flag turns recording ON; RECORD_VIDEO=true in .env is the standing way
+        config.record_video = True
     config.ensure_dirs()
     _kill_stale_browser(config.cdp_port)
 
@@ -296,38 +87,80 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
     task = spec.prompt
 
     # Resolve the ground-truth marker. --marker none/off disables the gate explicitly;
-    # otherwise the task's registry marker applies (resolve_task already inferred one for
-    # free-text prompts — including None for READ-ONLY tasks with no write verbs, which
-    # produce no create-write and must not be force-failed by the gate).
+    # --marker <fragment> enables it for a free-text prompt; otherwise the task's
+    # tasks.yaml marker applies. A task WITHOUT a marker (new/verification/read-only
+    # flows — free-text prompts never get one) runs with the gate disabled: it may
+    # legitimately fire no create-write, and the gate would force-fail an honest success.
     if success_marker and success_marker.strip().lower() in ("none", "off"):
         success_marker = None
     elif not success_marker:
         success_marker = spec.marker
     if success_marker is None:
-        print("[*] read-only task (or --marker none): network ground-truth gate disabled; "
-              "success comes from the agent + judge")
+        print("[*] no ground-truth marker (or --marker none): network gate disabled; "
+              "success comes from the segment gates")
+
+    # Files the prompt names ("upload X.csv ...") must exist NON-EMPTY in
+    # automation/uploads/ BEFORE login: the resolved absolute paths become the agent's
+    # upload_file allowlist. A bad path is worse than a failed run — observed live: a
+    # nonexistent relative path "uploaded" fine, then Save crashed the tab
+    # (RESULT_CODE_KILLED_BAD_MESSAGE) when the page tried to read it.
+    upload_files, file_problems = pfiles.resolve_prompt_files(task)
+    if file_problems:
+        raise SystemExit("[!] file reference(s) could not be resolved:\n    "
+                         + "\n    ".join(file_problems))
+    for f in upload_files:
+        print(f"[*] file for upload: {f} ({os.path.getsize(f):,} bytes)")
+
+    # Assertions judge the app under test only: scope defaults to the login URL's
+    # host, so helper-tab sites and third-party trackers can't fail a healthy run.
+    # A task's own `assertions.scope` (hosts list, or None = everything) overrides.
+    # Resolved BEFORE the Runner because the LOG CAPTURE uses the same scope: the
+    # collectors record only events produced by in-scope pages ("the app's logs"),
+    # and one shared derivation guarantees a captured-out entry can never be one an
+    # assertion rule needed. --log-all-hosts records everything (debugging a helper
+    # site itself); the assertions stay scoped either way.
+    defaults = dict(asserts.DEFAULT_SPEC)
+    scope_hosts = asserts.scope_hosts_for(config.login_url)
+    if scope_hosts:
+        defaults["scope"] = {"hosts": scope_hosts}
+    assert_spec = asserts.merge_spec(defaults, spec.assertions)
+    log_scope = None if log_all_hosts else (assert_spec.get("scope") or {}).get("hosts")
 
     async with async_playwright() as playwright:
-        browser, _page, cdp_url = await login(playwright, config)
+        # INVERTED handoff: browser-use launches and OWNS the browser (the session then
+        # classifies LOCAL — validated uploads, native download handling); login connects
+        # to it over CDP to authenticate. See browser/session.py.
+        session = launch_session(config, config.artifacts_dir / ".downloads_staging")
+        await session.start()
+        cdp_url = session.cdp_url
+        if not cdp_url:
+            raise SystemExit("[!] the agent browser exposed no CDP endpoint")
+        await login(playwright, config, cdp_url)
         print(f"[*] Login complete (CDP {cdp_url}) | model: {config.active_model} "
               f"vision={config.use_vision}")
 
-        expander_llm = build_expander_llm(config) if config.expand_prompt else None
+        # Always built: the subtask decomposer's LLM tier, the semantic router's verify
+        # tier, and adapt.parameterize all need this LLM (it is not optional the way the
+        # old prompt-expander was). NOT the end-of-run judge — that is off, see
+        # runner.py's use_judge=False.
+        expander_llm = build_expander_llm(config)
         try:
             runner = Runner(
                 cdp_url, config, playwright,
-                collector_factories=[NetworkCollector, ConsoleCollector],
+                session=session,
+                collector_factories=[
+                    partial(NetworkCollector, scope_hosts=log_scope),
+                    partial(ConsoleCollector, scope_hosts=log_scope),
+                ],
                 expander_llm=expander_llm,
-                expand_prompt=config.expand_prompt,
-                judge_llm=expander_llm,  # feeds browser-use's built-in end-of-run judge
                 extend_system_message=SPEED_OPTIMIZATION_PROMPT,
                 tools=build_tools(),  # custom actions the prompts call (escape hatches, UI scans)
+                available_files=upload_files,
             )
 
-            result = await run_task(runner, task, auto, fresh, success_marker,
-                                    fallback=fallback)
-            checks = asserts.apply(result, asserts.merge_spec(asserts.DEFAULT_SPEC,
-                                                              spec.assertions))
+            result = await run_task(runner, task, fresh, success_marker, spec=spec,
+                                    redecompose=redecompose, reauthor=reauthor)
+            checks = asserts.apply(result, assert_spec)
             paths = build_report(result)
             result.artifacts["report_html"] = paths["html"]
 
@@ -335,6 +168,14 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
             print(result.summary())
             if result.mode:
                 print(f"   mode: {result.mode}")
+            if result.subtasks:
+                print("   subtasks:")
+                for s in result.subtasks:
+                    status = "ok" if s.get("ok") else "FAIL"
+                    print(f"     {s['index']:>2}. {status:<5} {s.get('mode') or '—':<26} "
+                          f"{s.get('steps_executed', 0):>3} steps "
+                          f"{s.get('duration_seconds', 0):>6}s  "
+                          f"{(s.get('prompt') or '')[:60]}")
             if checks:
                 failed = [c for c in checks if c.passed is False]
                 print(f"   assertions: {'FAIL' if failed else 'pass'} "
@@ -343,16 +184,17 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
                       f"{sum(1 for c in checks if c.passed is None)} skipped)")
                 for c in failed:
                     print(f"     ✗ {c.name}: {c.detail}")
+            downloads = [d for s in (result.subtasks or [])
+                         for d in (s.get("downloads") or [])]
+            if downloads:
+                print(f"   downloads ({len(downloads)}) in "
+                      f"{result.artifacts_dir}/downloads/:")
+                for d in downloads:
+                    print(f"     ⬇ {d}")
             gt = result.ground_truth or {}
             if gt:
                 print(f"   ground truth: create-write to '{gt.get('marker')}' seen in network: "
-                      f"{gt.get('create_write_seen')}"
-                      + ("  (self-reported success OVERRIDDEN → FAIL)"
-                         if gt.get("overrode_success") else ""))
-            j = result.judgement or {}
-            if j:
-                verdict = {True: "PASS", False: "FAIL"}.get(j.get("verdict"), "N/A")
-                print(f"   judge: {verdict}{(' — ' + j['failure_reason']) if j.get('failure_reason') else ''}")
+                      f"{gt.get('create_write_seen')}")
             if result.usage:
                 print(f"   tokens: {result.usage.get('total_tokens')}  "
                       f"cost=${result.usage.get('total_cost', 0):.4f}")
@@ -360,115 +202,55 @@ async def main(task_raw: str, auto: bool, fresh: bool, success_marker: str | Non
             # Combined verdict for CI: the flow completed AND the telemetry was healthy.
             return bool(result.is_successful) and result.assertions_passed is not False
         finally:
-            await browser.close()
-
-
-async def main_suite(selector: str, auto: bool, fresh: bool, fallback: bool,
-                     continue_on_failure: bool) -> bool:
-    """Run a set of tasks on ONE login/browser and write a suite-level report.
-    Returns the CI verdict: every task PASS with assertions passing."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    config = Config.from_env()
-    config.ensure_dirs()
-    _kill_stale_browser(config.cdp_port)
-
-    try:
-        specs = select_tasks(selector)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from None
-    if fresh and selector.strip().lower() == "all":
-        raise SystemExit("--fresh with --suite all would re-author EVERY task (a long, "
-                         "token-heavy run). Name the tasks explicitly: "
-                         "--suite invoice,purchase --fresh")
-
-    async with async_playwright() as playwright:
-        browser, _page, cdp_url = await login(playwright, config)
-        print(f"[*] Login complete (CDP {cdp_url}) | model: {config.active_model} "
-              f"| suite: {len(specs)} task(s)")
-        expander_llm = build_expander_llm(config) if config.expand_prompt else None
-        try:
-            runner = Runner(
-                cdp_url, config, playwright,
-                collector_factories=[NetworkCollector, ConsoleCollector],
-                expander_llm=expander_llm,
-                expand_prompt=config.expand_prompt,
-                judge_llm=expander_llm,
-                extend_system_message=SPEED_OPTIMIZATION_PROMPT,
-                tools=build_tools(),
-            )
-
-            async def run_one(spec):
-                return await run_task(runner, spec.prompt, auto, fresh, spec.marker,
-                                      fallback=fallback)
-
-            async def reset():
-                await _reset_app_state(runner)
-
-            async def browser_alive() -> bool:
-                try:
-                    probe = await runner.playwright.chromium.connect_over_cdp(runner.cdp_url)
-                    await probe.close()
-                    return True
-                except Exception:  # noqa: BLE001 - any failure means the browser is gone
-                    return False
-
-            summary = await run_suite(
-                specs, run_one, selector=selector, artifacts_dir=config.artifacts_dir,
-                continue_on_failure=continue_on_failure, reset=reset,
-                browser_alive=browser_alive,
-            )
-        finally:
-            await browser.close()
-
-    totals = summary["totals"]
-    print("\n========== SUITE RESULT ==========")
-    for t in summary["tasks"]:
-        status = t["status"]
-        if status == "PASS" and t.get("assertions_ok") is False:
-            status = "PASS*"
-        line = f"  {t['key']:<24} {status:<8} {t.get('mode') or '—':<24} {t['duration_seconds']}s"
-        if t.get("error"):
-            line += f"  {str(t['error'])[:80]}"
-        print(line)
-    print(f"  {'-' * 60}")
-    print(f"  {totals['pass']} pass / {totals['fail']} fail / {totals['error']} error / "
-          f"{totals['done']} done / {totals['skipped']} skipped"
-          + (f" / {totals['assertion_failures']} with failed assertions"
-             if totals.get("assertion_failures") else ""))
-    print(f"  suite report: {summary['suite_html']}\n")
-    return bool(summary["ok"])
+            # The session owns the browser now (keep_alive only spans segments, not the
+            # process): kill closes Chromium itself.
+            try:
+                await session.kill()
+            except Exception as exc:  # noqa: BLE001 - teardown must never mask the verdict
+                log.debug("session kill at exit: %s", exc)
 
 
 def cli() -> None:
     """Synchronous console-script entry point (see [project.scripts] in pyproject.toml)."""
     import argparse
     parser = argparse.ArgumentParser(description="Run the automation framework tasks.")
-    parser.add_argument("--task", default=os.getenv("TASK", "invoice"), help="Task key or free-form prompt.")
-    parser.add_argument("--suite", default=os.getenv("SUITE", "").strip() or None,
-                        help="Run a task set instead of --task: 'all', 'tag:<tag>', or a "
-                             "comma-list of keys. Writes a suite report and exits non-zero "
-                             "unless every task passes.")
-    parser.add_argument("--continue-on-failure", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Suite mode: keep running after a failed task (default: on).")
-    # Replay-first by default: reuse a recorded script when one exists. Use --no-auto to
-    # force a plain agent run that ignores recordings.
-    parser.add_argument("--auto", action=argparse.BooleanOptionalAction, default=True, help="Replay a recorded script when one exists (default: on; use --no-auto to force a fresh agent run).")
-    parser.add_argument("--fresh", action="store_true", help="Force re-authoring, ignoring existing scripts.")
-    parser.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True,
-                        help="On a broken golden-script replay, archive the script and "
-                             "re-author with the agent (default: on).")
+    parser.add_argument("--task", default=os.getenv("TASK", "invoice"),
+                        help="Task key from tasks.yaml or a free-form prompt.")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Re-author AND re-record EVERY subtask, ignoring the library. "
+                             "The passing ones are committed back, so the next run replays "
+                             "them.")
     parser.add_argument("--marker", default=os.getenv("SUCCESS_MARKER", "").strip() or None,
                         help="Success marker URL fragment; pass 'none' to disable the "
-                             "network ground-truth gate (read-only tasks are auto-detected).")
+                             "network ground-truth gate. Tasks without a marker in "
+                             "tasks.yaml (and free-text prompts) already run with the "
+                             "gate disabled.")
+    parser.add_argument("--redecompose", action="store_true",
+                        help="Regenerate the task's cached subtask decomposition "
+                             "(the cache is otherwise immutable per prompt).")
+    parser.add_argument("--reauthor", default=None,
+                        help="Re-record specific subtasks with the LLM even though their "
+                             "library replay works — a comma-list of subtask indexes and/or "
+                             "prompt substrings (e.g. --reauthor 0 or --reauthor 'add "
+                             "estimate'). Other subtasks still replay; the entry is replaced "
+                             "only if the new recording passes its gate.")
+    parser.add_argument("--log-all-hosts", action="store_true",
+                        help="Record console/network telemetry from EVERY page. By default "
+                             "the logs are scoped to the app under test (same scope as the "
+                             "assertions), so helper-tab sites and their ad stacks stay out "
+                             "of the artifacts; use this when debugging a helper site "
+                             "itself.")
+    parser.add_argument("--record", action="store_true",
+                        help="Save an .mp4 of the run to artifacts/<run_id>/run.mp4. The "
+                             "capture is a TIME-LAPSE of the page viewport: the browser "
+                             "emits a frame only when the page changes, so the waits "
+                             "between LLM steps collapse and a long run becomes a short "
+                             "clip. Set RECORD_VIDEO_SIZE=1280x800 to cut the cost.")
     args = parser.parse_args()
 
-    if args.suite:
-        ok = asyncio.run(main_suite(args.suite, args.auto, args.fresh, args.fallback,
-                                    args.continue_on_failure))
-    else:
-        ok = asyncio.run(main(args.task, args.auto, args.fresh, args.marker,
-                              fallback=args.fallback))
+    ok = asyncio.run(main(args.task, args.fresh, args.marker,
+                          redecompose=args.redecompose, reauthor=args.reauthor,
+                          log_all_hosts=args.log_all_hosts, record=args.record))
     raise SystemExit(0 if ok else 1)
 
 
