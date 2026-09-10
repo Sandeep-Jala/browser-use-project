@@ -903,23 +903,15 @@ async def test_replay_finding_carries_into_later_agent_segments(stores, monkeypa
 # ------------------------------- noted-data consumers -------------------------------
 
 
-NOTED_PROMPT = ("open the generator and note the generated identity. "
-                "add employee using the noted generated name and save")
-NOTED_SPEC = TaskSpec(
-    key="noted", prompt=NOTED_PROMPT,
-    subtasks=(
-        SubtaskDecl(prompt="open the generator and note the generated identity."),
-        SubtaskDecl(prompt="add employee using the noted generated name and save"),
-    ),
-)
-
-
 
 
 async def test_noted_consumer_replays_when_nothing_was_noted_this_run(stores, monkeypatch):
-    """The dynamic gate is wording AND observations: with no upstream findings there is
-    nothing for the cached values to be stale against (and nothing the agent could
-    substitute either), so the zero-LLM replay stays."""
+    """Consumer WORDING alone must never force always-agent: with no upstream findings
+    there is nothing for the cached values to be stale against (and nothing the agent
+    could substitute either), so the zero-LLM replay stays.
+
+    This used to be framed as one half of a commit gate that read the wording; that gate
+    was unreachable from 2026-09-01 and removed on 2026-09-10. The behaviour stands."""
     prompt = "go to the section. add employee using the noted generated name and save"
     spec = TaskSpec(key="n2", prompt=prompt, subtasks=(
         SubtaskDecl(prompt="go to the section."),

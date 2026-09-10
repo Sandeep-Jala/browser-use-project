@@ -10,7 +10,6 @@ import pytest
 from automation.pipeline import adapt
 from automation.pipeline import hybrid
 from automation.pipeline import subtask_store as ss
-from automation.pipeline.decompose import consumes_noted_data
 from automation.pipeline.hybrid import (_bind_runtime_values, _binding_resolver,
                                         apply_json_path, learn_json_path,
                                         run_hybrid_task)
@@ -404,12 +403,13 @@ async def test_commit_binds_created_ref_and_next_run_replays_fresh(
 
 
 async def test_bound_entry_bypasses_noted_data_wording_net(stores, monkeypatch):
-    """The consumer-wording net ('the noted ref') forces always-agent for cached entries
-    — but a BOUND entry re-resolves its dynamic values from this run's data, so the net
-    stands down and the zero-LLM replay proceeds (fed by the producer's extract)."""
+    """A BOUND entry re-resolves its run-noted values from THIS run's data, so the
+    zero-LLM replay proceeds and types fresh values (fed by the producer's extract).
+
+    The contrast this was written against — a consumer-wording net that forced
+    always-agent — was removed on 2026-09-10; the binder is what keeps replays honest."""
     prompt = "go to the section. open the noted ref and verify it"
     consumer_prompt = "open the noted ref and verify it"
-    assert consumes_noted_data(consumer_prompt)   # the wording net does match
     spec = TaskSpec(key="net", prompt=prompt, subtasks=(
         SubtaskDecl(prompt="go to the section."),
         SubtaskDecl(prompt=consumer_prompt, marker="datarequests"),
@@ -648,26 +648,6 @@ def test_the_binder_matches_its_source_ignoring_case():
     assert rewritten[0]["value"] == "{{bound_1}}"
     assert bindings["bound_1"] == {"kind": "extract", "label": "town"}
     assert params["bound_1"] == "Hooton"
-
-
-def test_drop_unattributable_fills_removes_only_the_invented_values():
-    """Unit view of the 2026-08-24 gate relaxation: only the typed steps carrying an
-    unattributable value go; clicks, selects the task asked for, and every other fill
-    survive untouched."""
-    steps = [
-        {"action": "fill", "selectors": ["css=#first"], "value": "Paul"},
-        {"action": "fill", "selectors": ["css=#town"], "value": "HOOTON"},
-        {"action": "fill", "selectors": ["css=#county"], "value": "Merseyside"},
-        {"action": "type", "selectors": ["css=#note"], "text": "Merseyside"},
-        {"action": "select", "selectors": ["css=#cat"], "value": "A"},
-        {"action": "click", "selectors": ['text="Save"']},
-    ]
-    kept, dropped = hybrid._drop_unattributable_fills(steps, ["Merseyside"])
-    assert dropped == ["Merseyside", "Merseyside"]      # the fill AND the type
-    assert [s.get("value") or s.get("text") for s in kept] == [
-        "Paul", "HOOTON", "A", None]
-    # Nothing to drop is a no-op that returns the list unchanged.
-    assert hybrid._drop_unattributable_fills(steps, []) == (steps, [])
 
 
 # ---- a row gate's employee name is DATA the binder must see (2026-08-28) ----

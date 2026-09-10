@@ -47,91 +47,6 @@ _TOKEN = sstore.TOKEN_RE
 # after a 32-slice task silently ran as one blob). Raise this for the LLM's sake alone.
 MAX_SUBTASKS = 24
 
-# Verification wording that marks a subtask as a JUDGE node: its success is a judgment call
-# (compare/observe values), which does not survive compilation into a selector script — a
-# replayed judge segment would walk the clicks with nobody looking and report a hollow pass.
-# Judge nodes therefore always run with the LLM and are never committed to the library
-# (see hybrid.run_hybrid_task). Wording is matched on the TEMPLATE prompt (values lifted);
-# bare "note"/"check" are avoided: "credit note" is a record type and "check the option"
-# is a click, so only their verification phrasings match.
-_JUDGE_RE = re.compile(
-    r"\b(verify|verifies|confirm|ensure|validate|compare)\b"
-    r"|\bcheck (that|whether|if|it)\b"
-    r"|\bmake sure\b"
-    r"|\bsee (if|whether|that)\b"
-    r"|\bnote (the|down|it)\b"
-    r"|\bremember\b"
-    r"|\bcapture the\b",
-    re.IGNORECASE,
-)
-
-# Iteration wording that, COMBINED with a judge phrase, marks a LOOP node instead: an
-# imperative action repeated until a stated stop condition holds ("process employees one
-# at a time ... check that the next employee has loaded ... stopping as soon as X is
-# shown"). "keep"/"continue" count only with a following gerund ("continue clicking"), so
-# verification prose like "values keep their order" never matches.
-_LOOP_CUE_RE = re.compile(
-    r"\b(?:one at a time|at a time|each|until|stopping|(?:keep|continue)\s+\w+ing)\b",
-    re.IGNORECASE,
-)
-
-# Loop signature that needs NO judge phrase. The judge-first gate in node_kind misses
-# imperative rewrites ("keep repeating ... until X is shown") that carry no verification
-# vocabulary — observed 2026-08-05: the RTI employee loop reworded without "check that"
-# classified action, was committed to the library, and its frozen Save & Next replay
-# saved the stop-target employee. BOTH cues are required: "each"/"until"/"stopping"
-# alone are everyday action filler ("after each click", "wait until the page loads",
-# "stopping after the third click").
-_LOOP_REPEAT_RE = re.compile(
-    r"\b(?:at a time|repeat(?:ing|ed|s)?|for each|(?:keep|continue)\s+\w+ing)\b",
-    re.IGNORECASE,
-)
-_LOOP_STOP_RE = re.compile(
-    r"\b(?:until|as soon as|stop(?:ping|s)?)\b",
-    re.IGNORECASE,
-)
-
-# An exhaustion phrase carries BOTH cues at once, so it stands alone. "for all of the
-# REMAINING employees" states the repetition (all of them) and the stop condition (the set
-# depletes) in one breath, which is why the repeat+stop pair above misses it: it has no
-# repeat verb and no "until". Run 20260827_091313 subtask 8 compiled its eleven Next
-# clicks to ONE because of exactly this gap.
-#
-# Keyed on the DEPLETING SET ("remaining"), not on the quantifier, and it must follow an
-# iteration preposition. Two deliberate exclusions:
-#   - "Click Next for rest of the employees" stays an ACTION (test_node_kind_loop_detection
-#     pins that ruling to run 20260824_165824, where the slice bundled multi-step per-employee
-#     work); only "remaining" is read as exhaustion here.
-#   - a bare adjective ("tick the remaining periods checkbox") is not an iteration — without
-#     the preposition it never matches.
-_LOOP_EXHAUST_RE = re.compile(
-    r"\b(?:for|through|across)\s+(?:all|each|every|the)?\s*(?:of\s+)?(?:the\s+)?remaining\b",
-    re.IGNORECASE,
-)
-
-# A judge phrase that IS the subtask's head directive ("Verify that each filter...", "Then
-# check that entries do not repeat...") keeps the node a judge even when iteration cues
-# appear in WHAT it checks — only a leading imperative action with verification folded
-# inside ("Process ... and after each click check that ...") makes a loop.
-_LEADING_JUDGE_RE = re.compile(
-    r"^\s*(?:(?:and|then|now|next|first|finally|also|please)[,\s]+)*"
-    r"(?:verify|verifies|confirm|ensure|validate|compare|check|make sure|"
-    r"see (?:if|whether|that)|note|remember|capture)\b",
-    re.IGNORECASE,
-)
-
-# The VERIFICATION subset of _JUDGE_RE: verbs whose product is a COMPARISON the agent
-# performs, which is the one thing a recording can never replay. _JUDGE_RE's remaining
-# branches (note/remember/capture) say something weaker — carry this value forward — and
-# a compiled extract step does exactly that, live, every replay.
-_VERIFIES_RE = re.compile(
-    r"\b(verify|verifies|confirm|ensure|validate|compare)\b"
-    r"|\bcheck (that|whether|if|it)\b"
-    r"|\bmake sure\b"
-    r"|\bsee (if|whether|that)\b",
-    re.IGNORECASE,
-)
-
 
 def node_kind(template_prompt: str, marker: str | None,
               declared: str | None = None, tab_url: str | None = None) -> str:
@@ -139,9 +54,10 @@ def node_kind(template_prompt: str, marker: str | None,
     or "judge" (a verification, always live and never cached).
 
     Nothing here reads the prompt. Until 2026-08-28 four regex nets inferred kind and
-    cacheability from wording — `_JUDGE_RE` ("verify", "check that", even "note"),
-    `_NOTED_DATA_RE` ("the noted ..."), a leading "If", and producer phrasing — and each
-    could silently stop a segment being recorded. That cost real runs: "tick the Select
+    cacheability from wording — a judge net ("verify", "check that", even "note"), a
+    noted-data net ("the noted ..."), a leading "If", and producer phrasing — and each
+    could silently stop a segment being recorded. (Those nets and their two surviving
+    predicates were deleted on 2026-09-10; nothing reads wording for kind any more.) That cost real runs: "tick the Select
     Employee checkbox ... and click Verify" is a click sequence, not a verification, and it
     was held out of the library because the BUTTON is named Verify; a slice saying "the noted
     employee's name" re-authored every run at full LLM cost. The user's decision is that a
@@ -159,43 +75,6 @@ def node_kind(template_prompt: str, marker: str | None,
     return declared if declared in ("action", "judge") else "action"
 
 
-
-# Wording that CONSUMES data noted by an EARLIER subtask ("using the noted generated name
-# and address"). Such values exist only at run time, so a cached recording can only carry
-# the AUTHORING run's concrete ones (adapt.parameterize lifts only values the prompt spells
-# out) — replaying it types stale data into the app, and a marker gate would even bless the
-# save. The net is consumer-shaped on purpose: PRODUCER wording ("note the generated
-# identity; remember Name and Address") must NOT match, or the extract segments it labels
-# would lose their zero-LLM replay (replayed extracts re-read the live DOM — never stale).
-_NOTED_DATA_RE = re.compile(
-    # Determiner + participle: "the noted name", "these remembered values" — participles
-    # that unambiguously mean run-noted data. "generated"/"recorded"/"saved" are excluded
-    # here: "the generated identity" appears inside producer wording and "the recorded
-    # payment" is app-domain vocabulary.
-    r"\b(?:the|that|those|these|its|their)\s+"
-    r"(?:noted|remembered|captured|extracted|observed)\b"
-    # Usage word + determiner + participle: the ambiguous participles count only when the
-    # phrase says the data is being USED ("with the generated name", "enter the saved id").
-    r"|\b(?:using|use|with|from|for|enter|fill|add|type|paste|search)\s+"
-    r"(?:the|that|those|these)\s+"
-    r"(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)\b"
-    # Participle + back-reference adverb: "the name generated earlier", "values noted above".
-    r"|\b(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)\s+"
-    r"(?:earlier|previously|above|before)\b"
-    # Explicit cross-segment reference: "the title from the previous step/tab/search".
-    r"|\bfrom\s+the\s+(?:previous|prior|earlier|last)\s+"
-    r"(?:step|subtask|tab|page|site|search|result)s?\b"
-    # Relative-clause reference to a record an earlier segment made: "the employee which
-    # we added", "the request that was created" — its NAME/identity exists only at run
-    # time, so a cached pick can never carry it (observed live: the parameterizer bound
-    # the employee pick to the word "download", the only verbatim-checkable token left).
-    r"|\b(?:which|that|whom?)\s+(?:we|you|i|was|were)\s+(?:just\s+)?"
-    r"(?:added|created|generated|made|noted|saved)\b"
-    r"|\b(?:newly|just)[\s-](?:added|created|generated)\b",
-    re.IGNORECASE,
-)
-
-
 # Wording whose deliverable is a FILE DOWNLOAD ("select download, select PDF", "export to
 # Excel"). Such a subtask gets the authoritative download GATE (hybrid.segment_gate): the
 # segment passed iff a file actually arrived in its window — the click that triggers a
@@ -207,85 +86,6 @@ _DOWNLOAD_RE = re.compile(r"\b(download|export)\b", re.IGNORECASE)
 def downloads_file(template_prompt: str) -> bool:
     """True when the subtask's wording says it downloads/exports a file."""
     return bool(_DOWNLOAD_RE.search(template_prompt))
-
-
-# The noting INSTRUCTION itself ("note and remember exactly these details") — the
-# producer side of the noted-data flow.
-#
-# `copy` joined the verb list on 2026-08-25, when the copy_text tool made copying a real
-# CAPTURE (it stamps the extract channel, so the value lands in run_values like any other
-# noted fact). Before that, "click Get OTP, copy the 6 digit number (OTP)" scored
-# produces_noted_data = False: the commit guard that refuses to cache a producer whose
-# recording carries no capture step never ran, so a run that copied nothing would cache a
-# producer that notes nothing and leave every consumer's binding unresolvable. Measured
-# across the whole registry, this widening flips exactly that one slice and no consumer.
-_PRODUCES_NOTED_RE = re.compile(
-    r"\b(?:note|remember|capture|write|copy)\s+(?:and\s+\w+\s+)?(?:down\s+)?(?:exactly\s+)?"
-    r"(?:the|these|those|all|it)\b",
-    re.IGNORECASE,
-)
-
-
-# UNUSED BY THE PIPELINE since 2026-08-28. Kind and cacheability are declaration-only now
-# (see node_kind): nothing reads the prompt to decide them. These predicates and their
-# regexes are kept only because their direct tests still pin the wording rulings they took
-# many runs to get right — no production code path calls them. Safe to delete with those
-# tests; do not wire them back into a gate.
-def produces_noted_data(template_prompt: str) -> bool:
-    """True when the subtask's wording is the NOTING instruction — it captures a value
-    for later subtasks to consume.
-
-    Two callers, one meaning: node_kind treats such a slice as an ACTION (its replay is a
-    live extract, not a hollow assertion), and the commit guard in hybrid refuses to cache
-    one whose recording carries no extract step — a producer that noted only in prose
-    would replay silently, leaving its consumers to replay stale values instead.
-    """
-    return bool(_PRODUCES_NOTED_RE.search(template_prompt))
-
-# The UNAMBIGUOUS consumer signals of _NOTED_DATA_RE — everything except the
-# usage-word branch's ambiguous participles (generated/recorded/saved/copied), which
-# legitimately appear inside producer wording ("From the generated identity, note ...").
-_NOTED_UNAMBIGUOUS_RE = re.compile(
-    r"\b(?:the|that|those|these|its|their)\s+"
-    r"(?:noted|remembered|captured|extracted|observed)\b"
-    r"|\b(?:using|use|with|from|for|enter|fill|add|type|paste|search)\s+"
-    r"(?:the|that|those|these)\s+(?:noted|remembered|captured|extracted|observed)\b"
-    r"|\b(?:noted|remembered|captured|extracted|observed|generated|recorded|saved|copied)"
-    r"\s+(?:earlier|previously|above|before)\b"
-    r"|\bfrom\s+the\s+(?:previous|prior|earlier|last)\s+"
-    r"(?:step|subtask|tab|page|site|search|result)s?\b"
-    r"|\b(?:which|that|whom?)\s+(?:we|you|i|was|were)\s+(?:just\s+)?"
-    r"(?:added|created|generated|made|noted|saved)\b"
-    r"|\b(?:newly|just)[\s-](?:added|created|generated)\b",
-    re.IGNORECASE,
-)
-
-
-# UNUSED BY THE PIPELINE since 2026-08-28. Kind and cacheability are declaration-only now
-# (see node_kind): nothing reads the prompt to decide them. These predicates and their
-# regexes are kept only because their direct tests still pin the wording rulings they took
-# many runs to get right — no production code path calls them. Safe to delete with those
-# tests; do not wire them back into a gate.
-def consumes_noted_data(template_prompt: str) -> bool:
-    """True when the subtask's wording says it USES data noted by an earlier subtask.
-
-    The hybrid loop combines this with "did an earlier segment actually record findings
-    this run" to conclude that a library replay would type stale values: the segment then
-    runs with the agent (which receives the fresh observations) and is never committed.
-    Matched on the TEMPLATE prompt — the reference wording is procedure, not a value, so
-    the decomposer keeps it literal there.
-
-    A PRODUCER slice — one whose own wording is the noting instruction — does not count
-    unless it also carries an unambiguous consumer phrase: "From the generated identity,
-    note and remember these details" used to trip the usage-word branch on its own
-    opening and stopped the fakenamegenerator slice from ever replaying (2026-08-12).
-    """
-    if not _NOTED_DATA_RE.search(template_prompt):
-        return False
-    if _PRODUCES_NOTED_RE.search(template_prompt) \
-            and not _NOTED_UNAMBIGUOUS_RE.search(template_prompt):
-        return False
-    return True
 
 
 # Wording that opens with a conditional guard ("If you see an error ..., click Add

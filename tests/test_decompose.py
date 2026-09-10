@@ -412,51 +412,6 @@ def test_downloads_file_wording():
     assert not decompose.downloads_file("add invoice for customer {{customer}} and save")
 
 
-def test_consumes_noted_data_matches_consumers_not_producers():
-    # CONSUMER wording — the segment fills the app with run-noted values, so a cached
-    # replay would type the authoring run's stale ones (the observed Add Employee bug).
-    assert decompose.consumes_noted_data(
-        "Add Employee using the noted generated name and address, join date "
-        "{{join_date}}, NI number {{ni_number}}, and save")
-    assert decompose.consumes_noted_data("fill the form with the generated name")
-    assert decompose.consumes_noted_data("enter the id noted earlier into the search box")
-    assert decompose.consumes_noted_data("search for the title from the previous step")
-    assert decompose.consumes_noted_data("compare it with the remembered address")
-    # Relative-clause reference to a record an earlier segment created (the live case
-    # where the employee pick got parameterized to the word "download").
-    assert decompose.consumes_noted_data(
-        "Then go to pay forecast, search for employee which we added in the combobox "
-        "search employee, change pay from Dec-26 to {{pay}}, select download, select PDF")
-    assert decompose.consumes_noted_data("open the request that was created and verify")
-    assert decompose.consumes_noted_data("select the newly added employee")
-    # PRODUCER wording — its replayed extract re-reads the live DOM (never stale), so it
-    # must keep its zero-LLM replay.
-    assert not decompose.consumes_noted_data(
-        "Open a new tab, go to https://www.fakenamegenerator.com/ , set Name set to "
-        "{{name_set}} and Country to {{country}}, click Generate, and note the generated "
-        "identity; remember Name and Address")
-    assert not decompose.consumes_noted_data(
-        "search DuckDuckGo for {{query}} and note the title of the top result")
-    # Plain action wording and app-domain vocabulary stay replayable.
-    assert not decompose.consumes_noted_data(
-        "go to Payroll module, search and select {{business}} business name, "
-        "go to employee section")
-    assert not decompose.consumes_noted_data(
-        "add invoice for customer {{customer}} and click save")
-    assert not decompose.consumes_noted_data("open the recorded payment and click void")
-    # A PRODUCER slice — the wording IS the noting instruction — must not trip the
-    # usage-word branch on its own opening phrase ("From the generated identity ...").
-    # Observed live 2026-08-12: the fakenamegenerator slice classified consumer and
-    # stopped replaying whenever seg 0 authored (findings present).
-    assert not decompose.consumes_noted_data(
-        "Open a new tab and go to the generator site. From the generated identity, "
-        "note and remember exactly these details for use in all later steps: the "
-        "Name, the Gender (Male), the Address, and the Date of Birth.")
-    # ... but a slice that produces AND unambiguously consumes stays a consumer.
-    assert decompose.consumes_noted_data(
-        "note down the reference, then enter the noted name into the search box")
-
-
 JUDGE_PROMPT = "go to the reviews section. verify the mail is not sent"
 JUDGE_REPLY = json.dumps({"subtasks": [
     {"template_prompt": "go to the reviews section", "values": {}, "is_save_step": False},
@@ -625,26 +580,6 @@ def test_producer_wording_is_an_action_not_a_judge():
     assert decompose.node_kind(
         _IDENTITY_SLICE, None,
         tab_url="https://www.fakenamegenerator.com/gen-male-gd-uk.php") == "action"
-    assert decompose.produces_noted_data(_OTP_SLICE)
-    assert decompose.produces_noted_data(_IDENTITY_SLICE)
-
-
-def test_copy_wording_is_a_producer_now_that_copy_text_captures():
-    """2026-08-25: the OTP producer slice was reworded to "click Get OTP, copy the 6 digit
-    number (OTP)". `copy` was not a noting verb, so produces_noted_data returned False and
-    the commit guard that refuses to cache a producer whose recording carries no capture
-    step never ran — a run that copied nothing would have cached a producer that notes
-    nothing, leaving every consumer's binding unresolvable. copy_text stamps the same
-    extract channel extract_data does, so copying IS noting."""
-    copy_slice = ("Now go to Data Request, and on the top row (S.No. 1, the newest "
-                  "request) click the ref. no. to open the Payroll Review panel, and "
-                  "click Get OTP, copy the 6 digit number (OTP), close the review panel.")
-    assert decompose.produces_noted_data(copy_slice)
-    assert decompose.node_kind(copy_slice, None) == "action"
-    # A producer is still NOT a consumer without an unambiguous consumer phrase.
-    assert not decompose.consumes_noted_data(copy_slice)
-    # ...and the widening reaches only the noting shape: an ordinary click is untouched.
-    assert not decompose.produces_noted_data("click Save and close the dialog")
 
 
 def test_the_paste_consumer_slice_still_consumes():
@@ -654,8 +589,6 @@ def test_the_paste_consumer_slice_still_consumes():
     consumer = ("Now click on the external link button next to the ref. no, A new tab "
                 "will be open click Already have an OTP, paste the OTP from the previous "
                 "step into the first code box and click proceed Securely.")
-    assert decompose.consumes_noted_data(consumer)
-    assert not decompose.produces_noted_data(consumer)
     assert decompose.announces_new_tab(consumer)
     assert not decompose.is_conditional_guard(consumer)
     assert decompose.node_kind(consumer, None) == "action"
@@ -681,8 +614,9 @@ def test_a_marker_still_outranks_exhaustion_wording():
 
 
 # ---------------- kind is DECLARED, never inferred (2026-08-28) ----------------
-# Four regex nets used to read the prompt: _JUDGE_RE ("verify", "check that", even "note"),
-# a leading "If", producer phrasing, and _NOTED_DATA_RE ("the noted ..."). Each could
+# Four regex nets used to read the prompt: a judge net ("verify", "check that", even
+# "note"), a leading "If", producer phrasing, and a noted-data net ("the noted ..."). Each
+# was deleted on 2026-09-10, once nothing called them; these tests pin the absence. Each could
 # silently stop a segment being recorded — "tick the Select Employee checkbox ... and click
 # Verify" was held out of the library because the BUTTON is named Verify. These tests pin
 # the ABSENCE of that inference, which is the guarantee now.

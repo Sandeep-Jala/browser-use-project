@@ -181,11 +181,6 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     # a "judge", that slice reworded into verification wording and stopped caching.
     assert [s.kind for s in subs] == ["action"] * 23
     assert subs[1].tab_url and "fakenamegenerator" in subs[1].tab_url   # aux producer
-    # The producer-override keeps the noting slice OUT of the consumer net; the two
-    # slices that USE the noted identity stay consumers (bindings-only replay).
-    assert not decompose.consumes_noted_data(subs[1].template_prompt)
-    assert decompose.consumes_noted_data(subs[2].template_prompt)
-    assert decompose.consumes_noted_data(subs[4].template_prompt)
     assert "download" in subs[6].template_prompt.lower()              # download subtask
     # The RTI half, back from the commented block: the probe-gated popup slice and the
     # probe-gated Submit-error slice are what make the pass deterministic, and the FPS

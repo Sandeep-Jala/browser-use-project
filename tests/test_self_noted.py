@@ -193,15 +193,18 @@ async def test_run_steps_fails_honestly_when_the_noted_value_is_missing():
 # ------------------------------- wiring: the commit path -------------------------------
 
 
-def test_commit_rewrites_a_self_noted_paste_before_the_provenance_guards_see_it():
-    """_bind_self_noted must run BEFORE the runtime-value legs: once the literal is a
-    token it is no longer an unattributable typed value, so the consumer gate stops
-    refusing the commit over the very value that is now bound."""
-    from automation.pipeline.hybrid import _unattributed_typed_values
+def test_commit_rewrites_a_self_noted_paste_into_a_token():
+    """_bind_self_noted must run BEFORE the runtime-value legs, so the literal the agent
+    pasted is already a {{noted:}} token by the time the commit path reads typed values.
 
-    steps, _ = _bind_self_noted([_copy("otp"), _paste("587923")], {"otp": "587923"})
+    This asserted the old consumer gate stopped refusing over that value; the gate was
+    unreachable from 2026-09-01 and removed on 2026-09-10, so it asserts the rewrite
+    itself — which is what the replay actually depends on."""
+    steps, bound = _bind_self_noted([_copy("otp"), _paste("587923")], {"otp": "587923"})
 
-    assert _unattributed_typed_values(steps, "paste the OTP from the previous step", []) == []
+    assert bound == ["otp"]
+    assert not any("587923" in str(s.get("text") or s.get("value") or "") for s in steps)
+    assert any("{{noted:otp}}" in str(s.get("text") or s.get("value") or "") for s in steps)
 
 
 # ------------------------------- the live failure, end to end -------------------------------
@@ -290,14 +293,12 @@ async def test_a_self_noted_slice_caches_even_when_the_run_has_findings(
     have an earlier finding (~240k tokens, 405s)."""
     from automation.pipeline import hybrid
     from automation.pipeline import subtask_store as ss
-    from automation.pipeline.decompose import consumes_noted_data
     from automation.pipeline.hybrid import run_hybrid_task
     from automation.tasks import SubtaskDecl, TaskSpec
     from tests.test_hybrid import FakeSession, _runner, _seg
 
     otp_prompt = ("click Get OTP, copy the 6 digit number (OTP), then paste the OTP "
                   "from the previous step into the first code box")
-    assert consumes_noted_data(otp_prompt)      # the consumer net does match
     prompt = "go to the section. " + otp_prompt
     spec = TaskSpec(key="otpf", prompt=prompt, subtasks=(
         SubtaskDecl(prompt="go to the section."),

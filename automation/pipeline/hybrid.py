@@ -29,11 +29,12 @@ slow-app retries. node_kind returns only "action" or "judge". A leading-"If" con
 guard (a slice that declares a `probe:`) also always runs live and uncommitted: a recording
 could only capture ONE branch. Observations flow FORWARD: each completed segment's finding
 (its distilled final result) is handed to every later agent segment, so a note-then-verify
-task can compare against what was actually observed instead of guessing. A segment that CONSUMES such
-observations ("add employee using the noted generated name") is the third routing rule:
-once this run has findings, it always runs as an agent segment — a cached replay could only
-type the authoring run's stale values — and is never committed (see the dynamic-input gate
-in run_hybrid_task).
+task can compare against what was actually observed instead of guessing. A segment that CONSUMES such observations ("add employee using the noted generated name")
+is committed like any other: the load-time binder lifts each run-noted value into a
+{{bound_N}} param and the replay re-resolves it from THIS run's data, so a cached replay
+types fresh values, not the authoring run's. (A stricter commit gate used to hold such
+segments out of the library entirely; it was superseded by that binder and removed on
+2026-09-10.)
 """
 from __future__ import annotations
 
@@ -654,7 +655,7 @@ class Segment:
     # probed successor (_waive_for_next_conditional).
     steps_ok: bool | None = None
     # Why this segment did NOT replay (None on replays): "fresh" | "reauthor" | "judge" |
-    # "conditional" | "probe_absent" | "dynamic" | "fallback" | "no_entry" |
+    # "conditional" | "probe_absent" | "fallback" | "no_entry" |
     # "identity_fork" | "values_unresolved". The answer to "why didn't it use the
     # recording?" without archaeology — surfaced in the report row and the run summary.
     # ("loop" was a value here until the kind was removed on 2026-08-28; old run JSON
@@ -1493,7 +1494,7 @@ def _findings_sourced_values(steps: list[dict[str, Any]], prompt: str,
     created by the authoring run baked into a find_click, so every replay clicked the
     PREVIOUS run's real row and only the marker gate stopped a wrong-record commit).
     Prompt-sourced values cache fine; agent-invented incidentals (a title pick, a dummy
-    county) also cache fine — only findings provenance marks the segment dynamic.
+    county) also cache fine — only findings provenance marks a value as runtime data.
 
     Typed values (fill/select/type) are checked against the findings verbatim — prompt
     prefixes included, since re-typing another segment's wording is just as stale.
@@ -1552,60 +1553,6 @@ def _step_value_candidates(steps: list[dict[str, Any]]) -> list[tuple[str, str]]
                 names.append(str(step["expect_text"]))
             out.extend((name, "click") for name in names)
     return out
-
-
-def _unattributed_typed_values(steps: list[dict[str, Any]], prompt: str,
-                               flagged: list[str]) -> list[str]:
-    """Typed values with NO provenance at all — absent from the prompt and not flagged
-    for binding. On a CONSUMER segment (wording uses noted data) these are refusal-grade:
-    a RE-FORMATTED runtime value ("October 25, 1971" typed as 25/10/1971) escapes the
-    substring guard entirely, and a baked literal would write the authoring run's data
-    into every later run's records (the DR021/DR022 wrong-record class). Only a commit
-    that accounts for every typed value is honest. Length floor 3 skips micro-picks
-    ("A", "Mr") that carry no identity."""
-    out: list[str] = []
-    for value, kind in _step_value_candidates(steps):
-        value = value.strip()
-        if kind != "typed" or len(value) < 3:
-            continue
-        if _NOTED_TOKEN.search(value):
-            # Already self-bound (_bind_self_noted): this step reads the live value an
-            # earlier step of the same recording captured, so it has the best provenance
-            # there is — it never types anything the run did not just observe.
-            continue
-        if value in flagged or value in out or _names_value(prompt, value):
-            continue
-        out.append(value)
-    return out
-
-
-def _drop_unattributable_fills(steps: list[dict[str, Any]], loose: list[str]
-                               ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Remove the typed steps carrying `loose` values, returning (steps, dropped labels).
-
-    An unattributable value is one NEITHER the task wording asked for NOR any observed
-    page data supplied — the agent invented it. The Add Employee form's optional County
-    field is the standing case: fakenamegenerator's address card has no county, so the
-    agent derives one from the postcode ("Merseyside" for L66, run 20260824_101412).
-
-    Baking that literal and trusting archive-on-failure does NOT self-correct: a wrong
-    county still saves, the create-write fires, the gate passes, and every later run
-    writes the authoring run's county forever. Dropping the step instead fails LOUDLY or
-    not at all — an optional field simply stays empty (the correct record), and a field
-    that turns out to be required makes the save fail, which archive_if_failing retires
-    after two consecutive misses so the next run authors a clean replacement."""
-    if not loose:
-        return steps, []
-    unwanted = {v.strip() for v in loose}
-    kept, dropped = [], []
-    for step in steps:
-        key = "text" if step.get("action") == "type" else "value"
-        value = str(step.get(key) or "").strip()
-        if step.get("action") in ("fill", "select", "type", "paste") and value in unwanted:
-            dropped.append(value)
-            continue
-        kept.append(step)
-    return kept, dropped
 
 
 def _body_sourced_values(steps: list[dict[str, Any]], task_wording: str,
@@ -1927,9 +1874,6 @@ def _sub_whole(text: str, literal: str, token: str) -> str:
 # filled (SkillApi.noted / script_compile.resolve_noted). It is not a param and not a
 # binding — there is nothing for the load path to resolve, so a self-noted entry replays
 # at zero tokens instead of authoring fresh every run.
-_NOTED_TOKEN = re.compile(r"\{\{noted:([A-Za-z0-9_]+)\}\}")
-
-
 def _bind_self_noted(steps: list[dict[str, Any]], extracted: dict[str, str],
                      ) -> tuple[list[dict[str, Any]], list[str]]:
     """Rewrite each typed value that equals a value THIS recording extracted at an EARLIER
@@ -2261,7 +2205,7 @@ async def _author_segment(
     findings: list[str] | None = None, commit: bool = True,
     run_values: dict[str, str] | None = None,
     start_url: str | None = None, start_title: str | None = None,
-    dynamic: bool = False, next_conditional: str | None = None,
+    next_conditional: str | None = None,
     replay_progress: dict[str, Any] | None = None,
 ) -> Segment:
     """Agent-author one subtask and commit it to the library when honest.
@@ -2456,37 +2400,6 @@ async def _author_segment(
                         or _extract_transform_spec(v, prior_sources) is not None:
                     runtime_values.append(v)
         sources = {**(run_values or {}), **(seg.extracted or {})}
-        if dynamic:
-            # The wording DECLARES consumption of noted data, so this commit is held to
-            # a stricter bar than the substring guard alone: every typed value must be
-            # prompt-sourced or flagged for binding, and there must be something to bind.
-            # An unattributable value may be runtime data the guard cannot see (a
-            # re-formatted date), and a consumer recording with no bindable value at all
-            # keeps the pre-bindings behavior: author fresh every run.
-            loose = _unattributed_typed_values(steps, task_wording, runtime_values)
-            if loose:
-                # User-approved 2026-08-24: DROP the invented value rather than refuse the
-                # whole commit over it. Refusing cost the Add Employee segment its entry on
-                # every run where the agent filled the optional County field (~300-480k
-                # tokens re-authoring); baking the literal instead would pass forever while
-                # writing the authoring run's county into every later employee. See
-                # _drop_unattributable_fills for why dropping is the self-correcting one.
-                steps, dropped = _drop_unattributable_fills(steps, loose)
-                if dropped:
-                    print(f"[*] segment [{sid}]: dropped unattributable typed value(s) "
-                          f"{', '.join(v[:32] for v in dropped[:3])} from the recording "
-                          f"(neither the task nor the page supplied them) -> replays with "
-                          f"those fields left as the form defaults them")
-            if not runtime_values and not self_noted:
-                # self_noted counts: those values ARE bound, just at step-execution time
-                # rather than at load time. Refusing over them sent the merged OTP slice
-                # back to the agent on every run that happened to carry an earlier
-                # finding (~240k tokens, 405s — run 20260826_091931).
-                sstore.steps_path(sid).unlink(missing_ok=True)
-                print(f"[*] segment [{sid}]: consumes noted data with no bindable runtime "
-                      f"value in the recording -> not cached; future runs author it with "
-                      f"their own fresh values")
-                return seg
         bound = None
         if runtime_values:
             bound = _bind_runtime_values(steps, runtime_values, sources, bodies)
@@ -2905,7 +2818,7 @@ async def run_hybrid_task(
                                 remaining=remaining, dirty=dirty, prior_failure=prior,
                                 findings=takeover_findings, run_values=run_values,
                                 start_url=raw_start_url,
-                                start_title=raw_start_title, dynamic=False,
+                                start_title=raw_start_title,
                                 next_conditional=next_conditional,
                                 replay_progress=progress)
                             seg.mode = "replay_failed->authored"
@@ -2965,7 +2878,6 @@ async def run_hybrid_task(
                                                 findings=findings, run_values=run_values,
                                                 start_url=raw_start_url,
                                 start_title=raw_start_title,
-                                                dynamic=False,
                                                 next_conditional=next_conditional,
                                                 # A fallback blob never commits: a whole-
                                                 # task recording replayed blind is the
