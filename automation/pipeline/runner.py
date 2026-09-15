@@ -11,6 +11,7 @@ replays on the same live page.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -30,6 +31,18 @@ from automation.collectors.base import Collector
 from automation.config import Config
 from automation.llm import build_llm
 from automation.pipeline import agent_tools
+# The operator control channel (pause / steer / stop from outside the process). It
+# lives in its own module because the REPLAY path consumes it too — see control.py.
+from automation.pipeline.control import (
+    CONTROL_FILENAME,
+    clear_control,
+    inject_override,
+    read_control,
+    reset_control,
+    service_control,
+    service_replay_control,
+    write_control,
+)
 # React-select's filter input regex, shared with the compiler/tools: typing there is
 # dropdown filtering, NOT a list search — the search-Enter nudge must never fire on it.
 from automation.pipeline.script_compile import _RS_FILTER_ID
@@ -334,6 +347,7 @@ def _inject_context(agent: Any, notice: str) -> bool:
         mm.add_new_task(notice)
         return True
     return False
+
 
 
 @dataclass
@@ -665,6 +679,14 @@ class Runner:
         # next step boundary so we never interrupt an action mid-flight.
         pause_state = {"requested": False}
 
+        # The TTY-free twin of that Ctrl+C: one file, at a path fixed for the whole install, so
+        # an operator (or a UI) can pause/steer/stop a run they are not sitting in front of.
+        # Cleared here — a command left behind by a previous segment must never hold this one.
+        control_path = self.config.artifacts_dir / CONTROL_FILENAME
+        # Quietly, not reset_control: the task start already announced the channel once, and
+        # re-printing its instructions per segment is noise in the log an operator is reading.
+        clear_control(control_path)
+
         def _on_sigint(_signum: int, _frame: Any) -> None:
             if pause_state["requested"]:
                 # A pause is already queued and they hit Ctrl+C again → abort the whole run.
@@ -752,6 +774,9 @@ class Runner:
             if pause_state["requested"]:
                 pause_state["requested"] = False
                 self._prompt_and_inject(_agent)
+            # Same boundary, no TTY required. Serviced AFTER the Ctrl+C prompt so an operator
+            # holding the terminal stays in charge of their own pause.
+            await service_control(_agent, control_path)
 
         # Own SIGINT for the duration of the run so Ctrl+C opens the override prompt instead of
         # killing the process (browser-use's own handler is off via enable_signal_handler=False).
@@ -827,9 +852,8 @@ class Runner:
         override marker the system prompt documents. Empty input resumes; Ctrl+C / EOF at the
         prompt stops the run.
 
-        Injection goes through the message manager's add_new_task — the same primitive
-        Agent.add_new_task delegates to — rather than Agent.add_new_task itself, because the
-        latter recreates the agent's event bus, which is unsafe to do mid-run.
+        The injection itself lives in `inject_override`, shared with the control-file channel
+        (`service_control`) so there is exactly ONE way a human instruction reaches the agent.
         """
         # Restore default SIGINT for the duration of the prompt so Ctrl+C raises KeyboardInterrupt
         # (lets the operator abort from the prompt), then put our handler back afterwards.
@@ -862,15 +886,8 @@ class Runner:
             print("▶️  Resuming.", flush=True)
             return
 
-        override = f":warning:  HUMAN OPERATOR OVERRIDE\n\n{user_input}"
-        try:
-            mm = getattr(agent, "_message_manager", None)
-            if mm is not None and hasattr(mm, "add_new_task"):
-                mm.add_new_task(override)
-            else:
-                agent.add_new_task(override)  # public fallback (recreates the event bus)
+        if inject_override(agent, user_input):
             print("✅ Instruction injected — the agent will act on it on the next step.", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("could not inject human instruction: %s", exc)
-            print(f"❌ Could not inject instruction: {exc}", flush=True)
+        else:
+            print("❌ Could not inject instruction (see the log).", flush=True)
 

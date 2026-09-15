@@ -1396,22 +1396,15 @@ payroll_client:
 
 payroll_client_2:
   tags: [payroll]
-  # Derived from the screen recording "testing part 2.mp4" (18-06-2026, client WI LTD):
-  # the reports/exports/e-mail pass over Pensions and Reports, the P11D and Additional FPS
-  # submissions, and the practice-level General Settings services. Two things the recording
-  # does are deliberately NOT here: creating a throwaway Proton mailbox (and setting the
-  # employee-portal password) to receive the employee-login invite, and reading the sent
-  # mail in Outlook — both are outside the app and neither is an action to automate.
   subtasks:
     - prompt: >-
-        Go to the Payroll module, search for and select the business name WI LTD, then go to
-        Pensions and open the Pension Assessment tab; set the tax year to 2026-27, the
+        Go to the Payroll module, search for and select the business name WI LTD
+    - prompt: >-     
+        Go to Pensions module, open the Pension Assessment tab; set the tax year to 2026-27, the
         frequency to Monthly and the period to Apr-26.
     - prompt: >-
         Tick the checkbox in the grid header row, to the left of Employee ID, to select every
-        employee at once, then click Export and choose PDF.
-    - prompt: >-
-        Then click Export again and choose CSV.
+        employee at once, then click Export and choose PDF.Then click Export again and choose CSV.
     - prompt: >-
         Then open the Employee Enrolment tab, set the scheme combobox to NEST PENSION, tick
         the header checkbox to the left of Employee to select every employee, and click
@@ -1421,14 +1414,16 @@ payroll_client_2:
         and the scheme to Aviva pension, tick the header checkbox to select every employee,
         and click Download CSV.
     - prompt: >-
-        Then go to Reports and open Payroll Summary; set Period to Monthly, the tax year to
-        2026-27, the from period to Apr-26, the to period to Mar-27 and the view combobox to
-        Summarised, then click Export and choose PDF.
-    - prompt: >-
-        Then change the view combobox from Summarised to Detailed, wait for the grid to
-        reload, and click Export and choose PDF again.
+        Then go to Reports and open Payroll Summary; Set Period, set next combobox to Monthly, 
+        the next combobox to 2026-27, the next combobox to Apr-26, the next combobox to Mar-27, 
+        and the view combobox to Summarised, then click Export and choose PDF.Then click Export again and choose CSV.
     - prompt: >-
         Then click Email; in the Send email panel that opens, open the From dropdown, select
+        the no-reply option, and click Send.
+    - prompt: >-
+        Then change the view combobox to Detailed, wait for the grid to reload, and click Export and choose PDF again.Then click Export again and choose CSV.
+    - prompt: >-
+        hen click Email; in the Send email panel that opens, open the From dropdown, select
         the no-reply option, and click Send.
     - prompt: >-
         Then go to Reports and open Payslips; set the frequency to Monthly and the period to
@@ -1436,141 +1431,143 @@ payroll_client_2:
         employee. Then click Download and choose Single / Zip, and once that file has
         arrived click Download again and choose Bulk.
     - prompt: >-
-        Then click the Adele Roberts row to open her 'Period - Apr-26' payslip preview
-        dialog; in that dialog open the format combobox to see the four payslip formats,
-        leave it on 'Format A (Acting Office)', click Download, and then close the dialog.
-    - prompt: >-
-        Then untick the header checkbox so that no employee is selected, tick only the
-        checkbox on the Adele Roberts row, and click Email.
-    - prompt: >-
-        If a dialog says some employee email addresses are not in the system and asks whether
-        to proceed with the remaining employees, click Yes.
-      # It only appears when a selected employee has no e-mail on record, which depends on
-      # the employee data of the day; the probe settles that without an LLM turn.
-      probe: {text_visible: "not in the system"}
-    - prompt: >-
-        In the Send email panel, open the From dropdown, select the no-reply option, and
-        click Send.
-    - prompt: >-
-        Then go to Reports and open HMRC Payslip; set the first combobox to All, the from
-        period to Apr-26 and the to period to Mar-27, then click Download and choose PDF.
-    - prompt: >-
-        Then click Email, open the From dropdown, select the no-reply option, and click Send.
-    - prompt: >-
-        Then go to Reports and open YTD Reports; set the frequency to Monthly and the period
-        to Mar-27, type Bradley Fowler into the employee combobox and select the employee,
-        and wait until his twelve period rows have loaded. Then click Export and choose PDF.
-    - prompt: >-
-        Then click Email, open the From dropdown, select the no-reply option, and click Send.
-    - prompt: >-
-        Then go to Reports and open Additional Reports; on the P60 tab set the tax year to
-        2026-27 and the frequency to Monthly, tick the header checkbox to select every
-        employee, and click Download.
-    - prompt: >-
-        Then open the P45 tab, tick the header checkbox to select every leaver in the list,
-        and click Download.
-    - prompt: >-
-        Then open the Payroll Summary tab of Additional Reports, set the frequency to
-        Monthly, the from period to Apr-26 and the to period to Mar-27, then click Download
-        and choose PDF.
-    - prompt: >-
-        Then open the Pension Report tab, click Download and choose PDF, and once that file
-        has arrived click Download again and choose CSV.
-    - prompt: >-
-        Then go to Employees, open the employee {{employee}}, open the Personal details panel
-        for editing, set the Email field to {{email}}, and click Save.
-      values: {employee: "Adele Roberts", email: "sayan.bhattacharjee@actingoffice.co.uk"}
-    - prompt: >-
-        Then go to Employees, open the employee {{employee}}, open the Personal details panel
-        for editing, set the Email field to {{email}}, and click Save.
-      values: {employee: "Aidan Stokes", email: "sayan.bhattacharjee@actingoffice.co.uk"}
-    - prompt: >-
-        Then go to Employees, open the employee {{employee}}, open the Personal details panel
-        for editing, set the Email field to {{email}}, and click Save.
-      values: {employee: "Amanda Taylor", email: "sayan.bhattacharjee@actingoffice.co.uk"}
-    - prompt: >-
-        Then go to Employees, open the employee {{employee}}, open the Personal details panel
-        for editing, set the Email field to {{email}}, and click Save.
-      values: {employee: "Andrea Payne", email: "sayan.bhattacharjee@actingoffice.co.uk"}
-    - prompt: >-
-        Then go to Settings, open the Auto Payroll tab and click Add Schedule; in the Pay
-        Schedule panel set Name to monthly, set Frequency to Monthly, tick the first employee
-        in the Employee name multi-select, set 'Schedule first pay run creation' to
-        19/06/2026, leave 'Schedule last pay run end' as Current Tax Year, turn on 'Send to
-        the client for review' and set its time to 06:00 AM, turn on Customise Attachments
-        and pick Employee's Payslip, then click Save. The schedule is then listed as monthly
-        / Monthly / 1 employee(s); do not add it a second time.
-    - prompt: >-
-        Then switch the tax year selector at the top right from 2026-27 to 2025-26, go to
-        P11D and click + P11D; in the Create New P11D dialog set Form type to P11D, Pay
-        Frequency to Monthly and Select employee to Owen Walker, leave Is Director off, and
-        click Save.
-    - prompt: >-
-        Then, in the P11D that opens, click Expense and Benefits and choose Entertainment
-        from the Expenses column; in the Entertainment dialog set Description to other, leave
-        Entertainment type on Staff, turn on 'If employer is a trading organisation', set
-        Method of Payment to other, set Contractor to Employee, set Cost to 999, set Amount
-        made good to 56, set Section 336 claim to 94, and click Save. The dialog closes
-        silently on Save and the benefit is then listed at cost £999.00 with a taxable value
-        of £943.00, which is a successful add; do not add it again.
-    - prompt: >-
-        Then open the Submission tab of P11D, keep the year 2025-26 and the form type P11D,
-        tick the checkbox on the P11D-01 row for Owen Walker, and click Submit; when the P11D
-        Response dialog reports that the submission was successful, close that dialog.
-    - prompt: >-
-        Then go to Payroll & RTI, open the FPS tab and set the frequency to Monthly and the
-        period to Apr-26; on the submitted FPS row in the right-hand panel open the '...'
-        actions menu and click View to open the FPS Details dialog, then close that dialog.
-    - prompt: >-
-        Then open the same '...' actions menu on that row again and click Download XML.
-    - prompt: >-
-        Then go to Settings, open the Employee Login tab, find the row for the employee
-        Caitlin Ramirez, and click the Allow button on that row so that her portal invitation
-        is sent.
-    - prompt: >-
-        Then open the Additional FPS section in the left nav (it is shown while the tax year
-        is 2025-26), set the frequency to Monthly, pick the employee Adele Roberts, and click
-        + Additional FPS. In the panel that opens set the payment date to 05/04/2026 and fill
-        the 'To be submitted' column: Gross pay 999, Tax deducted 56, Benefits in kind 56,
-        Gross earnings for NICs 599, Employee's NI 56, Employer's NI 56, LEL 33, LEL to PT 26
-        and PT to UEL 566. Then click Submit.
-    - prompt: >-
-        Then click the view icon on the Adele Roberts row of the Additional FPS list to open
-        the 'Period - Mar-26' payslip preview, click Email, select the no-reply option in the
-        From dropdown, and click Send.
-    - prompt: >-
-        Then go to Payroll, open General Settings and click PAYE Calculator, then click Add
-        Details; in the 'Update PAYE parameters' panel set Year to 2026-27, Join Date to
-        06/04/2026, Pay Frequency to Monthly, Gross pay to 5999, Tax code to 1257L with M1,
-        turn on the W1/M1 basis toggle, turn on the Director toggle and set the Appointment
-        Date it reveals to 06/04/2026, set NI method to Alternative, set NI category to A,
-        turn on Student loan and set its plan to Plan 2, turn on Pension applicable, then
-        click Save.
-    - prompt: >-
-        Once the twelve calculated period rows have loaded, click the pencil icon at the
-        right end of the Nov-26 row; in the 'Salary to take home' popup type 4999 into the
-        Net amount box beside the £ sign (do not type into the grid's own Taxable Gross cells
-        behind the popup), tick 'Calculate for remaining periods', and click Calculate. The
-        popup closes on Calculate and the Nov-26 to Mar-27 rows then show a net pay of
-        £4,999.00; if the popup closed before you clicked Calculate, reopen it with the same
-        pencil icon and enter it again.
-    - prompt: >-
-        Then click Download and choose CSV.
-    - prompt: >-
-        Then open Service Requests under General Settings and click Add Service; in the Add
-        Service dialog set Service type to Free Agent and set the period from 01/05/2026 to
-        18/06/2026, then click Save.
-    - prompt: >-
-        Then open Bulk EPS Requests under General Settings, set the year to 2025-26 and click
-        Add Bulk EPS; in the Add Bulk EPS Service dialog set the No payment combobox to
-        Apr-25 and click Save. A new request row is then added at the top of the list with
-        the status Fetching Started; do not add it again.
-    - prompt: >-
-        Then open Subscribe Reports under General Settings and click Add; in the Add Report
-        Service dialog set Report type to the Master payrun report, type 5 into the Period Id
-        box, set the year to 2026-27, and click Save. The new row is then listed with the
-        status Draft.
-    - prompt: >-
-        Finally open Pay Elements under General Settings and look at its Payment, Expense /
-        Benefit and Addition / Deduction tabs in turn, then open Employee logins and set the
-        page size to 100 items. The task is complete after that; take no further actions.
+        Then click Email; in the Send email panel that opens, click Send.
+    # - prompt: >-
+    #     Then click the Adele Roberts row to open her 'Period - Apr-26' payslip preview
+    #     dialog; in that dialog open the format combobox to see the four payslip formats,
+    #     leave it on 'Format A (Acting Office)', click Download, and then close the dialog.
+    # - prompt: >-
+    #     Then untick the header checkbox so that no employee is selected, tick only the
+    #     checkbox on the Adele Roberts row, and click Email.
+    # - prompt: >-
+    #     If a dialog says some employee email addresses are not in the system and asks whether
+    #     to proceed with the remaining employees, click Yes.
+    #   # It only appears when a selected employee has no e-mail on record, which depends on
+    #   # the employee data of the day; the probe settles that without an LLM turn.
+    #   probe: {text_visible: "not in the system"}
+    # - prompt: >-
+    #     In the Send email panel, open the From dropdown, select the no-reply option, and
+    #     click Send.
+    # - prompt: >-
+    #     Then go to Reports and open HMRC Payslip; set the first combobox to All, the from
+    #     period to Apr-26 and the to period to Mar-27, then click Download and choose PDF.
+    # - prompt: >-
+    #     Then click Email, open the From dropdown, select the no-reply option, and click Send.
+    # - prompt: >-
+    #     Then go to Reports and open YTD Reports; set the frequency to Monthly and the period
+    #     to Mar-27, type Bradley Fowler into the employee combobox and select the employee,
+    #     and wait until his twelve period rows have loaded. Then click Export and choose PDF.
+    # - prompt: >-
+    #     Then click Email, open the From dropdown, select the no-reply option, and click Send.
+    # - prompt: >-
+    #     Then go to Reports and open Additional Reports; on the P60 tab set the tax year to
+    #     2026-27 and the frequency to Monthly, tick the header checkbox to select every
+    #     employee, and click Download.
+    # - prompt: >-
+    #     Then open the P45 tab, tick the header checkbox to select every leaver in the list,
+    #     and click Download.
+    # - prompt: >-
+    #     Then open the Payroll Summary tab of Additional Reports, set the frequency to
+    #     Monthly, the from period to Apr-26 and the to period to Mar-27, then click Download
+    #     and choose PDF.
+    # - prompt: >-
+    #     Then open the Pension Report tab, click Download and choose PDF, and once that file
+    #     has arrived click Download again and choose CSV.
+    # - prompt: >-
+    #     Then go to Employees, open the employee {{employee}}, open the Personal details panel
+    #     for editing, set the Email field to {{email}}, and click Save.
+    #   values: {employee: "Adele Roberts", email: "sayan.bhattacharjee@actingoffice.co.uk"}
+    # - prompt: >-
+    #     Then go to Employees, open the employee {{employee}}, open the Personal details panel
+    #     for editing, set the Email field to {{email}}, and click Save.
+    #   values: {employee: "Aidan Stokes", email: "sayan.bhattacharjee@actingoffice.co.uk"}
+    # - prompt: >-
+    #     Then go to Employees, open the employee {{employee}}, open the Personal details panel
+    #     for editing, set the Email field to {{email}}, and click Save.
+    #   values: {employee: "Amanda Taylor", email: "sayan.bhattacharjee@actingoffice.co.uk"}
+    # - prompt: >-
+    #     Then go to Employees, open the employee {{employee}}, open the Personal details panel
+    #     for editing, set the Email field to {{email}}, and click Save.
+    #   values: {employee: "Andrea Payne", email: "sayan.bhattacharjee@actingoffice.co.uk"}
+    # - prompt: >-
+    #     Then go to Settings, open the Auto Payroll tab and click Add Schedule; in the Pay
+    #     Schedule panel set Name to monthly, set Frequency to Monthly, tick the first employee
+    #     in the Employee name multi-select, set 'Schedule first pay run creation' to
+    #     19/06/2026, leave 'Schedule last pay run end' as Current Tax Year, turn on 'Send to
+    #     the client for review' and set its time to 06:00 AM, turn on Customise Attachments
+    #     and pick Employee's Payslip, then click Save. The schedule is then listed as monthly
+    #     / Monthly / 1 employee(s); do not add it a second time.
+    # - prompt: >-
+    #     Then switch the tax year selector at the top right from 2026-27 to 2025-26, go to
+    #     P11D and click + P11D; in the Create New P11D dialog set Form type to P11D, Pay
+    #     Frequency to Monthly and Select employee to Owen Walker, leave Is Director off, and
+    #     click Save.
+    # - prompt: >-
+    #     Then, in the P11D that opens, click Expense and Benefits and choose Entertainment
+    #     from the Expenses column; in the Entertainment dialog set Description to other, leave
+    #     Entertainment type on Staff, turn on 'If employer is a trading organisation', set
+    #     Method of Payment to other, set Contractor to Employee, set Cost to 999, set Amount
+    #     made good to 56, set Section 336 claim to 94, and click Save. The dialog closes
+    #     silently on Save and the benefit is then listed at cost £999.00 with a taxable value
+    #     of £943.00, which is a successful add; do not add it again.
+    # - prompt: >-
+    #     Then open the Submission tab of P11D, keep the year 2025-26 and the form type P11D,
+    #     tick the checkbox on the P11D-01 row for Owen Walker, and click Submit; when the P11D
+    #     Response dialog reports that the submission was successful, close that dialog.
+    # - prompt: >-
+    #     Then go to Payroll & RTI, open the FPS tab and set the frequency to Monthly and the
+    #     period to Apr-26; on the submitted FPS row in the right-hand panel open the '...'
+    #     actions menu and click View to open the FPS Details dialog, then close that dialog.
+    # - prompt: >-
+    #     Then open the same '...' actions menu on that row again and click Download XML.
+    # - prompt: >-
+    #     Then go to Settings, open the Employee Login tab, find the row for the employee
+    #     Caitlin Ramirez, and click the Allow button on that row so that her portal invitation
+    #     is sent.
+    # - prompt: >-
+    #     Then open the Additional FPS section in the left nav (it is shown while the tax year
+    #     is 2025-26), set the frequency to Monthly, pick the employee Adele Roberts, and click
+    #     + Additional FPS. In the panel that opens set the payment date to 05/04/2026 and fill
+    #     the 'To be submitted' column: Gross pay 999, Tax deducted 56, Benefits in kind 56,
+    #     Gross earnings for NICs 599, Employee's NI 56, Employer's NI 56, LEL 33, LEL to PT 26
+    #     and PT to UEL 566. Then click Submit.
+    # - prompt: >-
+    #     Then click the view icon on the Adele Roberts row of the Additional FPS list to open
+    #     the 'Period - Mar-26' payslip preview, click Email, select the no-reply option in the
+    #     From dropdown, and click Send.
+    # - prompt: >-
+    #     Then go to Payroll, open General Settings and click PAYE Calculator, then click Add
+    #     Details; in the 'Update PAYE parameters' panel set Year to 2026-27, Join Date to
+    #     06/04/2026, Pay Frequency to Monthly, Gross pay to 5999, Tax code to 1257L with M1,
+    #     turn on the W1/M1 basis toggle, turn on the Director toggle and set the Appointment
+    #     Date it reveals to 06/04/2026, set NI method to Alternative, set NI category to A,
+    #     turn on Student loan and set its plan to Plan 2, turn on Pension applicable, then
+    #     click Save.
+    # - prompt: >-
+    #     Once the twelve calculated period rows have loaded, click the pencil icon at the
+    #     right end of the Nov-26 row; in the 'Salary to take home' popup type 4999 into the
+    #     Net amount box beside the £ sign (do not type into the grid's own Taxable Gross cells
+    #     behind the popup), tick 'Calculate for remaining periods', and click Calculate. The
+    #     popup closes on Calculate and the Nov-26 to Mar-27 rows then show a net pay of
+    #     £4,999.00; if the popup closed before you clicked Calculate, reopen it with the same
+    #     pencil icon and enter it again.
+    # - prompt: >-
+    #     Then click Download and choose CSV.
+    # - prompt: >-
+    #     Then open Service Requests under General Settings and click Add Service; in the Add
+    #     Service dialog set Service type to Free Agent and set the period from 01/05/2026 to
+    #     18/06/2026, then click Save.
+    # - prompt: >-
+    #     Then open Bulk EPS Requests under General Settings, set the year to 2025-26 and click
+    #     Add Bulk EPS; in the Add Bulk EPS Service dialog set the No payment combobox to
+    #     Apr-25 and click Save. A new request row is then added at the top of the list with
+    #     the status Fetching Started; do not add it again.
+    # - prompt: >-
+    #     Then open Subscribe Reports under General Settings and click Add; in the Add Report
+    #     Service dialog set Report type to the Master payrun report, type 5 into the Period Id
+    #     box, set the year to 2026-27, and click Save. The new row is then listed with the
+    #     status Draft.
+    # - prompt: >-
+    #     Finally open Pay Elements under General Settings and look at its Payment, Expense /
+    #     Benefit and Addition / Deduction tabs in turn, then open Employee logins and set the
+    #     page size to 100 items. The task is complete after that; take no further actions.

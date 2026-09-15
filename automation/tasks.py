@@ -23,6 +23,7 @@ tests/test_tasks.py pins every prompt's task id for exactly this reason.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,8 @@ import yaml
 
 from automation.pipeline.checks import Check, parse_probe, parse_verify
 from automation.pipeline.subtask_store import is_absolute_http_url
+
+logger = logging.getLogger("framework.tasks")
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,15 @@ class TaskSpec:
 
 TASKS_FILE = Path("tasks.yaml")
 
+# The UI-owned half of the registry: one file per prompt, `prompts/<key>.yaml`, in the SAME schema
+# as a tasks.yaml entry. Separate because tasks.yaml is a document — its comments record why each
+# marker and slice is worded as it is, and a YAML writer round-tripping it destroys them. One file
+# per prompt so the UI can create, edit and delete one without rewriting any other.
+#
+# A module global (not a constant inlined at the call site) so tests can point it somewhere else,
+# the same reason TASKS_FILE is one.
+PROMPTS_DIR = Path("prompts")
+
 
 _DECL_TOKEN = re.compile(r"\{\{(\w+)\}\}")
 
@@ -102,7 +114,8 @@ def _instantiated(decl: SubtaskDecl) -> str:
     return _DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), decl.prompt)
 
 
-def _parsed_verify(key: str, i: int, d: dict[str, Any]) -> tuple[Check, ...] | None:
+def _parsed_verify(key: str, i: int, d: dict[str, Any], *,
+                   source: str = "tasks.yaml") -> tuple[Check, ...] | None:
     """One slice's `verify:` block → validated Check tuple, {{tokens}} substituted from
     the slice's values. Substitution happens HERE (load time) because the downstream
     token grammar (sstore.TOKEN_RE) is lowercase-only and would silently skip uppercase
@@ -122,16 +135,17 @@ def _parsed_verify(key: str, i: int, d: dict[str, Any]) -> tuple[Check, ...] | N
             if isinstance(item, dict) else item
             for item in raw
         ]
-    checks = parse_verify(raw, where=f"tasks.yaml entry {key!r} subtask {i} verify")
+    checks = parse_verify(raw, where=f"{source} entry {key!r} subtask {i} verify")
     for c in checks:
         if _DECL_TOKEN.search(c.arg):
             raise ValueError(
-                f"tasks.yaml entry {key!r} subtask {i} verify: unresolved token in "
+                f"{source} entry {key!r} subtask {i} verify: unresolved token in "
                 f"{c.kind} {c.arg!r} — add it to the subtask's values")
     return checks
 
 
-def _parsed_probe(key: str, i: int, d: dict[str, Any]) -> Check | None:
+def _parsed_probe(key: str, i: int, d: dict[str, Any], *,
+                  source: str = "tasks.yaml") -> Check | None:
     """One slice's `probe:` mapping → validated Check, {{tokens}} substituted from the
     slice's values — same load-time substitution contract (and rationale) as
     _parsed_verify."""
@@ -143,40 +157,41 @@ def _parsed_probe(key: str, i: int, d: dict[str, Any]) -> Check | None:
         raw = {k: (_DECL_TOKEN.sub(lambda m: str(values.get(m.group(1), m.group(0))), v)
                    if isinstance(v, str) else v)
                for k, v in raw.items()}
-    check = parse_probe(raw, where=f"tasks.yaml entry {key!r} subtask {i} probe")
+    check = parse_probe(raw, where=f"{source} entry {key!r} subtask {i} probe")
     if check is not None and _DECL_TOKEN.search(check.arg):
         raise ValueError(
-            f"tasks.yaml entry {key!r} subtask {i} probe: unresolved token in "
+            f"{source} entry {key!r} subtask {i} probe: unresolved token in "
             f"{check.kind} {check.arg!r} — add it to the subtask's values")
     return check
 
 
-def _parsed_write_waiver(key: str, i: int, d: dict[str, Any]) -> bool:
+def _parsed_write_waiver(key: str, i: int, d: dict[str, Any], *,
+                         source: str = "tasks.yaml") -> bool:
     """One slice's `allow_write_refusal:` → bool. A non-bool fails loud for the same
     reason a bad `kind` does: silently ignoring the typo would re-fail the run for the
     exact reason the declaration exists to prevent, and it would look like it worked."""
     raw = d.get("allow_write_refusal", False)
     if not isinstance(raw, bool):
         raise ValueError(
-            f"tasks.yaml entry {key!r} subtask {i}: allow_write_refusal must be true or "
+            f"{source} entry {key!r} subtask {i}: allow_write_refusal must be true or "
             f"false, got {raw!r}")
     return raw
 
 
-def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
+def _spec_from_entry(key: str, entry: Any, *, source: str = "tasks.yaml") -> TaskSpec:
     """Materialize one tasks.yaml entry into a TaskSpec. Bad entries fail loud — a broken
     registry must be caught at load, not as a silent no-marker/no-prompt run."""
     if not isinstance(entry, dict):
-        raise ValueError(f"tasks.yaml entry {key!r} must be a mapping")
+        raise ValueError(f"{source} entry {key!r} must be a mapping")
     subtasks = None
     if entry.get("subtasks"):
         subtasks = tuple(
             SubtaskDecl(prompt=str(d["prompt"]), values=d.get("values"),
                         marker=d.get("marker"), postcondition=d.get("postcondition"),
                         kind=d.get("kind"), tab_url=d.get("tab_url"),
-                        verify=_parsed_verify(key, i, d),
-                        probe=_parsed_probe(key, i, d),
-                        allow_write_refusal=_parsed_write_waiver(key, i, d))
+                        verify=_parsed_verify(key, i, d, source=source),
+                        probe=_parsed_probe(key, i, d, source=source),
+                        allow_write_refusal=_parsed_write_waiver(key, i, d, source=source))
             for i, d in enumerate(entry["subtasks"])
         )
         for i, s in enumerate(subtasks):
@@ -187,14 +202,14 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
             # exactly the bug the declaration exists to prevent.
             if s.kind is not None and s.kind not in ("action", "judge"):
                 raise ValueError(
-                    f"tasks.yaml entry {key!r} subtask {i}: kind must be 'action' or "
+                    f"{source} entry {key!r} subtask {i}: kind must be 'action' or "
                     f"'judge', got {s.kind!r}"
                     + (" — the 'loop' kind was removed on 2026-08-28; state a repeat with "
                        "the repeat_click tool instead" if str(s.kind).lower() == "loop"
                        else ""))
             if s.tab_url is not None and not is_absolute_http_url(s.tab_url):
                 raise ValueError(
-                    f"tasks.yaml entry {key!r} subtask {i}: tab_url must be an absolute "
+                    f"{source} entry {key!r} subtask {i}: tab_url must be an absolute "
                     f"http(s) URL, got {s.tab_url!r}")
     # Collapse the YAML block-scalar line wrapping. task_id normalizes whitespace the
     # same way, so re-wrapping a prompt in the file can never change its identity.
@@ -210,14 +225,14 @@ def _spec_from_entry(key: str, entry: Any) -> TaskSpec:
             context_p = " ".join(prompt.split()[max(0, diverge - 3):diverge + 5])
             context_d = " ".join(derived.split()[max(0, diverge - 3):diverge + 5])
             raise ValueError(
-                f"tasks.yaml entry {key!r}: prompt and subtasks disagree around word "
+                f"{source} entry {key!r}: prompt and subtasks disagree around word "
                 f"{diverge}: prompt says '…{context_p}…' but the slices join to "
                 f"'…{context_d}…'. Drop the 'prompt:' key (it is derived from the "
                 f"slices) or fix the diverging slice.")
         prompt = derived
     if not prompt:
         raise ValueError(
-            f"tasks.yaml entry {key!r} must have a non-empty 'prompt' or 'subtasks'")
+            f"{source} entry {key!r} must have a non-empty 'prompt' or 'subtasks'")
     return TaskSpec(
         key=key,
         prompt=prompt,
@@ -235,13 +250,71 @@ def load_tasks(path: str | Path | None = None) -> dict[str, TaskSpec]:
     malformed file or entry raises ValueError so the CLI fails before logging in.
     """
     p = Path(path) if path is not None else TASKS_FILE
-    if not p.exists():
+    curated: dict[str, TaskSpec] = {}
+    if p.exists():
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"{p} must be a YAML mapping of task-key -> fields")
+        curated = {str(key).strip().lower():
+                   _spec_from_entry(str(key).strip().lower(), entry, source=str(p))
+                   for key, entry in data.items()}
+    if path is not None:
+        # An explicit path means "exactly this file" — the contract every other caller and
+        # every test relies on. Merging a real directory into it would make those callers
+        # depend on whatever happens to be in the working tree.
+        return curated
+    return {**curated, **_load_prompt_files(curated)}
+
+
+def _load_prompt_files(curated: dict[str, TaskSpec]) -> dict[str, TaskSpec]:
+    """The UI-owned prompts in `PROMPTS_DIR`, one task entry per `<key>.yaml`.
+
+    A bad file is SKIPPED AND LOGGED, not raised. This registry feeds the CLI and the whole
+    test suite, so a hard error would let one file in a directory the UI writes to break
+    `automation --task invoice` and collection for 1100 tests. Skipping keeps the damage local
+    and legible: `resolve_task` then raises "Unknown TASK key" for that one key.
+
+    The one hard error is two PROMPT files claiming the same key — both are UI-owned, there is
+    no correct winner to fall back to, and the UI can fix it.
+    """
+    if not PROMPTS_DIR.exists():
         return {}
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"{p} must be a YAML mapping of task-key -> fields")
-    return {str(key).strip().lower(): _spec_from_entry(str(key).strip().lower(), entry)
-            for key, entry in data.items()}
+    found: dict[str, TaskSpec] = {}
+    owners: dict[str, Path] = {}
+    for f in sorted(PROMPTS_DIR.glob("*.yaml")):
+        if f.name.startswith("."):
+            continue
+        try:
+            data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            if not isinstance(data, dict) or len(data) != 1:
+                raise ValueError(
+                    f"{f} must hold exactly ONE task entry (the UI addresses prompts as "
+                    f"{PROMPTS_DIR}/<key>.yaml), found {len(data) if isinstance(data, dict) else 0}")
+            raw_key, entry = next(iter(data.items()))
+            key = str(raw_key).strip().lower()
+            if key != f.stem.strip().lower():
+                raise ValueError(
+                    f"{f} holds the key {raw_key!r}, which does not match its filename — the UI "
+                    f"edits and deletes a prompt by its filename, so a mismatched key is "
+                    f"unreachable. Rename the file to {key}.yaml or rename the key to {f.stem!r}.")
+            spec = _spec_from_entry(key, entry, source=str(f))
+        except Exception as exc:  # noqa: BLE001 - one bad prompt must not break the registry
+            logger.error("skipping prompt file %s: %s", f, exc)
+            continue
+        if key in owners:
+            raise ValueError(
+                f"two prompt files claim the task key {key!r}: {owners[key]} and {f} "
+                f"(keys are compared lowercased). Rename one of them.")
+        if key in curated:
+            # Never let a UI file shadow a curated task: that would silently redirect
+            # `automation --task <key>` to whatever someone saved in the browser.
+            logger.error(
+                "prompt file %s is ignored: the task key %r already belongs to %s, which wins. "
+                "Rename the prompt.", f, key, TASKS_FILE)
+            continue
+        owners[key] = f
+        found[key] = spec
+    return found
 
 
 def resolve_task(raw: str) -> TaskSpec:

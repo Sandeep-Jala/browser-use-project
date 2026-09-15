@@ -132,6 +132,84 @@ TASK=purchase uv run python -m automation --reauthor 'add invoice'
 The exit code is CI-ready: `0` only when the flow completed (ground-truth gate) **and** the
 telemetry assertions passed.
 
+## Auto Agent (the web UI)
+
+```bash
+uv run auto-agent
+```
+
+Opens `http://127.0.0.1:8765` — bound to loopback only, with no auth, because it starts runs that
+drive a logged-in browser and it deletes run directories. A `Host` header that is not this machine
+is refused outright: binding to loopback does not stop a page on the internet resolving its own
+hostname to 127.0.0.1, and checking `Host` does.
+
+A [Gradio](https://gradio.app) app mounted on a small FastAPI app — mounted rather than
+`launch()`ed so that Host check survives, and so run reports are served from one guarded route
+instead of exposing every file under `artifacts/`. There is no code path that can mint a public
+share link.
+
+Four tabs: **Prompts · Files · Run · History**.
+
+- **Prompts** — create, edit, delete and run prompts, written as plain English. Each step gets a
+  type: *Action* (recorded once, replayed free), *Check* (`kind: judge` — the agent judges it live
+  every run, never cached), or *Conditional* (a `probe:` — skipped at zero AI cost when the page
+  does not show what you named). End-of-step `verify:` checks are rows of a dropdown and a text
+  box. No YAML or JSON to type — there is a read-only *Raw YAML* view for reading what a prompt
+  became, but nothing to hand-author. Validation runs the framework's real loaders as you type, so
+  the editor cannot save a prompt the CLI would reject.
+- Prompts live in `prompts/<key>.yaml`, one file each, in the same schema as `tasks.yaml`. The
+  entries in `tasks.yaml` itself are **read-only** here — its comments record why each step and
+  marker is worded as it is, and no YAML writer preserves them — but they can be run, or copied
+  into an editable prompt.
+- **Files** — upload what a prompt names, with the exact snippet to paste (quoted when the name
+  has a space, because the bare-name scanner cannot see one otherwise), which prompts use each
+  file, and a warning on a 0-byte iCloud placeholder.
+- **Run** — start a run, watch its steps live, and **Pause / Resume / Stop** it. The controls stay
+  disabled until the run arms its control channel after login, because a command sent before that
+  is discarded. Sending an instruction with Resume steers an agent step; on a replaying step it is
+  refused out loud and the refusal is shown.
+- **History** — every run, with `PASS` / `PASS*` / `DONE` / `FAIL`, plus `STOPPED` and `CRASHED`
+  for runs that never wrote a report, and the full HTML report inline.
+
+### Steering a live run
+
+Two levers, both serviced at a **step boundary** — never mid-action.
+
+**Ctrl+C**, if you are sitting at the terminal: the first press queues a pause and prompts
+for one instruction (Enter alone resumes); a second press aborts, saving the partial
+recording and `progress.json`.
+
+**`artifacts/control.json`**, if you are not — another shell, a background run, a UI. Each
+segment clears the file and logs its path on startup. Write one command to it:
+
+```bash
+echo '{"command":"pause"}'  > artifacts/control.json   # holds at the next step boundary
+echo '{"command":"resume","instruction":"close the FPS panel first"}' > artifacts/control.json
+echo '{"command":"stop"}'   > artifacts/control.json   # no further action is taken
+rm artifacts/control.json                              # the blunt resume; also works
+```
+
+`stop` takes no further action on the page: the step already in flight finishes, and
+browser-use enters the next step and aborts it before any action runs (it logs that as
+`⏹️ Agent stopping` → `The agent was interrupted mid-step` → `🛑 Agent stopped`). The
+interrupted segment fails, so its trace parks as `.recording.failed.json` and cannot
+overwrite a working library entry — but the task summary attributes the failure to the
+segment's last receipt, not to you, so check the log for `Agent stopping` to tell an
+operator stop apart from a real failure.
+
+A command is consumed as it is applied, so it never re-fires on later steps. `resume` with
+an `instruction` also works on a *running* agent — that is how you steer one without pausing
+it first. The instruction is injected as a human override the agent reads on its next step.
+A malformed or half-written file reads as "no command", so a hand-edit in progress can
+never derail the run.
+
+A **replaying** subtask (from `library/`, no agent, no LLM) accepts `pause` and `stop` too —
+serviced between two replayed actions — but **not** steering: there is no model to give an
+instruction to, so an `instruction` sent to a replay is refused out loud in the log and
+ignored. `stop` during a replay aborts the run the same way Ctrl+C does, writing
+`progress.json` with `status: interrupted` (and, like Ctrl+C, ending on a `KeyboardInterrupt`
+traceback).
+
 ### Outputs
 
 - `artifacts/<run_id>/` — `network.json`, `console.json`, `report.html`, `report.json`,

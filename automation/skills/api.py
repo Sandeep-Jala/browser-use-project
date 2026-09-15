@@ -19,11 +19,14 @@ handlers are added deliberately, never invented per skill.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 from typing import Any, Awaitable, Callable
 
 from playwright.async_api import Page
 
+from automation.pipeline.control import service_replay_control
 from automation.pipeline.subtask_store import rebase_to_live
 from automation.pipeline.script_compile import (_REOPEN_MS, _SETTLE_MS, _click_with_retry,
                                                 _close_and_return,
@@ -610,3 +613,28 @@ class SkillApi:
         await self.page.goto(rebase_to_live(url, self.page.url),
                              wait_until="domcontentloaded", timeout=self.timeout_ms)
         self._done("goto")
+
+
+# ── the operator control boundary ─────────────────────────────────────────────────────────
+# A replaying subtask runs no agent, so it never reached the control channel that pause/stop
+# live on (pipeline/control.py) and the whole replay-first fast path was uninterruptible
+# except by Ctrl+C, which aborts rather than holds. Every verb below is the boundary BETWEEN
+# two replayed actions — the only safe place to hold, and the same guarantee the agent path
+# gets from its step start.
+#
+# Applied by wrapping, not by 19 hand-placed decorators, so the set is one reviewable list
+# and `test_every_replay_verb_passes_through_the_control_boundary` can assert that EVERY
+# public async verb is in it — including one added next year.
+def _with_control_boundary(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    @functools.wraps(fn)
+    async def wrapper(self: "SkillApi", *args: Any, **kwargs: Any) -> Any:
+        await service_replay_control()
+        return await fn(self, *args, **kwargs)
+    wrapper.__control_boundary__ = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+for _verb_name, _verb in list(vars(SkillApi).items()):
+    if not _verb_name.startswith("_") and inspect.iscoroutinefunction(_verb):
+        setattr(SkillApi, _verb_name, _with_control_boundary(_verb))
+del _verb_name, _verb

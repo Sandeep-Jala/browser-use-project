@@ -30,6 +30,10 @@ _EXTS = ("csv", "tsv", "xlsx", "xls", "pdf", "png", "jpg", "jpeg", "txt", "json"
          "xml", "docx", "doc", "zip")
 _EXT_ALT = "|".join(_EXTS)
 
+# Public alias: the upload UI validates a file against the SAME set the prompt-side scanner
+# recognises, so a file it accepts can never be one `referenced_files` would not see.
+ALLOWED_EXTENSIONS = _EXTS
+
 # 'Name With Spaces.csv' / "Name With Spaces.csv" — quoted names may contain spaces.
 _QUOTED = re.compile(r'["\']([^"\']+\.(?:%s))["\']' % _EXT_ALT, re.IGNORECASE)
 # Bare single-token names. The lookbehind rejects URL/path contexts (https://host/a.csv)

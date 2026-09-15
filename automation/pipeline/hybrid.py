@@ -65,6 +65,7 @@ from automation.pipeline.decompose import (Subtask, announces_new_tab,
                                            downloads_file, get_decomposition,
                                            is_conditional_guard)
 from automation.pipeline.prompts import scoped_subtask_prompt
+from automation.pipeline.control import CONTROL_FILENAME, set_control_path
 from automation.pipeline.runner import RunResult, Runner, _first_create_write
 from automation.pipeline.script_compile import (CALLOUT_SCROLL_PIN_JS, REVEAL_CSS_JS,
                                                 _atomic_write, _esc,
@@ -2532,6 +2533,25 @@ def reauthor_match(reauthor: str | None, sub: Subtask) -> bool:
     return False
 
 
+def _set_task_control_channel(runner: Any) -> None:
+    """Point the replay layer at the operator control channel for this task, clearing anything
+    a previous run left in it.
+
+    Per TASK, not per segment, because a REPLAYING subtask never enters run_agent_segment —
+    before this, the replay-first fast path could not be paused or stopped at all (see
+    pipeline/control.py). Also the single place the channel is announced.
+
+    Never allowed to raise: the channel is a convenience and must not be able to fail a task.
+    A runner without a usable artifacts_dir leaves it explicitly DISABLED rather than pointing
+    at whatever a previous task in this process set.
+    """
+    try:
+        set_control_path(runner.config.artifacts_dir / CONTROL_FILENAME)
+    except Exception as exc:  # noqa: BLE001 - a convenience must never fail a task
+        set_control_path(None)
+        logger.debug("operator control channel unavailable (%s) — pause/stop disabled", exc)
+
+
 async def run_hybrid_task(
     runner: Runner, task: str, spec: Any = None, marker: str | None = None, *,
     fresh: bool = False, redecompose: bool = False, reauthor: str | None = None,
@@ -2550,6 +2570,7 @@ async def run_hybrid_task(
     subtasks = await get_decomposition(task, llm=runner.expander_llm, spec=spec,
                                        marker=marker, redecompose=redecompose)
     logger.info("▶ HYBRID %s: %d subtask(s)", tid, len(subtasks))
+    _set_task_control_channel(runner)
     hs = await HybridSession.open(runner)
     segments: list[Segment] = []
     completed: list[str] = []

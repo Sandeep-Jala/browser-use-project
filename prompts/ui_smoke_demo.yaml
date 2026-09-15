@@ -1,0 +1,6 @@
+ui_smoke_demo:
+  subtasks:
+  - prompt: Go to the Bookkeeping module.
+  - prompt: If a warning banner appears, dismiss it.
+    probe:
+      text_visible: warning

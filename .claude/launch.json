@@ -2,10 +2,14 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "runs-dashboard",
+      "name": "auto-agent",
       "runtimeExecutable": ".venv.nosync/bin/python",
-      "runtimeArgs": ["-m", "automation.dashboard", "--no-browser"],
-      "port": 8787
+      "runtimeArgs": [
+        "-m",
+        "automation.ui",
+        "--no-browser"
+      ],
+      "port": 8765
     }
   ]
 }

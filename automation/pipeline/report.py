@@ -87,6 +87,30 @@ def _headers_block(title: str, headers: dict[str, Any]) -> str:
     )
 
 
+def derive_status(is_successful: bool, is_done: bool,
+                  assertions_passed: bool | None) -> tuple[str, str]:
+    """A run's headline verdict as `(label, tone)`, where tone names a CSS token
+    (`success` / `warning` / `error`).
+
+    Lives here, named, because the report is no longer the only consumer — the Auto Agent UI
+    shows the same verdict on its runs list and run-detail pages, and a dashboard that
+    disagrees with the report it links to is worse than no dashboard.
+
+    `PASS*` is the state that needs a rule rather than a boolean: the flow completed and saved,
+    but the telemetry assertions failed (5xx responses, console errors). `assertions_passed` is
+    deliberately kept out of `is_successful` (see assertions.py), so the fourth state has to be
+    carried here. Assertions are demote-only at this level too — passing telemetry can never
+    turn a failed flow green.
+    """
+    if is_successful and assertions_passed is False:
+        return "PASS*", "warning"
+    if is_successful:
+        return "PASS", "success"
+    if is_done:
+        return "DONE", "warning"
+    return "FAIL", "error"
+
+
 def _render_html(result: "RunResult") -> str:
     net = result.collector_results.get("network", {})
     con = result.collector_results.get("console", {})
@@ -96,16 +120,9 @@ def _render_html(result: "RunResult") -> str:
     net_problems = net_sum.get("http_4xx", 0) + net_sum.get("http_5xx", 0) + net_sum.get("failed", 0)
     con_errors = con_sum.get("errors", 0)
 
-    if result.is_successful and getattr(result, "assertions_passed", None) is False:
-        # The flow completed and saved, but telemetry assertions failed (5xx, console
-        # errors, ...): a distinct state so a "green" run with an unhealthy app stands out.
-        status, ring = "PASS*", "var(--warning)"
-    elif result.is_successful:
-        status, ring = "PASS", "var(--success)"
-    elif result.is_done:
-        status, ring = "DONE", "var(--warning)"
-    else:
-        status, ring = "FAIL", "var(--error)"
+    status, tone = derive_status(result.is_successful, result.is_done,
+                                getattr(result, "assertions_passed", None))
+    ring = f"var(--{tone})"
 
     p: list[str] = []
     p.append("<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>")

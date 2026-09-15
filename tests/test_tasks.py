@@ -21,7 +21,7 @@ from automation.tasks import SubtaskDecl, TaskSpec, load_tasks, resolve_task
 def test_no_login_steps_or_credentials_in_prompts():
     # The framework logs in itself; a prompt must never carry the login step, credentials,
     # or the raw books URL (tasks say "go to Bookkeeping module" instead).
-    for key, spec in load_tasks().items():
+    for key, spec in load_tasks(tasks_mod.TASKS_FILE).items():
         low = spec.prompt.lower()
         for forbidden in ("login using", "log in to http", "password", "aoadmin",
                           "welcome1@", "@capsitech.com", "demo.admin@",
@@ -30,7 +30,7 @@ def test_no_login_steps_or_credentials_in_prompts():
 
 
 def test_markers_only_where_known():
-    tasks = load_tasks()
+    tasks = load_tasks(tasks_mod.TASKS_FILE)
     # Bookkeeping/CRM write tasks keep their verified markers...
     assert tasks["invoice"].marker == "Invoices"
     assert tasks["credit_notes"].marker == "Refunds"
@@ -43,7 +43,7 @@ def test_markers_only_where_known():
 
 
 def test_specs_are_frozen_taskspecs():
-    tasks = load_tasks()
+    tasks = load_tasks(tasks_mod.TASKS_FILE)
     assert all(isinstance(t, TaskSpec) and t.key == k for k, t in tasks.items())
     with pytest.raises(Exception):
         tasks["invoice"].marker = "X"  # type: ignore[misc]
@@ -74,6 +74,9 @@ def test_resolve_unknown_key_raises():
 
 def test_missing_registry_is_empty_and_adhoc_still_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks_mod, "TASKS_FILE", tmp_path / "tasks.yaml")
+    # Both halves of the registry must be pointed away from the working tree: load_tasks()
+    # also merges the UI-owned PROMPTS_DIR, so a real prompt file would make this non-empty.
+    monkeypatch.setattr(tasks_mod, "PROMPTS_DIR", tmp_path / "prompts")
     assert load_tasks() == {}
     spec = resolve_task("do a thing on the current page")
     assert spec.key == "adhoc" and spec.marker is None
@@ -154,7 +157,7 @@ async def test_e2e_rti_declared_subtasks_survive_validation(tmp_path, monkeypatc
     monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path / "library")
     monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "library" / "manifest.json")
     monkeypatch.setattr(ss, "DECOMPOSITIONS_DIR", tmp_path / "decompositions")
-    spec = load_tasks()["payroll_food_limited_e2e_rti"]
+    spec = load_tasks(tasks_mod.TASKS_FILE)["payroll_food_limited_e2e_rti"]
 
     joined = " ".join(" ".join(d.prompt.split()) for d in spec.subtasks)
     assert joined == spec.prompt          # verbatim partition, no reword drift
@@ -235,7 +238,7 @@ def test_detailed_review_fps_parts_are_independently_runnable():
     diverged in INTENT, which is the accepted cost of keeping both (see the tasks.yaml
     comment above the parts). Restoring the rebuild assertion would mean reverting a
     deliberate wording choice, so guard what is still true instead."""
-    tasks = load_tasks()
+    tasks = load_tasks(tasks_mod.TASKS_FILE)
     for key in FPS_PART_SLICE_COUNTS:
         spec = tasks[key]
         slices = [" ".join(d.prompt.split()) for d in spec.subtasks]
@@ -254,7 +257,7 @@ async def test_detailed_review_fps_parts_survive_validation(key, tmp_path, monke
     monkeypatch.setattr(ss, "LIBRARY_DIR", tmp_path / "library")
     monkeypatch.setattr(ss, "LIBRARY_MANIFEST", tmp_path / "library" / "manifest.json")
     monkeypatch.setattr(ss, "DECOMPOSITIONS_DIR", tmp_path / "decompositions")
-    spec = load_tasks()[key]
+    spec = load_tasks(tasks_mod.TASKS_FILE)[key]
 
     subs = await decompose.get_decomposition(spec.prompt, llm=None, spec=spec)
     assert len(subs) == FPS_PART_SLICE_COUNTS[key]
