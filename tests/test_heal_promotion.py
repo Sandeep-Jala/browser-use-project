@@ -52,8 +52,9 @@ def test_promoted_selectors_prepend_and_old_ones_survive(tmp_path):
     assert sc.promote_healed(path, log) == [0]
 
     step = json.loads(path.read_text())[0]
-    # New durable candidates lead; the previous anchors remain as fallbacks.
-    assert step["selectors"][0] == 'role=button[name="Save"]'
+    # New durable candidates lead; the previous anchors remain as fallbacks. (The
+    # winner's identity attributes lead now that role=/text= are gone from the ladder.)
+    assert step["selectors"][0] == 'css=[id="new-id"]'
     assert 'css=[id="new-id"]' in step["selectors"]
     assert step["selectors"].index('css=[id="new-id"]') < step["selectors"].index('css=[id="old-id"]')
     assert "xpath=/html/body/div[1]" in step["selectors"]
@@ -73,7 +74,7 @@ def test_promotion_dedupes_and_caps(tmp_path):
     sels = json.loads(path.read_text())[0]["selectors"]
     assert len(sels) == sc._MAX_SELECTORS
     assert len(set(sels)) == len(sels)  # deduped
-    assert sels[0] == 'role=button[name="Go"]'
+    assert sels[0] == 'css=[id="stable"]'
     assert sels.index('css=[id="stable"]') < sels.index('css=[data-old="0"]')
 
 
@@ -164,3 +165,19 @@ async def test_heal_locate_refuses_ambiguous_lookalikes():
         fingerprint = {"tag": "input", "attrs": {"name": "amount", "placeholder": "Amount"}}
         assert await sc._heal_locate(page, fingerprint, editable=True) is None
         await browser.close()
+
+
+def test_promotion_never_demotes_the_recorded_xpath(tmp_path):
+    """A heal adds fallbacks; it must not push the exact recorded location out of rank
+    0 (2026-08-13 xpath-first directive)."""
+    path = _script(tmp_path, [
+        {"action": "click",
+         "selectors": ["xpath=/html/body/div[3]/button", 'css=[id="old"]'],
+         "fingerprint": {"tag": "button", "attrs": {"id": "old"}}},
+    ])
+    log = [_healed_entry(0, attrs={"id": "fresh"}, text="Save")]
+
+    assert sc.promote_healed(path, log) == [0]
+    sels = json.loads(path.read_text())[0]["selectors"]
+    assert sels[0] == "xpath=/html/body/div[3]/button"
+    assert sels[1] == 'css=[id="fresh"]'

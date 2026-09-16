@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "auto-agent",
+      "runtimeExecutable": ".venv.nosync/bin/python",
+      "runtimeArgs": [
+        "-m",
+        "automation.ui",
+        "--no-browser"
+      ],
+      "port": 8765
+    }
+  ]
+}

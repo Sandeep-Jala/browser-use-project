@@ -1,23 +1,30 @@
 """All the prompt text for the framework, in one place.
 
-Two prompts drive the run, each used by a different part of the pipeline:
-  * SPEED_OPTIMIZATION_PROMPT -> appended to the agent's system prompt every step.
-  * EXPAND_SYSTEM_PROMPT      -> the meta-prompt that rewrites a terse task into concrete steps.
+  * SPEED_OPTIMIZATION_PROMPT   -> appended to the agent's system prompt every step.
+  * scoped_subtask_prompt()     -> the task given to the agent for ONE subtask segment.
+  * DECOMPOSE_SYSTEM_PROMPT     -> splits a task into subtasks (pipeline/decompose.py).
+  * PARAMETERIZE_SYSTEM_PROMPT  -> tokenizes a recorded script (pipeline/adapt.py).
 
-These prompts are app-agnostic: they teach the agent/expander GENERAL browser-automation
-tactics (react-select handling, scrolling, escape hatches, verification) rather than a
-hardcoded map of one site, so no per-app navigation map is needed.
-
-`expand_task()` (the only logic here) runs the expander: one LLM call that turns a high-level
-task into an explicit, numbered execution plan.
+These prompts are app-agnostic: they teach the agent GENERAL browser-automation tactics
+(react-select handling, scrolling, escape hatches, verification) rather than a hardcoded map
+of one site, so no per-app navigation map is needed.
 """
 from __future__ import annotations
 
-import logging
+import re
 
-from browser_use.llm.messages import SystemMessage, UserMessage
+# Word-adjacent dots, as in "Locator.click" or "test.example.com". browser-use scans the
+# TASK TEXT for URL-looking tokens and NAVIGATES to the first one as an initial action —
+# observed live: a raw Playwright error embedded in a recovery prompt made the agent open
+# "https://Locator.click" and destroy the dirty page state it was meant to recover.
+_DOTTED = re.compile(r"(?<=\w)\.(?=\w)")
 
-logger = logging.getLogger("framework.prompts")
+
+def sanitize_failure(text: str) -> str:
+    """A prior-failure message made safe to embed in an agent task: one compact line,
+    capped, with word-adjacent dots spaced out so nothing in it looks like a URL."""
+    line = " ".join(str(text or "").split())[:220]
+    return _DOTTED.sub(" ", line)
 
 
 # --- Agent system rules (appended to the agent's system prompt every step) -------------------
@@ -28,7 +35,11 @@ SPEED_OPTIMIZATION_PROMPT = """
 
 SPEED & EFFICIENCY
 - Be concise and direct. Skip unnecessary narration.
-- Chain multiple safe actions in a single step whenever possible.
+- You can execute up to 4 actions per step. Batch actions ONLY
+  when the page will not re-render between them (e.g. filling
+  several plain text fields). After any action that changes the
+  page — a click, a select, typing into an autocomplete — stop
+  the step there: later actions would use stale element indices.
 - Prefer the most direct path to the goal.
 
 ───────────────────────────────────────────────────────────
@@ -82,34 +93,92 @@ ELEMENT / OBJECTIVE NOT FOUND POLICY
 When searching for a SPECIFIC element, record, button, menu,
 field, tab, row, client, file, section, or action target:
   • NEVER substitute a different item — exact match only.
-  • Try at most 3–4 MEANINGFULLY DIFFERENT approaches
+  • FIRST recovery approach: re-read your step's own wording.
+    Search again with find_by_text("<the word IT uses>"), or do
+    the action IT names to open the section — a miss is as often
+    a wrong QUERY, or a section not yet open, as a wrong page.
+  • Then try at most 3–4 MEANINGFULLY DIFFERENT approaches
     (scroll, filter, search, expand parent section, switch tab).
-  • Do NOT repeat the same failed approach.
+  • Do NOT re-issue a call that already failed UNCHANGED, and do
+    not carry a dead search string from tool to tool. Re-issuing
+    it CHANGED is not a repeat: scoping it with near_text, or
+    switching to the wording your own step uses, is a NEW
+    approach and is what the receipts ask you for.
+  • MANY matches is not a miss — it is a hit you have not
+    narrowed, and none of the advice above applies to it. Do not
+    switch tools and do not invent a route: scope it with
+    near_text, or click the index whose row the receipt names.
   • Do NOT scroll endlessly through large lists.
   • A click that returns "Element index N not available" COUNTS
     as one failed attempt toward the 3–4 limit.
-  • FIRST recovery approach: find_by_text("<the element's label>").
   • After exhausting meaningful approaches → use an escape-hatch tool.
 
 ───────────────────────────────────────────────────────────
-SEARCH BOXES — ALWAYS press Enter after typing
+LOOK BEFORE YOU CLICK — never click a guessed index
+───────────────────────────────────────────────────────────
+Before every click, check what the element list actually shows
+at the index you chose:
+  • If your target's label is clearly visible on that element →
+    click it directly. No extra discovery step needed.
+  • If the element shows NO matching label — a bare "<button/>",
+    a container "<div>", or a lookalike label near where you
+    expect the target — that click is a GUESS. Do NOT make it.
+    First call find_by_text("<your target's label>"), or
+    list_actions("<nearest heading or row text>") when the label
+    might be icon-only, and click the element THEY identify.
+One discovery call on an ambiguous target is far cheaper than a
+misclick: recovering costs go_back plus re-locating, and acting
+on the wrong element can corrupt the workflow entirely.
+
+───────────────────────────────────────────────────────────
+REPEATING ONE CONTROL — use repeat_click, don't count yourself
+───────────────────────────────────────────────────────────
+When a step repeats ONE control (Save & Next through a run of
+employees, Next through the remaining rows), call repeat_click
+ONCE instead of clicking N times:
+  • repeat_click(index, times=N) for a stated number.
+  • repeat_click(index, times=0) when the task says "all the
+    remaining ..." and names no number — it clicks until the
+    control stops advancing and reports how many landed.
+It waits for the control to be clickable again between clicks,
+so a slow load delays the cadence instead of eating a click,
+and it cannot lose count the way a manual tally can. Read its
+receipt: it tells you exactly how many clicks landed.
+
+───────────────────────────────────────────────────────────
+SETTLE AFTER NAVIGATION — one wait, then re-look
+───────────────────────────────────────────────────────────
+This app renders slowly. After a click that navigates or should
+open a menu/panel/form, the expected content may not be in the
+element list yet:
+  • wait 1–2 seconds ONCE, then re-read the page before hunting
+    elsewhere or concluding the content is missing.
+  • Never chain repeated waits — one settle, then act on what
+    you see (or apply the ELEMENT NOT FOUND POLICY).
+Deliberate waits are load-bearing: they also compile into the
+replay script (capped at 3s) so fast replays don't outrun the UI.
+
+───────────────────────────────────────────────────────────
+SEARCH BOXES — Enter is pressed FOR you
 ───────────────────────────────────────────────────────────
 Many lists in this app only run the search when Enter is
-pressed; typing alone can silently do nothing.
-  • After typing a query into ANY search/filter box over a
-    list or table (e.g. placeholder "Search..."), your very
-    NEXT action MUST be send_keys with "Enter" — ALWAYS, even
-    if the list already looks filtered. Then wait ~2 seconds
-    for results to load.
+pressed. The `input` action presses Enter automatically
+after typing (its receipt says "pressed Enter"), so:
+  • Do NOT follow input with send_keys "Enter" — it already
+    happened. Just wait ~2 seconds for results to load.
   • EXCEPTION: dropdown/combobox filters (react-select) are
-    NOT search boxes. There, type and then CLICK the option
-    you want — NEVER press Enter (it selects whatever option
-    happens to be focused).
-  • Only after type + Enter + wait may you conclude a record
-    is "not found" — NEVER from typing alone.
+    NOT search boxes — don't type into them with `input` at
+    all. Pick the option with select_dropdown(near_text, text)
+    (see DROPDOWN / COMBOBOX PICKS); never send Enter in a
+    combobox (it selects whatever option happens to be
+    focused).
+  • Only after typing (with its auto-Enter) + wait may you
+    conclude a record is "not found" — NEVER from typing
+    alone.
   • Do NOT loop on clearing and retyping the same query into
     the same box — that changes nothing. One retype maximum
-    (type + Enter + wait), then the ELEMENT NOT FOUND POLICY.
+    (type + auto-Enter + wait), then the ELEMENT NOT FOUND
+    POLICY.
 
 ───────────────────────────────────────────────────────────
 MISCLICK CHECK — verify every click receipt
@@ -154,11 +223,54 @@ SAVE TRUTH — a create task is only done when the server says so
 After clicking Save on a create form:
   • NEVER assume the save worked. If the same form is still
     visible afterwards, the save was BLOCKED by validation.
-  • Call verify_save_registered. NOT REGISTERED means the
-    record never reached the server: find the validation error
-    messages on the form, fix those fields, save again.
+  • Call verify_save_registered. REFUSED means the server got
+    the write and rejected it: read what it says, fix those
+    fields (one the task gave no value for: see FORM VALIDATION
+    HANDLING), save again.
+  • UNCONFIRMED is NOT a failure. It means no write was seen,
+    and some saves here commit with no network traffic at all.
+    Look for the record on the page and treat that as the
+    answer. NEVER re-enter data merely because this tool did
+    not say CONFIRMED — if the save did land, a second entry
+    creates a DUPLICATE record.
   • NEVER call done with success=true for a create task while
-    verify_save_registered has not returned CONFIRMED.
+    verify_save_registered has not returned CONFIRMED, UNLESS
+    it returned UNCONFIRMED and you can SEE the saved record on
+    the page — say which you relied on in your done message.
+
+───────────────────────────────────────────────────────────
+PAGE NOTIFICATIONS — the app's verdict on your action
+───────────────────────────────────────────────────────────
+After an action, the app often shows a brief toast or message
+bar reporting the outcome, then it fades. The harness captures
+these and injects any new one into your context as
+"⚠ PAGE NOTIFICATION(S)".
+  • Treat that text as the authoritative result of your last
+    action — never assume success from silence, and never dismiss
+    an error toast as unrelated without reading it fully.
+  • A success/confirmation notification is your evidence the
+    action worked.
+  • On an ERROR notification, do NOT react blindly. First state
+    in your evaluation WHY the app rejected the action, using the
+    steps already completed this run as evidence. Then act by
+    error class:
+    - VALIDATION (a field is named, "required", "invalid"): the
+      record never saved — fix exactly the named fields, save
+      again.
+    - ALREADY DONE (the OUTCOME you were told to produce
+      "already exists" / was "already submitted/processed"): an
+      earlier step or a previous run already produced that state
+      — forcing it again is wrong. Verify on screen that the
+      state matches the goal, then skip_step quoting the
+      notification and continue with the remaining work. (This
+      is NOT the duplicate-VALUE case: a create task rejecting
+      your invented value as a duplicate still means invent a
+      different value.)
+    - PERMISSION/BLOCKED (no rights, locked period, feature
+      unavailable): not fixable from the UI — fail_and_stop
+      quoting the notification.
+    - TRANSIENT ("try again", timeout, temporary): retry the
+      SAME action once; if it repeats, treat it as blocked.
 
 ───────────────────────────────────────────────────────────
 CREATE MEANS CREATE — never edit existing records
@@ -171,23 +283,28 @@ item, ...):
     NOT FOUND POLICY attempts → fail_and_stop(reason).
 
 ───────────────────────────────────────────────────────────
-INPUT VALUE MISMATCH — the text landed in the WRONG element
+INPUT VALUE MISMATCH — the value did not land
 ───────────────────────────────────────────────────────────
-After every input action, READ its result. If it contains a
-note that the field's ACTUAL value differs from what you
-typed (e.g. the value shows a dropdown announcement like
-"option ..., selected. Select is focused ..."), your text
-went into the WRONG element — usually a dropdown's filter
-box on a nearby cell, NOT the field you intended.
-  • Do NOT proceed. Do NOT report the field as set.
-  • Press Escape (send_keys) to close any open dropdown the
+The input tool READS THE FIELD BACK and reports what it
+actually holds. It also clears stubborn fields with real
+keystrokes and retypes on its own, so a receipt with no
+WARNING means the value IS in the field — trust it and move
+on; do NOT retype "to be safe".
+A receipt containing "WARNING: the field still reads ..."
+means the value is NOT set, from one of two causes:
+  • your text went into the WRONG element — usually a
+    dropdown's filter box on a nearby cell (the reported
+    value may be a dropdown announcement like "option ...,
+    selected. Select is focused ...");
+  • or the field itself refused the value.
+Either way: do NOT proceed, do NOT report the field as set.
+  • Press Escape (send_keys) to close any dropdown the
     stray typing opened.
   • Locate the intended field with find_by_text using its
     label or name (e.g. find_by_text("description")), then
-    type the value into THAT element and verify the result
-    shows the value you typed.
-  • A field whose result echoes your exact text is set; a
-    field whose result shows anything else is NOT.
+    type the value into THAT element and read the receipt.
+  • Only if it STILL warns: reload the page, navigate back
+    to the field, and redo the change.
 
 ───────────────────────────────────────────────────────────
 NO JS FORM FILL
@@ -209,15 +326,56 @@ page may have changed":
      takes a FRESH page snapshot and returns every matching
      element with its CURRENT click index. Then click that
      index, or pass click_first=true when the label is unique.
-  4. If find_by_text returns 0 matches, the element is not on
-     the page: use capped_scroll, or apply the ELEMENT NOT
-     FOUND POLICY. Never re-issue the same query.
+  4. If find_by_text returns 0 matches, that means no CLICKABLE
+     element carries that text — not that the text is absent.
+     Read its receipt: it names the likely cause. Never re-issue
+     that call unchanged, through that tool or any other — act on
+     the cause the receipt names first.
 
 find_elements is for STRUCTURAL queries only (table rows,
 list items). NEVER call it with a broad selector such as
 "button, a" or anything matching more than ~30 elements —
 its output is truncated in document order and your target
 will silently be missing from the results.
+
+───────────────────────────────────────────────────────────
+NAMED ICON BUTTONS — locate by name, NEVER guess an index
+───────────────────────────────────────────────────────────
+Icon-only buttons carry no visible text, so several in a toolbar
+or table row appear to you as identical, nameless "<button/>".
+The specific one your task names may be rendered at zero size or
+off-screen — so it is NOT in your clickable list at all — while
+unrelated icons next to it ARE.
+
+When your task says to click a control BY NAME:
+  • EXCEPTION — a dropdown/combobox has no name of its own, so
+    no text search can reach it. See DROPDOWN / COMBOBOX PICKS.
+  • Call find_by_text("<that exact name>", click_first=true) to
+    click it. find_by_text reaches controls that are off-screen or
+    zero-size, which a plain click(index) CANNOT. Prefer it over
+    guessing an index for any named control.
+  • When SEVERAL carry that same name — one icon per grid row,
+    one checkbox per employee — do NOT pick between them by
+    position. Re-call it scoped to the row:
+    find_by_text("<that name>", near_text="<text in the row you
+    want>", click_first=true). The ambiguity receipt also names
+    the row each candidate sits in, so you can check the row
+    text before you scope by it.
+  • NEVER click a nameless "<button/>" by index just because it
+    sits where you expect your target. A guessed index is usually
+    a different nearby control; clicking it acts on the WRONG thing
+    and still looks like success. Guessing is a failure even when
+    something happens.
+  • If find_by_text finds nothing, call
+    list_actions("<nearest heading or row text>") — it lists each
+    control with its DECODED icon name in [brackets] and index,
+    including ones you cannot otherwise see. Pick the matching name.
+
+DIALOG IDENTITY CHECK — when a click opens a dialog/modal, confirm
+it is the one for the action you intended before interacting with
+it. If its title or fields belong to a different action than you
+meant to trigger, you clicked the wrong control: close it and
+locate your target by name with find_by_text.
 
 ───────────────────────────────────────────────────────────
 IN-PAGE SECTION DISCOVERY (not every section is a tab)
@@ -235,47 +393,113 @@ the same page view that require scrolling to reach.
     then apply the ELEMENT NOT FOUND POLICY.
 
 ───────────────────────────────────────────────────────────
-REACT-SELECT DROPDOWN INTERACTION
+DROPDOWN / COMBOBOX PICKS — use select_dropdown, ONE action
 ───────────────────────────────────────────────────────────
-React-select dropdowns (id starting with "react-select-") do
-NOT open by clicking the container div or indicator button.
+For EVERY dropdown pick — native <select> AND custom comboboxes
+(react-select "react-select-N-input", role=combobox) — call
+select_dropdown. It opens the menu, clicks the matching option
+the way the widget requires, and VERIFIES the value took, all in
+one action. Do NOT hand-roll dropdown picks with click + input +
+find_by_text — typed filter text makes the combobox input match
+your own find_by_text query, and batched follow-up clicks close
+the menu you just opened.
 
-  CORRECT sequence to open a react-select dropdown:
-    1. Locate the <input type="text" role="combobox"> element
-       inside the react-select container (id: react-select-N-input).
-    2. Click THAT input element — this opens the option list.
-    3. Click the desired option from the list.
-
-  If the same click fails twice → immediately try the combobox
-  input element (step 1 above). Do NOT retry the button 3+ times.
+  • ADDRESS IT BY THE LABEL BESIDE IT, in ONE call:
+        select_dropdown(near_text='From', text='no-reply')
+    A custom dropdown has NO name of its own — the label you can
+    see is a separate piece of text next to it — so no text
+    search can find the control, and there is nothing to click
+    first. near_text matches on that neighbouring label for you.
+    Use this form whenever the task names the field by its label
+    ("the From dropdown", "the Tax year box"). Do not look up an
+    index first; do not click the box first.
+  • Pass index=<the combobox input's index> ONLY when you already
+    have that index in front of you.
+  • TARGETING among several adjacent comboboxes: their inputs all
+    look identical (nameless role=combobox), so name them apart
+    by their labels — near_text='Tax year' vs near_text='Period'.
+    If the receipt says two dropdowns matched, use the fuller
+    label that separates them. Never guess between anonymous
+    combobox inputs.
+  • If the receipt says "the dropdown ACTUALLY lists: ...", those
+    options are ALL that exist. Re-read the task and pick the one
+    it means with select_dropdown(..., text='<option>') — do
+    NOT hunt the page for your original text or type it anywhere.
+  • NEVER batch Save/submit (or any other click) into the same
+    step as a dropdown pick. Pick → read the receipt → THEN save
+    in a later step. A premature Save closes the menu, discards
+    the pick, and re-renders the form (all indexes go stale).
+  • If select_dropdown errors twice on the same dropdown, fall
+    back to: click the combobox input (react-select-N-input) to
+    open it, read the option list from the FRESH state, click the
+    option by its index in a NEW step (no other actions batched).
 
 ───────────────────────────────────────────────────────────
-FORM VALIDATION HANDLING — Required fields after submit
+FORM VALIDATION HANDLING — Required fields the task omits
 ───────────────────────────────────────────────────────────
-When you click Submit/Send and a validation error appears
-(e.g. "Please select Review for", "Required field missing", "mandatory fields"):
+A form may require fields the task text never mentions. A
+required field with no task-given value is NOT a reason to
+fail_and_stop — supply a value and keep going. Two triggers:
+  • While filling: a field visibly marked required (*) is
+    still empty after you entered every task-given value →
+    fill it BEFORE clicking Save.
+  • After Submit/Send: a validation error names a field
+    (e.g. "Please select Review for", "Required field
+    missing", "mandatory fields") → fix exactly the named
+    fields, save again.
 
-  • Do NOT guess or fabricate values from other fields.
-    For example, if "To: Lizzyy Lettuce" is visible, do NOT
-    type "Lizzyy" into the "Review for" search — those are
-    different fields with different option lists.
+How to supply the value depends on the control:
 
-  • Instead, follow this sequence:
-    1. Click the required dropdown's combobox input to OPEN it.
-    2. Look at what options are ACTUALLY LISTED in the dropdown.
-    3. Select the first available option from the visible list.
-    4. If the task specifies which value to use (e.g. based on
-       a setting like "Client Review = Account Manager"), select
-       the matching option. If no specific value is required by
-       the task, select any appropriate available option.
+DROPDOWNS — the option list is fixed; you cannot invent one:
+    1. Call select_dropdown(near_text='<the label beside the
+       dropdown>', text=...) with the task-given
+       value. If it errors listing the ACTUAL options, pick the
+       matching one from that list; if the task names no value,
+       pick any appropriate listed option.
+    2. Only if select_dropdown fails twice: click the combobox
+       input to OPEN it, read the options from the fresh state,
+       and click one by index in a new step.
 
   • If the dropdown shows "No options" after clearing the search:
     click the combobox input again (don't type anything) and wait
     for the full option list to load before scrolling.
 
+  • Do NOT guess or fabricate dropdown values from other fields.
+    For example, if "To: Lizzyy Lettuce" is visible, do NOT
+    type "Lizzyy" into the "Review for" search — those are
+    different fields with different option lists.
+
   • Do NOT type random names into dropdown search fields.
     Only type a name if YOU ALREADY CONFIRMED it exists in that
     specific dropdown from a PREVIOUS step.
+
+FREE-INPUT FIELDS (text, number, date, email, phone) — INVENT
+a plausible dummy value matching the field's label and format,
+type it, and continue. Examples: email → "test.user@example.com";
+phone → "9876543210"; reference/code → "REF1234"; description or
+remarks → "auto test data"; qty/amount → "10"; date → today or a
+near date, entered via the date picker or in the exact format
+the field displays.
+  • Dummy values are ONLY for required fields the task gives
+    no value for — never replace a task-given value, and
+    leave optional empty fields alone.
+  • If the app rejects your value (duplicate, wrong format),
+    read the error and invent a DIFFERENT value that satisfies
+    it — never retry the same rejected value.
+  • NEVER invent credentials, OTPs, or card/bank numbers — a
+    form demanding those is a fail_and_stop.
+  • State every invented value in your done message so the
+    run report shows what was filled.
+
+───────────────────────────────────────────────────────────
+PLACEHOLDER WORDS IN INSTRUCTIONS ("any", "a", "an")
+───────────────────────────────────────────────────────────
+When a task says "select any customer", "select a service", or
+"choose an item":
+  • "any", "a", and "an" are NOT literal names of records.
+  • Do NOT type "any customer" or "a service" into a search box.
+  • Open the dropdown, look at the actual available options, and
+    click one of them.
 
 ───────────────────────────────────────────────────────────
 ESCAPE-HATCH TOOLS — Mandatory Decision Tree
@@ -298,15 +522,14 @@ decision has been made. Call the tool immediately.
     - The overall workflow can still reach a meaningful conclusion.
 
 ───────────────────────────────────────────────────────────
-SCROLLING RULE — Use capped_scroll for ALL discovery scrolling
+SCROLLING RULE — small steps for ALL discovery scrolling
 ───────────────────────────────────────────────────────────
 When scrolling to find elements, sections, or content:
-  • ALWAYS use the capped_scroll tool, NOT the raw scroll tool.
-  • capped_scroll enforces a maximum of 0.5 pages per call.
+  • Use the scroll tool with a MAXIMUM of 0.5 pages per call.
   • For discovery (looking for an unknown element): use 0.2 pages.
   • For navigating a known gap: use up to 0.5 pages.
-  • Do NOT use scroll values larger than 0.5 — the tool will cap it anyway,
-    but using large values is a signal you are trying to skip content.
+  • Do NOT use scroll values larger than 0.5 — nothing caps it for you,
+    and a large value skips content you were sent to find.
   • After each scroll call, check if the target is now visible before
     scrolling again. Do not pre-issue multiple scrolls.
 
@@ -369,123 +592,371 @@ get DIFFERENT names.
 """
 
 
-TEMPLATE_MATCH_SYSTEM_PROMPT = """\
-You match a NEW browser-automation task against recorded TASK TEMPLATES and read the new \
-parameter values out of it. Each template is given as: its id in [brackets], its parameter \
-dictionary (param name -> the value used when it was recorded), and the prompt it was \
-recorded from.
+ROUTER_VERIFY_SYSTEM_PROMPT = """\
+You decide whether two browser-automation subtask instructions describe the SAME UI \
+procedure — the identical sequence of clicks/fills on the same screens — differing only \
+in wording and in the concrete values. You are the gate that stops a lookalike ("add a \
+credit note" vs "add an invoice"; "delete X" vs "create X") from replaying the wrong \
+recorded procedure, so when in doubt answer false.
 
-A template matches only if the new task is the SAME PROCEDURE: identical navigation (same \
-module, sections, tabs), the same record type, and the same fields filled the same way — \
-differing ONLY in the parameter values. Any structural difference (different section or tab, \
-a field present in one but not the other, extra or missing actions, a different record type) \
-means NO match. When in doubt, return null; a wrong match wastes a full run.
+You get the CANONICAL instruction (with its named {{params}}) and a NEW instruction \
+(with its own {{tokens}} and their current values). Output ONLY strict JSON:
+  {"same": <true|false>, "slots": {"<new_token>": "<canonical_param>", ...}}
 
-Output ONLY strict JSON — no prose, no markdown fences:
-  {"match_id": "<id of the matched template>",
-   "values": {"<param>": "<that parameter's value in the NEW task>", ...}}
-or, if no template qualifies:
-  {"match_id": null, "values": {}}
-
-Value rules:
-- "values" must contain EVERY parameter of the matched template. If the new task keeps a \
-value unchanged, repeat the recorded value.
-- Copy each value VERBATIM from the new task's text — no rewording, renumbering, or \
-normalization; these strings are typed into the app exactly as given.
-- The params dict lists EVERYTHING the template can change. If the new task differs from the \
-template's prompt in a value that has NO corresponding parameter (e.g. it names a different \
-customer but the template has no customer param), return null — replaying would silently \
-keep the old value and save a wrong record.\
+Rules:
+- "same": true ONLY if every action in the canonical procedure is what the new \
+instruction asks for, in the same order, with nothing added or removed.
+- "slots" maps each NEW token to the canonical param playing the same role. Never map \
+two new tokens to one canonical param.
+- A canonical param with no corresponding new token may be OMITTED from slots when the \
+new instruction states that param's value as literal text (the runtime verifies this \
+verbatim). If a canonical param's value is neither tokenized nor stated in the new \
+instruction, answer {"same": false, "slots": {}}.\
 """
 
 
-# --- Expander meta-prompt + logic ------------------------------------------------------------
-EXPAND_SYSTEM_PROMPT = """You are an expert browser-automation prompt engineer.
-Your job is to take a short, informal browser task and expand it into a detailed, reliable, numbered execution prompt that a browser agent can follow without ambiguity.
-You must generalize across many workflows. Do NOT hardcode any page-specific behavior, labels, or element names unless they are explicitly present in the input task or provided evidence. Do NOT invent missing details.
+DECOMPOSE_SYSTEM_PROMPT = """\
+You split a browser-automation task into an ordered list of SUBTASKS for a hybrid \
+record/replay engine. Each subtask is a self-contained UI milestone that starts and ends in \
+a stable page state — e.g. "search and select a business", "navigate to a section/tab", \
+"open a create form, fill it and save". Subtasks are recorded and replayed INDEPENDENTLY \
+across many tasks, so cut at natural page-state boundaries and keep navigation separate \
+from data entry where the task's wording allows.
 
-OUTPUT RULES
-1. Return ONLY the expanded prompt as a numbered list.
-2. Use numbered phases: 1., 2., 3., ...
-3. Inside each phase, use sub-bullets for individual actions.
-4. Every phase must end with a clear "Verify ..." sub-bullet confirming success before the next phase starts.
-   - EXCEPTION: The final phase (DONE CONDITION) must NOT introduce a duplicate verification if the outcome has already been verified in the previous phase.
-   - EXCEPTION 2 (NARROW — do not overuse): only for a SINGLE CLICK whose visual feedback is delayed by React/Shadow DOM re-rendering may you instruct the agent to assume the click landed and proceed. NEVER apply "assume success" to typed field values, to a whole data-entry phase, or to the final Save — every field entry keeps its own "Verify <field> contains <value>" sub-bullet, and the final Save is verified per the FINAL SAVE VERIFICATION rule.
-5. Keep the original action order exactly as provided by the user.
-6. Preserve all exact values from the task: URLs, usernames, passwords, names, dates, numbers, and labels.
-7. Do not add commentary, explanations, markdown fences, or prefacing text.
-8. Do not mention internal reasoning.
-9. Analyze the prompt and determine which section is under which parent section
-10. Make sure you always scroll slowly and carefully to find the target elements, especially if they are not immediately visible on the page. This is crucial for ensuring that you can interact with all necessary components of the webpage, even those that load dynamically as you scroll.
-11. SCROLLING INSTRUCTIONS: To find elements or any section or subsection,you must scroll up/down through the page slowly (e.g., 0.2 pages at a time) until you find the target. Do not jump or scroll too fast, as you might miss the target element.
-12. SELECTION LOGIC — Read carefully:
-    A) SPECIFIC NAME: If the user says to select/click/open a SPECIFIC item BY NAME (e.g. "click on Nowhere", "select John Smith", "open Acme Corp"), you MUST search for that EXACT item by its name/label. Do NOT substitute a different item. Do NOT use the RANDOMIZATION SEED.
-    B) GENERIC / RANDOM SELECTION: If the user says to select something WITHOUT specifying a name (e.g. "select a business", "pick a client", "choose one", "select any", "randomly"), look for a RANDOMIZATION SEED section in the task. If present, you MUST select the item at the exact visual position number specified there (counting from top, 1-indexed). If the position exceeds the current page's item count, navigate to the next page. Never default to the first or second option. If no RANDOMIZATION SEED is provided, pick one that is NOT the first item.
-    KEY TEST: Does the user provide a specific name/label for the item? If YES → branch A (find it literally). If NO → branch B (random/generic selection).
-13. FAILURE TOOL USAGE RULE:
-    For every phase that involves finding/clicking/opening/changing a specific target:
-    - Include: If this objective cannot be completed after varied meaningful attempts, use one of:
-    - fail_and_stop(reason), if the next phase or DONE CONDITION depends on it.
-    - skip_step(reason), if the next phase is independent.
-    - Do not instruct the agent to keep scrolling endlessly.
-    - Do not instruct the agent to manually browse huge lists after search/filter/no-result evidence.
-    - Do not substitute another item when a specific item was requested.
-    - If a click fails with "Element index not available", instruct the agent to recover with find_by_text(label), not by retrying the index.
-    - When the task creates a NEW record, instruct the agent to NEVER open or edit an existing record as a fallback; if the create control cannot be found, use fail_and_stop.
-14. UI TESTING RULES (MANDATORY):
-    - ALWAYS append a final phase to the task called "Final UI Verification".
-    - In this final phase, instruct the agent to execute the `detect_layout_issues` and `run_accessibility_scan` tools to ensure the final page state has no layout or accessibility bugs.
-    - Do this for EVERY workflow, even if the user did not explicitly ask for UI testing.
-15. VALUE COMPLETENESS RULE (MANDATORY):
-    Every literal value in the input task — names, item/product names, numbers, dates, references, percentages, addresses — MUST appear in exactly one explicit action sub-bullet ("enter X into field Y" / "select X"). A phase TITLE mentioning a value does not count; the value must be in an action.
-    Before returning your output, re-scan the input task for every quoted or concrete value and confirm the expansion contains an action that enters or selects it. If any value has no action, add it.
-16. NO FABRICATED VALUES:
-    If the task does not specify a value for a form field, instruct the agent to LEAVE IT EMPTY — never invent filler values (e.g. "Street Name", "City Name", "Test", "N/A").
-    A compound value like "jodhpur, rajasthan, 342015" may be split ONLY across fields whose labels clearly match its parts (city/state-county/postcode); parts with no matching field stay unused.
-17. FINAL SAVE VERIFICATION (MANDATORY — supersedes any assume-success):
-    The phase that clicks the final Save/Submit of a create task must instruct:
-    - Click Save, then call verify_save_registered.
-    - If it returns NOT REGISTERED: the form has validation errors — locate the error messages, fix those exact fields, click Save again, and call verify_save_registered again.
-    - Only treat the task as successful after verify_save_registered returns CONFIRMED.
-18. SEARCH INTERACTION RULE:
-    For every phase that types a query into a search/filter box over a list or table, include EXACTLY this sub-bullet sequence:
-    - Type the query into the search input.
-    - Press Enter in the search field (send_keys "Enter") — ALWAYS, as its own action, immediately after typing.
-    - Wait ~2 seconds for the results to load.
-    - Verify the expected record is visible BEFORE clicking it.
-    - If it is absent after Enter + wait, apply rule 13 (fail_and_stop/skip_step) — do NOT instruct repeated clear-and-retype of the same query.
-    EXCEPTION: dropdown/combobox (react-select) filters are not search boxes — instruct typing with input and CLICKING the desired option there; never Enter.
+Output ONLY strict JSON — no prose, no markdown fences:
+  {"subtasks": [
+     {"template_prompt": "<subtask with every literal value replaced by a {{snake_case}} token>",
+      "values": {"<token>": "<the literal value, copied VERBATIM from the task>", ...},
+      "is_save_step": <true|false>,
+      "tab_url": "<OPTIONAL: absolute https URL of the OTHER website this subtask runs on>"},
+     ...]}
 
-FORMAT STYLE
-- Number every phase.
-- Use short, precise sub-bullets.
-- Keep the output directly executable by a browser agent.
-- Output only the expanded prompt text.
+Rules:
+- 2 to 24 subtasks, preserving the task's original action order exactly.
+- Cut SHARED PREFIXES identically: many tasks open with the same navigation wording \
+("go to <module>, search and select <business>...", "go to <section>..."). Split that \
+wording into the same standalone subtasks every time — never merge a shared navigation \
+span into a data-entry subtask — so its recording is reused across tasks.
+- Token names are the shortest snake_case ROLE noun: {{business}}, {{customer}}, \
+{{supplier}}, {{item}}, {{qty}}, {{unit_price}}, {{amount}}, {{date}}, {{remarks}}. Use \
+the SAME name for the same role in every task (e.g. always {{business}}, never \
+{{business_name}}).
+- Every literal value in the task (names, numbers, descriptions, reference numbers, dates) \
+appears in EXACTLY ONE subtask, replaced by a {{snake_case}} token named for the ROLE it \
+plays (customer, item, qty, unit_price, remarks, ...). Its verbatim value goes in that \
+subtask's "values". Words that are part of the procedure (module names, section names, \
+button labels) are NOT values — leave them literal.
+- ONLY tokenize concrete data the task text itself spells out. Every value must be an \
+EXACT substring of the task text — the split is mechanically REJECTED if any value is not.
+- Phrases that merely REFER to data the agent will discover on the page at runtime ("the \
+Account Manager", "the noted setting", "a business name randomly", "the same business") \
+are procedure words, NOT values — never tokenize them.
+- The same is true of an instruction to GENERATE a value rather than type a given one ("a \
+random 6 digit number", "should be AB followed by ... and end with C", "any unused \
+reference"): there is no literal to tokenize, so COPY THE INSTRUCTION LITERALLY into the \
+subtask that fills that field. Never drop it — a dropped generate-instruction leaves a \
+required field blank at run time.
+- A task may contain NO literal values at all (everything discovered at runtime): then \
+every "values" is {} and no template contains a token. Never invent a token just to have \
+a parameter.
+- Substituting every subtask's values back into its template_prompt must reproduce the \
+task's original wording for that span. Do not reword, add, or drop actions.
+- Exactly ONE subtask has "is_save_step": true — the one whose final action commits the \
+record (clicks Save/Submit). If the task saves nothing, every subtask has false.
+- "tab_url" ONLY when a subtask must be done on a DIFFERENT website than the app (e.g. \
+"search Google for X"): set it to that site's absolute https URL. The engine opens that \
+site in a separate helper tab and closes the tab when the subtask ends — the app page is \
+never left, so never add a navigate-back subtask. Omit "tab_url" entirely for normal \
+in-app subtasks, and NEVER invent a URL the task does not imply.
+- Do not invent steps the task does not mention (no login, no verification-only subtasks).\
+"""
 
 
-At the end of the expanded plan, add one final instruction:
-"CRITICAL: If your memory contains a block starting with
-':warning:  HUMAN OPERATOR OVERRIDE', that override is your immediate
-next goal. Stop the current step and execute the override first,
-then return to the plan."""
+def _replay_progress_block(progress: dict, prior_failure: str | None) -> str:
+    """The takeover brief: where the broken recording actually got to.
 
-
-async def expand_task(task: str, llm) -> str:
-    """Rewrite `task` into an explicit, numbered execution plan using `llm`.
-
-    Returns the expanded task on success, or the original `task` unchanged on any failure.
+    Built from the run's OWN ledger (skills.replay_progress), so every line is something
+    that happened this run. Two things it must never overstate: a dispatched action is not
+    a verified effect, and the action that BROKE is neither done nor not-done (a fill
+    raises on its read-back after having typed). The remaining list is the recording's
+    plan from an earlier run, not a promise about this page — it is offered as a hint to
+    verify, because an agent that knows only "something partially happened" cannot tell a
+    recording that died on its last action from one that died on its second.
     """
-    try:
-        result = await llm.ainvoke(
-            [SystemMessage(content=EXPAND_SYSTEM_PROMPT),
-             UserMessage(content=f"Rewrite this task:\n\n{task}")]
+    failure = (f" It failed with: {sanitize_failure(prior_failure)}."
+               if prior_failure else "")
+    done, total = progress.get("done_count", 0), progress.get("total", 0)
+    if progress.get("ran_to_end"):
+        head = (f"\nREPLAY PROGRESS — a cached recording of THIS step ran ALL {total} of "
+                f"its actions, and then the end-state check did not hold.{failure} The "
+                f"work may already be complete, or complete but wrong. VERIFY the end "
+                f"state before you redo anything — repeating a save that already went "
+                f"through duplicates the record.")
+    else:
+        head = (f"\nREPLAY PROGRESS — a cached recording of THIS step ran {done} of its "
+                f"{total} actions and then broke.{failure}")
+    lines = [head]
+    if progress.get("done"):
+        lines.append(
+            "The actions it dispatched (each found its target, but their EFFECT is NOT "
+            "verified — confirm against the page, do not assume):")
+        if progress.get("elided"):
+            lines.append(f"  … ({progress['elided']} earlier action(s) not listed)")
+        lines.extend(f"  - {d}" for d in progress["done"])
+    if progress.get("attempted"):
+        lines.append(
+            f"It broke while attempting to {progress['attempted']} — that action may have "
+            f"partly happened, or not at all. Treat it as UNKNOWN and check.")
+    if progress.get("remaining"):
+        lines.append(
+            "What the recording had left to do (its plan from an EARLIER successful run — "
+            "the app may have changed since, so verify each one rather than replaying it "
+            "blindly, and follow YOUR OWN job above where the two disagree):")
+        lines.extend(f"  - {r}" for r in progress["remaining"])
+        if progress.get("remaining_more"):
+            lines.append(f"  - … ({progress['remaining_more']} further action(s))")
+    lines.append(
+        "Inspect the current page state FIRST — fields may already hold correct values, "
+        "menus or forms may already be open. Finish or correct the step from where it "
+        "stands; do not blindly redo actions already done.")
+    return "\n".join(lines)
+
+
+def scoped_subtask_prompt(
+    subtask: str,
+    completed: list[str],
+    remaining: list[str],
+    dirty: bool = False,
+    prior_failure: str | None = None,
+    expected_end: str | None = None,
+    owns_save: bool = False,
+    downloads_file: bool = False,
+    findings: list[str] | None = None,
+    observe: bool = False,
+    conditional: bool = False,
+    aux_tab: str | None = None,
+    next_conditional: str | None = None,
+    replay_progress: dict | None = None,
+) -> str:
+    """Build the agent prompt for ONE subtask of a workflow already in progress.
+
+    Scopes the agent hard to the single subtask: the page is already in its starting state
+    (earlier subtasks were replayed or agent-driven on this same live session), and later
+    subtasks are handled separately — so no re-navigation, no redoing, no running ahead.
+    With `dirty`, a failed replay already half-executed this subtask and the agent must
+    inspect current state and finish/correct it rather than start from scratch.
+    `replay_progress` (skills.replay_progress) makes that concrete: which actions the
+    broken recording dispatched, which one it broke on, and what it had left to do —
+    without it the agent cannot tell a recording that died on its LAST action from one
+    that died on its second. Absent/unalignable, the generic dirty paragraph stands.
+
+    Carries the per-action verification discipline inline (segments are not expanded into
+    numbered plans), plus `expected_end` — a concrete done-condition read from the
+    library entry's gate: the end state this segment reached in previous SUCCESSFUL runs.
+    `owns_save` marks the segment whose final action commits the record. `downloads_file`
+    marks a segment whose deliverable is a file download — its click receipt lies with a
+    timeout on every honest success, so the rule is click ONCE, then trust
+    verify_download, never the receipt. `findings` are
+    the observations earlier segments recorded ("prompt: outcome" lines) — the data a
+    verify step compares against. `observe` marks a judge node: its done message must
+    carry the observed facts, because later segments receive it as a finding. `conditional` marks a branch-guard node (leading-"If" wording): when the stated
+    condition does not hold on the page, the correct outcome is an immediate no-op
+    success — without saying so, the generic "done with success=true when the end state
+    was not reached is a failed run" footer made the agent hunt for controls matching
+    the branch's action words to force the condition true (observed live: a suppressed
+    popup's "click Process" resolved to a "Reminder to process the payroll" icon button,
+    opening/closing the email modal in an endless loop). `next_conditional` is the condition the NEXT slice declares as
+    its `probe:`, already rendered into words: an expected outcome of THIS step that a
+    separate step handles. Without saying so, the producing agent read that outcome as
+    its own failed action — the still-ahead list even handed it the successor's action
+    words ("click Cancel") under a generic do-not-start rule it ignores once it believes
+    its step failed — so it dismissed the dialog and retried its own actions to clear it
+    (observed live: a server-refused FPS submit became 4 submits, 3 uploads and 2
+    self-issued Cancels in one segment, cached as 22 replayable actions). `aux_tab`
+    marks an aux-tab segment: the framework already opened and focused a helper tab at
+    that URL, all work happens there, and facts must be captured via extract_data so
+    future replays can re-read them fresh.
+    """
+    lines = [
+        # NOT "the page is already in the correct starting state for your step" (the
+        # original wording, unchanged since the pipeline's first commit). That was an
+        # unconditional promise the framework cannot keep: a segment starts wherever the
+        # PREVIOUS one finished, which is only the right page by luck. Run
+        # 20260902_120618 subtask 5 is the measured cost — "Then go to Payroll & RTI and
+        # change the period to Jun-26" ran from the payroll SUMMARY page, and the agent's
+        # own reasoning shows it never treated the navigation as an action at all: "we
+        # need to change the period filter in the Payroll & RTI navbar ... this is the
+        # final required action". Given a guarantee that you are already correctly
+        # placed, a phrase naming a page CANNOT be an instruction to go there — it can
+        # only be scenery, which is exactly how it was read. It then set the report's
+        # period filter, the payrun never moved off May-26, and the segment committed a
+        # skill with no navigation in it.
+        #
+        # Check-then-navigate, not "always navigate": an agent genuinely on the right
+        # page must not re-click a nav item and risk resetting the page state.
+        "You are executing ONE STEP of a workflow that is ALREADY IN PROGRESS in this "
+        "browser. Earlier steps ran in this same session and left the app wherever they "
+        "finished, which is NOT necessarily where your step needs to be. If your step "
+        "names a page, module, section or tab, make sure you are actually on it before "
+        "doing the rest — those words are an action to perform when you are not there, "
+        "not a description of where you already are.",
+    ]
+    if completed:
+        # The carve-out matters as much as the list. These lines are the wording of
+        # EARLIER subtasks, and a repeated workflow states the same step once per cycle:
+        # the run above handed the agent "...change the period to May-26..." as already
+        # done while its own job was the byte-identical Jun-26 line, so the navigation
+        # half of its own job was sitting in the forbidden list.
+        lines.append(
+            "\nAlready done (do NOT redo, verify, or navigate back to these — but this "
+            "never excuses skipping any part of YOUR OWN job below, even where the "
+            "wording repeats):")
+        lines.extend(f"  - {c}" for c in completed)
+    if findings:
+        lines.append(
+            "\nOBSERVATIONS recorded by the completed steps — facts your step may need. "
+            "Trust these values; do NOT navigate back to re-check them (a captured "
+            "block's text may hold several facts — read the ones you need out of it):")
+        lines.extend(f"  - {f[:1000]}" for f in findings)
+    lines.append(
+        "\nDo NOT navigate to the app root, re-select the business, or restart the flow."
+    )
+    lines.append(f"\nYOUR ONLY JOB: {subtask}")
+    if aux_tab:
+        lines.append(
+            f"\nThis step runs in a SEPARATE HELPER TAB, already open and focused at "
+            f"{aux_tab}. Do ALL of this step's work in this helper tab. Do NOT switch "
+            f"back to the app tab, do NOT open or close any tab, and do NOT touch the "
+            f"app — the framework closes this helper tab itself when your step ends."
+            f"\nNOTING FACTS: your done message must state every fact this step was "
+            f"asked to note. A value your instructions already specify (a setting you "
+            f"were told to pick) is just restated there — do NOT extract_data it and do "
+            f"NOT hunt the page for it. Facts the PAGE generated must ALSO be captured "
+            f"with extract_data so future replays can re-read them fresh: prefer ONE "
+            f"call on the block/card that shows them — the block's whole text is the "
+            f"value, later steps parse it — and per-fact calls only when values live in "
+            f"separate places. If one extract_data call keeps returning the wrong text, "
+            f"do not repeat it more than twice: capture the enclosing block instead and "
+            f"state the fact in your done message."
         )
-        expanded = (result.completion or "").strip()
-        if not expanded:
-            logger.warning("expander returned empty output; using original task")
-            return task
-        logger.info("task expanded (%d -> %d chars)", len(task), len(expanded))
-        return expanded
-    except Exception as exc:  # noqa: BLE001 - expansion is best-effort
-        logger.warning("prompt expansion failed (%s); using original task", exc)
-        return task
+    if dirty and replay_progress:
+        lines.append(_replay_progress_block(replay_progress, prior_failure))
+    elif dirty:
+        failure = (f" It failed with: {sanitize_failure(prior_failure)}."
+                   if prior_failure else "")
+        lines.append(
+            f"\nA previous automated attempt at THIS step partially completed it and then "
+            f"stopped.{failure} Inspect the current page state FIRST — fields may already "
+            f"hold correct values, menus or forms may already be open. Finish or correct "
+            f"the step from where it stands; do not blindly redo actions already done."
+        )
+    lines.append(
+        "\nVERIFY EVERY ACTION before taking the next one:\n"
+        "  - Read each action's receipt. A click receipt naming a DIFFERENT element than "
+        "you intended, or an input receipt echoing different text than you typed, means "
+        "the action did NOT work — recover before moving on.\n"
+        "  - After a click that should navigate or open something, confirm the page "
+        "actually changed (new URL, heading, or the expected panel visible). If nothing "
+        "changed, the click did not register: re-locate the target with find_by_text and "
+        "click it again."
+    )
+    if expected_end:
+        lines.append(
+            f"\nDONE CONDITION: this step is complete ONLY when {expected_end} — the end "
+            f"state recorded from previous successful runs. Check it after your final "
+            f"action; if it does not hold, your job is NOT done: keep working, or report "
+            f"failure honestly."
+        )
+    if owns_save:
+        lines.append(
+            "\nThis step COMMITS the record. After clicking Save, call "
+            "verify_save_registered; only report success after it returns CONFIRMED. NOT "
+            "REGISTERED means validation blocked the save: find the error messages on the "
+            "form, fix those exact fields, and save again. A required field your "
+            "instructions give no value for is not a failure: dropdowns — open it and "
+            "pick a listed option; free-input fields — type a plausible dummy value "
+            "matching the field's label and format, and state every invented value in "
+            "your done message."
+        )
+    if downloads_file:
+        lines.append(
+            "\nThis step's deliverable is a FILE DOWNLOAD. Click the download control "
+            "ONCE. The click's receipt will usually show a TIMEOUT or error — for "
+            "downloads that is NORMAL and does NOT mean it failed. NEVER click the "
+            "control a second time because of a timeout alone. Instead call "
+            "verify_download: CONFIRMED naming your file means the step is COMPLETE — "
+            "call done with success=true immediately. Only if verify_download returns "
+            "NONE may you click the control once more."
+        )
+    if observe:
+        lines.append(
+            "\nThis is an OBSERVATION/VERIFICATION step. Your final done message is its "
+            "product: state exactly WHAT YOU OBSERVED — the concrete values, names, or "
+            "settings you read. The ONLY pass/fail criteria are the checks YOUR ONLY "
+            "JOB states in words. When it states a check, compare what you read against "
+            "it and state the verdict (e.g. 'Client Review setting = Account Manager; "
+            "Review for dropdown showed John Smith (the Account Manager) — MATCH'); if "
+            "a stated check does NOT hold, report honestly: say so, state what you saw "
+            "instead, and finish with success=false. When it states NO expected value "
+            "or end state — it only tells you to click, tick, open, or read things — "
+            "completing those actions with clean receipts IS success: finish with "
+            "success=true and report the end state you observed as FACT, even when a "
+            "status or label differs from what you expected. NEVER invent an expected "
+            "outcome and fail the step over it. Later steps receive your message as "
+            "recorded fact, so a bare 'done' or 'verified' without the observed values "
+            "is a FAILED step."
+        )
+    if conditional:
+        lines.append(
+            "\nThis is a CONDITIONAL step: its actions apply ONLY IF the condition "
+            "stated in YOUR ONLY JOB actually holds. FIRST read the current page and "
+            "decide whether the popup/element/error it names is present RIGHT NOW. If "
+            "it is NOT, this step is COMPLETE: call done with success=true immediately, "
+            "stating that the condition did not occur — for a conditional step the "
+            "unchanged page IS the verified end state, and reporting it is success, "
+            "not failure. NEVER click, re-trigger earlier actions, or search the page "
+            "to MAKE the condition true, and never click a control merely because its "
+            "name or tooltip contains a word from this step's actions. If the "
+            "condition DOES hold, perform the stated actions and verify them as usual."
+        )
+    if next_conditional:
+        # "POSSIBLE", not "EXPECTED", and the absent branch stated FIRST. A probe exists
+        # precisely because the outcome is intermittent, but the original heading read as
+        # a prediction that it WOULD appear, and the block said only what to do when it
+        # did. Run 20260908_094852 subtask 4 is the cost: the agent finished its FPS
+        # submit at step 7 ("the dialog closed and the server accepted the write"), then
+        # spent steps 8-21+ polling search_page and find_elements for a popup that this
+        # cycle never raised — "awaiting synchronise prompt" — through five loop-detection
+        # nudges, until the run was killed. Waiting for a probed outcome is never this
+        # step's job: the framework checks for it deterministically before the next slice.
+        lines.append(
+            f"\nPOSSIBLE OUTCOME ALREADY HANDLED BY THE NEXT STEP: "
+            f"{next_conditional}. It MAY OR MAY NOT appear, and most runs never see it. "
+            f"Do NOT wait for it, poll for it, or search the page for it: if it is not "
+            f"already in front of you once your own actions are done, your step is "
+            f"simply finished — report it in the ordinary way. If it IS there, it is a "
+            f"KNOWN and ACCEPTED result "
+            f"of this step — not a failure, and not yours to clear. Your step is then "
+            f"FINISHED: call done with success=true and state in your done message "
+            f"exactly what appeared, quoting the message text you can read. Do NOT "
+            f"close, cancel, dismiss or click through it, and do NOT repeat, re-enter "
+            f"or retry any of this step's actions to make it go away — a separate step "
+            f"immediately after yours handles it, and redoing your actions here "
+            f"duplicates work that step cannot undo. This overrides the re-click rule "
+            f"above: this outcome IS the page's response, so the action DID register "
+            f"and there is nothing to re-locate and click again. It also overrides the "
+            f"done condition and the end-state rule below — the framework checks for "
+            f"this outcome deterministically before the next step runs, so reporting "
+            f"it and stopping is a PASS, not success claimed without reaching the end "
+            f"state."
+        )
+    if remaining:
+        lines.append("\nStill ahead in this workflow (context only — each is handled "
+                     "separately AFTER you finish; do NOT start any of them):")
+        lines.extend(f"  - {r[:117] + '...' if len(r) > 120 else r}" for r in remaining)
+    lines.append(
+        "\nWhen your job is complete AND verified, call done with success=true. The "
+        "harness independently checks your end state — done with success=true when the "
+        "end state was not actually reached is recorded as a failed run."
+    )
+    return "\n".join(lines)

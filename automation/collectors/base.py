@@ -23,6 +23,8 @@ from typing import Any
 
 from playwright.async_api import BrowserContext, Page
 
+from automation.pipeline.assertions import _host_in_scope
+
 logger = logging.getLogger("framework.collector")
 
 
@@ -37,13 +39,29 @@ class Collector(ABC):
     #: short, filename-safe identifier; also the default output filename stem.
     name: str = "collector"
 
-    def __init__(self, context: BrowserContext, artifacts_dir: Path) -> None:
+    def __init__(self, context: BrowserContext, artifacts_dir: Path,
+                 scope_hosts: list[str] | None = None) -> None:
         self.context = context
         self.artifacts_dir = Path(artifacts_dir)
         self._active = False
         # Agent step the run is currently on; the Runner bumps this at each step start so
         # captured events can be attributed to a step (0 == before the first step / setup).
         self.current_step = 0
+        # Capture scope: only events produced by a PAGE on one of these hosts are recorded
+        # (suffix match — api.actingoffice.com is inside scope "actingoffice.com"), so a
+        # helper tab's ad stack (observed: ~3,600 of 3,680 logged requests in one run)
+        # never reaches the artifacts. Empty/None records everything. The entry point
+        # passes the SAME resolved scope the assertions use, so a captured-out entry can
+        # never be one an assertion rule needed.
+        self.scope_hosts = [str(h).lower().lstrip(".") for h in (scope_hosts or []) if h]
+
+    def _page_in_scope(self, page_url: str | None) -> bool:
+        """False only when the producing page is DEFINITELY outside the capture scope.
+        A missing/unreadable page URL stays in (fail open): dropping an event over a
+        torn-down page handle could silently lose the marker's create-write."""
+        if not self.scope_hosts or not page_url:
+            return True
+        return _host_in_scope(page_url, self.scope_hosts)
 
     async def start(self) -> None:
         """Attach listeners to every current page and to any page opened later."""
@@ -75,7 +93,7 @@ class Collector(ABC):
         try:
             self.artifacts_dir.mkdir(parents=True, exist_ok=True)
             out_path = self.artifacts_dir / f"{self.name}.json"
-            out_path.write_text(json.dumps(self.results(), indent=2, default=str))
+            out_path.write_text(json.dumps(self.results(), indent=2, default=str), encoding="utf-8")
             return out_path
         except Exception as exc:  # noqa: BLE001 - persistence must not crash the run
             logger.exception("collector %s failed to write results: %s", self.name, exc)

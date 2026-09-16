@@ -9,8 +9,10 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Virtual environments (.venv is a symlink to .venv.nosync — the .nosync suffix keeps
+# iCloud Desktop sync away from the venv, which kept hiding its .pth files)
 .venv
+.venv.nosync/
 
 # Local environment variables / secrets (real secrets stay local; the sample is committed)
 .env
@@ -27,4 +29,13 @@ run.log
 nohup.out
 
 # Recorded action traces for replay
-recordings/
+
+# Hybrid subtask engine stores (shared subtask library + cached decompositions)
+library/
+decompositions/
+
+# Auto Agent UI: deleted prompts and uploads are TRASHED rather than unlinked, so the trash is
+# recoverable but never source. The prompts themselves ARE source and stay tracked, as do the
+# upload fixtures the curated tasks reference.
+prompts/.trash/
+automation/uploads/.trash/

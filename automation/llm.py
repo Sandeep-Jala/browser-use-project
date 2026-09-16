@@ -1,9 +1,9 @@
 """LLM provider construction.
 
 One place to turn a `Config` into a browser-use chat model. The active provider is Azure
-OpenAI (gpt-4.1-mini) via its OpenAI-compatible /openai/v1 endpoint — ChatOpenAI plus a
-custom base_url. Groq remains available: flip `LLM_PROVIDER=groq` in `.env` to switch
-with no other code changes.
+OpenAI via its OpenAI-compatible /openai/v1 endpoint — ChatOpenAI plus a custom base_url,
+with the deployment name from AZURE_OPENAI_MODEL (o4-mini as of 2026-08-11 PM). Groq
+remains available: flip `LLM_PROVIDER=groq` in `.env` to switch with no other code changes.
 """
 from __future__ import annotations
 
@@ -27,28 +27,56 @@ def build_llm(config: Config) -> BaseChatModel:
             model=config.azure_model,
             api_key=config.azure_api_key,
             base_url=config.azure_base_url,
-            temperature=0.0,
+            temperature=0.3,
+            # Reliability params pinned rather than inherited from browser-use defaults
+            # (these ARE 0.13.3's defaults — pinned so an upgrade can't silently move them).
+            # frequency_penalty is deliberately left at its 0.3 default: it exists to stop
+            # gpt-4.1-mini's runaway "\t" generation — do not zero it.
+            max_retries=5,
+            # Applied only to reasoning models — active again on o4-mini, the deployment
+            # since 2026-08-11 PM (user: "back to o4 mini medium"; the 07-30 approved
+            # setting — "low" produced shallow moves, "high" was a one-day trial). The
+            # cap must rise with the effort: completion tokens INCLUDE the hidden
+            # reasoning tokens (8192 for medium, 16384 for high), or
+            # finish_reason='length' comes back with empty content — and o4-mini needs
+            # llm_timeout passed explicitly in runner.run_agent_segment (browser-use's
+            # model-name heuristic hands it only 75s).
+            reasoning_effort="medium",
+            max_completion_tokens=8192,
+            # Best-effort determinism: at temperature 0, Azure still varies across backend
+            # replicas; a fixed seed narrows step-to-step decision flakiness.
+            seed=42,
         )
 
     if provider == "groq":
         if not config.groq_api_key:
             raise SystemExit("GROQ_API_KEY is not set in .env (LLM_PROVIDER=groq)")
-        return ChatGroq(model=config.groq_model, api_key=config.groq_api_key, temperature=0.0)
+        return ChatGroq(model=config.groq_model, api_key=config.groq_api_key, temperature=0.0, timeout=45.0)
 
     raise SystemExit(f"Unknown LLM_PROVIDER: {config.llm_provider!r} (expected 'azure' or 'groq')")
 
 
 def build_expander_llm(config: Config) -> BaseChatModel | None:
-    """Build the model used for one-shot prompt expansion and the QA judge.
+    """Build the NON-AGENT model: the decomposer's LLM tier, the router's verify tier,
+    and adapt.parameterize. (Not the QA judge — browser-use's is off, see use_judge in
+    runner.py. Not a prompt expander either; that was deleted, and the name stuck.)
 
     Always on the Azure endpoint (same gpt-4.1-mini deployment as the agent), independent of
     the agent's LLM_PROVIDER. Returns None if no Azure key is configured.
     """
     if not config.azure_api_key:
         return None
+    # Same explicit reliability/determinism params as build_llm (see the comments there).
     return ChatOpenAI(
         model=config.expander_model,
         api_key=config.azure_api_key,
         base_url=config.azure_base_url,
         temperature=0.0,
+        # Medium reasoning effort takes ~3 minutes for full-coverage output on long task
+        # prompts; 45s guarantees "Request timed out" on every attempt. Sized with headroom.
+        timeout=240.0,
+        max_retries=5,
+        reasoning_effort="medium",
+        max_completion_tokens=16384,
+        seed=42,
     )
