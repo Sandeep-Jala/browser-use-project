@@ -22,11 +22,17 @@ RUNNING, and anything else in that shape has stopped existing without finishing.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from automation.ui.runs import delete_run, load_progress, scan_runs
+from automation.ui.runs import (
+    _force_writable_and_retry,
+    delete_run,
+    load_progress,
+    scan_runs,
+)
 
 
 def make_run(root: Path, run_id: str, *, is_successful=True, is_done=True,
@@ -197,3 +203,46 @@ def test_report_json_still_wins_when_both_exist(tmp_path):
              progress=_progress("finished", ok=True))
     (run,) = scan_runs(tmp_path)
     assert run.status == "PASS" and run.note is None
+
+
+# ── deleting a run on Windows ─────────────────────────────────────────────────────────────
+
+
+def test_read_only_files_do_not_strand_a_half_deleted_run(tmp_path):
+    """Windows checks the FILE's read-only attribute on unlink, where POSIX only needs write
+    permission on the directory. Without the hook, `rmtree` raises part-way through and the UI is
+    left listing a run whose files are gone — so the hook is exercised directly here rather than
+    through rmtree, which would not fail on this platform."""
+    run_dir = tmp_path / "20260102_000000_000001"
+    run_dir.mkdir()
+    victim = run_dir / "report.json"
+    victim.write_text("{}", encoding="utf-8")
+    victim.chmod(0o444)
+
+    unlinked: list[Path] = []
+
+    def _unlink(path):
+        unlinked.append(Path(path))
+        Path(path).unlink()
+
+    try:
+        raise PermissionError(13, "Access is denied")
+    except PermissionError:
+        _force_writable_and_retry(_unlink, str(victim), sys.exc_info())
+
+    assert unlinked == [victim]
+    assert not victim.exists()
+
+
+def test_a_failure_that_chmod_cannot_fix_is_re_raised(tmp_path):
+    """A file genuinely held open by another process is not a permissions problem, and silently
+    swallowing it would report a successful delete that did not happen."""
+    def _boom(path):
+        raise AssertionError("must not retry a non-permission error")
+
+    try:
+        raise OSError(16, "Device or resource busy")
+    except OSError:
+        with pytest.raises(OSError, match="Device or resource busy"):
+            _force_writable_and_retry(_boom, str(tmp_path / "x"), sys.exc_info())
+

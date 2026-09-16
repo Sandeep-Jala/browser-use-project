@@ -400,8 +400,6 @@ def build_blocks(paths: Paths, supervisor: RunSupervisor) -> gr.Blocks:
                         head += f" · {snap['task_label']}"
                     if snap.get("run_id"):
                         head += f" · `{snap['run_id']}`"
-                    if snap.get("elapsed_s"):
-                        head += f" · {snap['elapsed_s']:.0f}s"
                     for w in snap.get("warnings") or []:
                         head += f"\n\n⚠️ {w}"
                     if snap.get("reason"):

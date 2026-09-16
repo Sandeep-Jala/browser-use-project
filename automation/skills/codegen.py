@@ -290,7 +290,7 @@ def compile_code_skill(sid: str) -> Path | None:
     Failure is non-fatal — the tier-0 steps stay authoritative — but it must never leave
     STALE code shadowing fresh steps, so any failure removes the code artifacts."""
     try:
-        steps = json.loads(sstore.steps_path(sid).read_text())
+        steps = json.loads(sstore.steps_path(sid).read_text(encoding="utf-8"))
         source_prompt, params = "", {}
         tpath = sstore.template_path(sid)
         if tpath.exists():

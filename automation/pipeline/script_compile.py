@@ -1303,7 +1303,7 @@ def compile_recording(
     ~400k tokens a run, which also re-keyed the subtask after it — sids hash the START
     CONTEXT, and a live authoring ends wherever it ends).
     """
-    data = json.loads(Path(recording_path).read_text())
+    data = json.loads(Path(recording_path).read_text(encoding="utf-8"))
     steps: list[dict[str, Any]] = []
     history = data.get("history", [])
     if max_steps is not None and max_steps > 0:
@@ -1954,13 +1954,17 @@ def merge_extract(store: dict[str, str], label: str, value: str) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Write via a temp file + os.replace so a crash never leaves a half-written file."""
-    import os
+    """Write via a temp file + os.replace so a crash never leaves a half-written file.
+
+    The replace is retried: `progress.json` goes through here, and the UI's supervisor polls it
+    while the run writes it — a contended replace is a hard failure on Windows, not a no-op.
+    """
+    from automation.pipeline.atomic import replace_with_retry
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    replace_with_retry(tmp, path)
 
 
 def save_steps(
@@ -4265,7 +4269,7 @@ def promote_healed(steps_path: str | Path, replay_log: list[dict[str, Any]]) -> 
     must never rewrite a golden script.
     """
     steps_path = Path(steps_path)
-    steps: list[dict[str, Any]] = json.loads(steps_path.read_text())
+    steps: list[dict[str, Any]] = json.loads(steps_path.read_text(encoding="utf-8"))
     promoted: list[int] = []
     for entry in replay_log or []:
         winner = entry.get("healed")

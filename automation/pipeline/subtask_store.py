@@ -253,7 +253,7 @@ def load_aliases() -> dict[str, Any]:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - a corrupt alias table just means no aliases
         return {}
 
@@ -283,7 +283,7 @@ def has_script(sid: str) -> bool:
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -317,7 +317,7 @@ def load_manifest() -> dict[str, Any]:
     if not LIBRARY_MANIFEST.exists():
         return {}
     try:
-        return json.loads(LIBRARY_MANIFEST.read_text())
+        return json.loads(LIBRARY_MANIFEST.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - a corrupt manifest just means an empty library
         return {}
 
@@ -356,7 +356,7 @@ def load_meta(sid: str) -> dict[str, Any]:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - corrupt meta just means fresh stats
         return {}
 
@@ -395,7 +395,7 @@ def load_decomposition(tid: str) -> dict[str, Any] | None:
     if not p.exists():
         return None
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - corrupt cache entry = no cache entry
         return None
     return data if isinstance(data, dict) and data.get("subtasks") else None
@@ -412,7 +412,7 @@ def all_decompositions() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for p in DECOMPOSITIONS_DIR.glob("*.json"):
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001
             continue
         if isinstance(data, dict) and data.get("subtasks"):

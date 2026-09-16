@@ -28,10 +28,14 @@ Three behaviours that exist because of measured facts about this codebase:
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -43,6 +47,10 @@ from automation.ui.supervisor import (
     RunSupervisor,
     build_argv,
     classify_exit,
+    _interrupt_group,
+    _kill_group,
+    _pid_alive,
+    _spawn_isolation_kwargs,
 )
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────────
@@ -470,3 +478,120 @@ async def test_the_adoption_record_is_removed_when_a_run_ends(tmp_path):
     await _start(sup, fake_run())
     _wait(sup, "done")
     assert not (paths.ui_state_dir / "run.json").exists()
+
+
+# ── cross-platform process control ────────────────────────────────────────────────────────
+#
+# These three calls decide whether a run can be stopped, and whether merely LOOKING at one kills
+# it. Each takes an explicit `windows` flag so the Windows branch — the one nobody on this project
+# can exercise by running it — is still pinned from a Mac.
+
+
+def test_spawn_isolation_is_a_process_group_on_both_platforms():
+    """The run must sit in its own process group either way: a Ctrl+C in the server's terminal
+    must not reach it, and `kill()` needs a group to signal.
+
+    `start_new_session` is POSIX-only AND silently accepted on Windows — CPython's
+    `_execute_child` binds it as `unused_start_new_session` — so passing it there would read as
+    correct and do nothing at all.
+    """
+    assert _spawn_isolation_kwargs(windows=False) == {"start_new_session": True}
+    assert _spawn_isolation_kwargs(windows=True) == {"creationflags": 0x00000200}
+
+
+def test_interrupt_asks_windows_for_ctrl_break_not_a_posix_signal():
+    """CTRL_BREAK_EVENT is what the child's Python turns into the KeyboardInterrupt the
+    framework's abort path already handles, so a stopped run still writes progress.json."""
+    class _Proc:
+        pid = _A_FREE_PID
+
+        def terminate(self):
+            raise AssertionError("the Windows branch should not need the fallback")
+
+    with mock.patch.object(os, "kill") as fake_kill:
+        _interrupt_group(_Proc(), windows=True)
+    fake_kill.assert_called_once_with(_A_FREE_PID, 1)   # CTRL_BREAK_EVENT == 1
+
+
+def test_interrupt_falls_back_when_a_posix_only_call_is_missing():
+    """The regression guard, and the reason `AttributeError` is in the except tuple.
+
+    `os.killpg`, `os.getpgid` and `signal.SIGKILL` do not EXIST on Windows, so a stray POSIX
+    call there raises AttributeError — which sails straight past `except (OSError,
+    ProcessLookupError)` and takes the fallback with it. `kill()` then raises instead of stopping
+    the run, and the UI's Stop button is dead for every run.
+    """
+    terminated: list[bool] = []
+
+    class _Proc:
+        pid = _A_FREE_PID
+
+        def terminate(self):
+            terminated.append(True)
+
+    with mock.patch.object(os, "killpg", side_effect=AttributeError("no killpg here")):
+        _interrupt_group(_Proc(), windows=False)
+    assert terminated == [True]
+
+
+def test_interrupt_falls_back_for_a_process_that_is_already_gone():
+    """The ordinary POSIX path, unmocked: a pid nobody owns must degrade to terminate(), not
+    raise out of kill()."""
+    terminated: list[bool] = []
+
+    class _Proc:
+        pid = _A_FREE_PID
+
+        def terminate(self):
+            terminated.append(True)
+
+    _interrupt_group(_Proc(), windows=False)
+    assert terminated == [True]
+
+
+def test_hard_kill_walks_the_tree_on_windows():
+    """`TerminateProcess` does not touch children and the run's browser is a grandchild, so the
+    hard kill has to go through taskkill /T or it leaves a Chromium behind holding the CDP port —
+    which is exactly what `_foreign_cdp_owner` then refuses the next launch over."""
+    class _Proc:
+        pid = _A_FREE_PID
+
+        def kill(self):
+            raise AssertionError("should not fall back while taskkill is available")
+
+    with mock.patch.object(subprocess, "run") as fake_run_cmd:
+        _kill_group(_Proc(), windows=True)
+    argv = fake_run_cmd.call_args[0][0]
+    assert argv[0] == "taskkill"
+    assert "/T" in argv and str(_A_FREE_PID) in argv
+
+
+def test_pid_alive_delegates_to_psutil_rather_than_signalling():
+    """`os.kill(pid, 0)` is the POSIX existence idiom and a loaded gun on Windows: os.kill
+    special-cases only CTRL_C_EVENT/CTRL_BREAK_EVENT and hands everything else to
+    `TerminateProcess(handle, sig)`, so signal 0 KILLS the target — with exit code 0, which
+    `classify_exit` then reports as "Passed". `adopt()` runs this against a live run on every
+    server start, so the idiom costs you the run and tells you it went well.
+
+    psutil is the fix because it is platform-correct, not because it avoids os.kill: on POSIX
+    `psutil.pid_exists` uses `os.kill(pid, 0)` itself, which is right THERE. On Windows it goes
+    through the process table instead. This test can only pin the behaviour, since the bug is
+    invisible on the platform running it — the guard against regressing to a bare `os.kill` is
+    the docstring on `_pid_alive` plus this test's name.
+    """
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(_A_FREE_PID) is False
+
+
+def _find_free_pid() -> int:
+    import psutil
+    for candidate in range(999_000, 1_000_000):
+        if not psutil.pid_exists(candidate):
+            return candidate
+    raise AssertionError("no unused pid found to test with")
+
+
+# Resolved once, at import: a pid that exists to nobody. Chosen dynamically rather than
+# hardcoded because `os.killpg` against a pid that HAPPENS to be live would signal a stranger's
+# process group, and the POSIX tests above call it for real.
+_A_FREE_PID = _find_free_pid()

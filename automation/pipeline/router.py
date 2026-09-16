@@ -86,7 +86,7 @@ def _load_vectors() -> dict[str, Any]:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        return json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - a corrupt cache just recomputes
         return {}
 

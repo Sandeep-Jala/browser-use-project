@@ -445,7 +445,7 @@ def instantiate(template: dict[str, Any], values: dict[str, str]) -> list[dict[s
 
 
 def load_template(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def save_template(path: str | Path, template: dict[str, Any]) -> None:

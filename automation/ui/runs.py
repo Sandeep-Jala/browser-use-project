@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -197,7 +198,25 @@ def delete_run(artifacts_dir: Path, run_id: str) -> None:
         raise ValueError(f"run id escapes artifacts dir: {run_id!r}")
     if not target.is_dir():
         raise FileNotFoundError(f"no such run: {run_id}")
-    shutil.rmtree(target)
+    shutil.rmtree(target, onerror=_force_writable_and_retry)
+
+
+def _force_writable_and_retry(func, path, exc_info) -> None:
+    """rmtree error hook: clear the read-only bit and try that one entry again.
+
+    POSIX only needs write permission on the *directory* to unlink a file, so rmtree there
+    rarely trips on a read-only file. Windows checks the FILE's read-only attribute and raises
+    `PermissionError`, which would leave a half-deleted run directory behind — a state the UI
+    then lists as a run whose files are gone.
+
+    `onerror` rather than 3.12's `onexc` because this package supports 3.11 (`.python-version`).
+    Anything that is not a permission problem is re-raised: a file genuinely held open by
+    another process is not something chmod can fix, and the caller should hear about it.
+    """
+    if not isinstance(exc_info[1], PermissionError):
+        raise
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
 def _dir_size_bytes(path: Path) -> int:

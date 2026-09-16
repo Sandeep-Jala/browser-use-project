@@ -28,7 +28,7 @@ def build_report(result: "RunResult") -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = out_dir / "report.json"
-    json_path.write_text(json.dumps(_result_to_dict(result), indent=2, default=str))
+    json_path.write_text(json.dumps(_result_to_dict(result), indent=2, default=str), encoding="utf-8")
 
     html_path = out_dir / "report.html"
     html_path.write_text(_render_html(result), encoding="utf-8")

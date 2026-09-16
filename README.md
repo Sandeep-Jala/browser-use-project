@@ -62,6 +62,50 @@ automation/
     console.py         # console messages + uncaught page errors via Playwright
 ```
 
+## Quick start (no terminal needed)
+
+For handing this to someone who is not going to run five commands.
+
+1. **macOS** — double-click `start.command`.  **Windows** — double-click `start.bat`.
+2. The first run installs everything it needs, which takes a few minutes; later runs start in
+   seconds. When it is ready it opens `http://127.0.0.1:8765` in a browser.
+3. The first run also creates a `.env`, opens it in a text editor, and stops so four values can
+   be filled in: `LOGIN_URL`, `LOGIN_EMAIL`, `LOGIN_PASSWORD`, `AZURE_OPENAI_KEY`. Save it and
+   double-click again.
+4. To stop it: press Ctrl+C in the black window, or just close the window.
+
+Every failure prints one plain sentence saying what to do. On Linux, or from a terminal,
+`python3 launch.py` does exactly the same thing.
+
+Both files are thin shims over `launch.py`, which holds all the logic and is deliberately
+stdlib-only — it has to run *before* the dependencies it installs exist.
+
+<details><summary>macOS says "Apple could not verify start.command is free of malware"</summary>
+
+Gatekeeper blocks scripts that arrived by download, AirDrop or chat, and that dialog has no
+"Open" button. Either Control-click (right-click) `start.command` → **Open** → **Open**, or go to
+**System Settings → Privacy & Security**, find *"start.command was blocked"*, click **Open
+Anyway**, then double-click again. `git clone` avoids this entirely — files written by git are
+never quarantined.
+
+If double-clicking opens the file in TextEdit instead, its executable bit was lost in transit.
+In Terminal, once: `chmod +x "<this folder>/start.command"`.
+</details>
+
+<details><summary>It says uv is not installed</summary>
+
+macOS: `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`)
+Windows: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+
+Then double-click the start file again. The launcher deliberately does not install uv for you:
+the installer edits shell profiles, which is a persistent change to the machine.
+</details>
+
+**Windows status:** the UI runs, and the process-control and text-encoding fixes needed for runs
+are in (`ui/supervisor.py`'s process group and liveness probe, `encoding="utf-8"` on every text
+read). It has not yet been exercised end to end on a Windows machine — do that before relying on
+it. `.claude/launch.json` is macOS-only and dev-only; `start.bat` is the supported entry point.
+
 ## Setup
 
 ```bash
@@ -69,8 +113,8 @@ uv sync
 uv run playwright install chromium
 ```
 
-Run the offline test suite (no app credentials needed) with `uv run pytest` — 1079 tests
-across 49 files, none of which touch the live app.
+Run the offline test suite (no app credentials needed) with `uv run pytest` — 1333 tests
+across 61 files, none of which touch the live app.
 
 Copy the sample env file and fill in your values (`.env.example` documents the common
 keys):
@@ -137,6 +181,9 @@ telemetry assertions passed.
 ```bash
 uv run auto-agent
 ```
+
+That is the developer path. `start.command` / `start.bat` do the whole setup first and then start
+this same server via `python -m automation.ui` — see [Quick start](#quick-start-no-terminal-needed).
 
 Opens `http://127.0.0.1:8765` — bound to loopback only, with no auth, because it starts runs that
 drive a logged-in browser and it deletes run directories. A `Host` header that is not this machine

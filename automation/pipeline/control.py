@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from automation.pipeline.atomic import replace_with_retry
+
 logger = logging.getLogger("framework.control")
 
 
@@ -58,7 +60,7 @@ def read_control(path: Path) -> dict[str, Any]:
     boundary on the next tick.
     """
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -66,7 +68,8 @@ def read_control(path: Path) -> dict[str, Any]:
 
 def write_control(path: Path, command: str, instruction: str = "") -> None:
     """Queue `command` for the next step boundary. Written via os.replace so a step that
-    reads while we write sees the OLD file whole, never a half-written one."""
+    reads while we write sees the OLD file whole, never a half-written one — and retried,
+    because on Windows that replace fails outright while the reader holds the file open."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(
         {
@@ -77,8 +80,8 @@ def write_control(path: Path, command: str, instruction: str = "") -> None:
         indent=2,
     )
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload)
-    tmp.replace(path)
+    tmp.write_text(payload, encoding="utf-8")
+    replace_with_retry(tmp, path)
 
 
 def clear_control(path: Path) -> None:

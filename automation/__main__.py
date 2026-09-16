@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from functools import partial
 
 import psutil
@@ -210,9 +211,38 @@ async def main(task_raw: str, fresh: bool, success_marker: str | None = None,
                 log.debug("session kill at exit: %s", exc)
 
 
+def _force_utf8_stdio() -> None:
+    """Make this process' own output UTF-8, whatever the OS thinks the locale is.
+
+    The framework's log lines and the end-of-run summary contain emoji. On Windows, stdout
+    defaults to the locale encoding (cp1252 on a default box), which cannot encode them — and the
+    two failure modes differ in a way that matters:
+
+    * `print` RAISES `UnicodeEncodeError`. `__main__`'s summary prints `✗` and `⬇`, so a run that
+      otherwise succeeded would die while reporting its own result.
+    * `logging` SWALLOWS it in `handleError`, so the line is dropped silently. One of those lines
+      is `control.py`'s 'operator control:' announcement, which the UI watches for to arm
+      Pause/Resume/Stop — losing it leaves those controls dead for the whole run and looks like a
+      hang rather than a bug.
+
+    The UI's supervisor sets PYTHONUTF8=1 on the child it spawns, which covers UI-started runs
+    before the interpreter even boots. This covers the other launch path: a run started from a
+    terminal, where nobody set it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:       # a stream replaced by something that is not a TextIOWrapper
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # detached or already-closed stream: not worth failing over
+            pass
+
+
 def cli() -> None:
     """Synchronous console-script entry point (see [project.scripts] in pyproject.toml)."""
     import argparse
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description="Run the automation framework tasks.")
     parser.add_argument("--task", default=os.getenv("TASK", "invoice"),
                         help="Task key from tasks.yaml or a free-form prompt.")

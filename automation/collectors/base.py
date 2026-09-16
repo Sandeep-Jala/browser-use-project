@@ -93,7 +93,7 @@ class Collector(ABC):
         try:
             self.artifacts_dir.mkdir(parents=True, exist_ok=True)
             out_path = self.artifacts_dir / f"{self.name}.json"
-            out_path.write_text(json.dumps(self.results(), indent=2, default=str))
+            out_path.write_text(json.dumps(self.results(), indent=2, default=str), encoding="utf-8")
             return out_path
         except Exception as exc:  # noqa: BLE001 - persistence must not crash the run
             logger.exception("collector %s failed to write results: %s", self.name, exc)

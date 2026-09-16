@@ -58,6 +58,70 @@ _LOG_LINE_CAP = 4000
 _RUN_DIR_POLL_S = 0.5
 _COMMANDS = ("pause", "resume", "stop")
 
+_WINDOWS = os.name == "nt"
+
+# Resolved through getattr because both names are Windows-only: referencing
+# `subprocess.CREATE_NEW_PROCESS_GROUP` or `signal.CTRL_BREAK_EVENT` on POSIX raises
+# AttributeError. That matters for more than tidiness — `_interrupt_group` CATCHES
+# AttributeError to keep its fallback reachable, so a bare reference would have made the
+# Windows branch degrade silently to `terminate()` instead of the clean abort, and there is no
+# machine in this project's test matrix that would notice. The literals are the documented Win32
+# values (`CREATE_NEW_PROCESS_GROUP = 0x00000200`, `CTRL_BREAK_EVENT = 1`) and are used only when
+# the real attribute is absent, i.e. never in production — they exist so both branches are total
+# and can be pinned from a Mac.
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_CTRL_BREAK_EVENT = getattr(signal, "CTRL_BREAK_EVENT", 1)
+
+
+def _spawn_isolation_kwargs(windows: bool = _WINDOWS) -> dict[str, Any]:
+    """`Popen` kwargs that put the run in its own process group.
+
+    The goal is the same on both platforms — a Ctrl+C in the server's terminal must not also
+    interrupt the run, and a hard kill must be able to signal the whole group — but the mechanism
+    is not. `start_new_session` is POSIX-only, and CPython's Windows `_execute_child` accepts it
+    as `unused_start_new_session`: passing it there is silently ignored, so the isolation the
+    comment promises would simply not exist. `CREATE_NEW_PROCESS_GROUP` is the Windows spelling,
+    and it is also the precondition for `_interrupt_group` — `CTRL_BREAK_EVENT` can only be
+    delivered to a process group that was created as one.
+    """
+    if windows:
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _interrupt_group(proc: "subprocess.Popen[str]", windows: bool = _WINDOWS) -> None:
+    """Ask the run to abort cleanly: the signal its own handlers are waiting for.
+
+    On POSIX that is SIGINT to the process group. On Windows it is `CTRL_BREAK_EVENT`, which the
+    child's Python turns into the same `KeyboardInterrupt` — `CTRL_C_EVENT` would be the closer
+    analogue but cannot be aimed at one group, so it would hit this server too.
+
+    `AttributeError` is in the except tuple on purpose, not for tidiness: `os.killpg`,
+    `os.getpgid` and `signal.SIGKILL` do not EXIST on Windows, so a stray POSIX call there raises
+    AttributeError rather than OSError and would sail straight past a narrower tuple, taking the
+    fallback with it. The whole point of this function is that the fallback stays reachable.
+    """
+    try:
+        if windows:
+            os.kill(proc.pid, _CTRL_BREAK_EVENT)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+    except (OSError, ProcessLookupError, AttributeError):
+        proc.terminate()
+
+
+def _kill_group(proc: "subprocess.Popen[str]", windows: bool = _WINDOWS) -> None:
+    """It would not go. Take it down, and its children with it where the OS lets us."""
+    try:
+        if windows:
+            # TerminateProcess does not walk the tree, and the run's browser is a grandchild.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError, AttributeError):
+        proc.kill()
+
 
 class RunBusy(RuntimeError):
     """A run is already in flight. There is one browser and one control channel."""
@@ -215,14 +279,21 @@ class RunSupervisor:
 
         token = uuid.uuid4().hex[:12]
         self._known_run_ids = self._existing_run_ids()
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        # PYTHONUTF8: the child's stdout here is a PIPE, and a piped stdout does not inherit the
+        # console's encoding — on Windows it falls back to the locale (cp1252), which cannot
+        # encode the emoji this framework logs. `logging` swallows the resulting
+        # UnicodeEncodeError in handleError, so the line is DROPPED rather than raised, and
+        # `_ARMED_MARKER` never arrives: Pause/Resume/Stop would stay disabled for the whole run
+        # and look like a hang. The `encoding=` below is the other half — decoding the pipe in
+        # the locale encoding while the child writes UTF-8 trades the drop for mojibake.
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
         proc = subprocess.Popen(
             argv, cwd=str(self.paths.repo_root), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, errors="replace",
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
             # Its own process group: a Ctrl+C in the server's terminal must not also SIGINT the
             # run, and a hard kill can then signal the whole group.
-            start_new_session=True,
+            **_spawn_isolation_kwargs(),
         )
 
         with self._mutex:
@@ -310,13 +381,18 @@ class RunSupervisor:
         with self._mutex:
             if self._s.token != token:
                 return                     # superseded by a newer run
+            # Inside the lock, and BEFORE the state flips. `state == "done"` is what every
+            # observer polls, so publishing it first leaves a window in which the run is finished
+            # and the adoption record still names it — a server starting in that window adopts a
+            # dead run. The token check has to come first either way: a superseded run reaching
+            # here must not unlink the record belonging to the run that replaced it.
+            try:
+                (self.paths.ui_state_dir / "run.json").unlink(missing_ok=True)
+            except OSError:
+                pass
             self._s.state = "done"
             self._s.exit_code = code
             self._s.verdict, self._s.verdict_tone, self._s.reason = verdict, tone, reason
-        try:
-            (self.paths.ui_state_dir / "run.json").unlink(missing_ok=True)
-        except OSError:
-            pass
         log.info("run %s finished: exit %s -> %s", token, code, verdict)
 
     # -- reading state --------------------------------------------------------------------
@@ -348,7 +424,6 @@ class RunSupervisor:
                 "task_label": s.task_label,
                 "argv": list(s.argv),
                 "started_at": s.started_at or None,
-                "elapsed_s": round(time.time() - s.started_at, 1) if s.started_at else None,
                 "run_id": s.run_id,
                 "run_dir": str(self.run_dir()) if s.run_id else None,
                 "progress": progress or None,
@@ -404,22 +479,16 @@ class RunSupervisor:
                 "command": command}
 
     def kill(self) -> dict[str, Any]:
-        """Last resort. SIGINT the group first — the framework's own handlers turn that into a
-        clean abort that still writes progress.json — then SIGKILL if it will not go."""
+        """Last resort. Interrupt the group first — the framework's own handlers turn that into a
+        clean abort that still writes progress.json — then kill hard if it will not go."""
         proc = self._proc
         if proc is None or proc.poll() is not None:
             return {"signalled": False}
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-        except (OSError, ProcessLookupError):
-            proc.terminate()
+        _interrupt_group(proc)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                proc.kill()
+            _kill_group(proc)
         return {"signalled": True}
 
     # -- surviving a restart --------------------------------------------------------------
@@ -517,11 +586,17 @@ def _phase(s: _State, progress: dict[str, Any], *, alive: bool) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
-        return False
-    return True
+    """Is that pid still there?
+
+    NOT `os.kill(pid, 0)`. On Windows `os.kill` only special-cases CTRL_C_EVENT and
+    CTRL_BREAK_EVENT; every other signal value — 0 included — calls `TerminateProcess(handle,
+    sig)`. The POSIX "existence probe" idiom therefore KILLS the process it is asking about, and
+    with exit code 0, which `classify_exit` then reads as a clean finish. `adopt()` runs this
+    against a live run on every server start, so the idiom costs you the run you were adopting
+    and tells you it ended well.
+    """
+    import psutil
+    return psutil.pid_exists(pid)
 
 
 def _process_matches(pid: int, argv: list[str]) -> bool:

@@ -86,7 +86,7 @@ async def _seed_workspace_files(agent: Any, files: list[str]) -> list[str]:
         if p.suffix.lstrip(".").lower() not in _WORKSPACE_TEXT_EXTS:
             continue
         try:
-            await fs.write_file(p.name, p.read_text())
+            await fs.write_file(p.name, p.read_text(encoding="utf-8"))
             seeded.append(p.name)
         except Exception as exc:  # noqa: BLE001 - the allowlist still covers this file
             logger.debug("workspace seed failed for %s: %s", p.name, exc)
@@ -315,7 +315,7 @@ def restore_result_metadata(history: Any, record_path: Path) -> bool:
     save_history we copy it into the JSON where compile_recording expects it.
     """
     try:
-        data = json.loads(record_path.read_text())
+        data = json.loads(record_path.read_text(encoding="utf-8"))
         items = data.get("history", [])
         changed = False
         for i, item in enumerate(getattr(history, "history", None) or []):
@@ -329,7 +329,7 @@ def restore_result_metadata(history: Any, record_path: Path) -> bool:
                     saved[j]["metadata"] = md
                     changed = True
         if changed:
-            record_path.write_text(json.dumps(data, indent=2))
+            record_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return changed
     except Exception as exc:  # noqa: BLE001 - enrichment must never lose the recording
         logger.warning("could not restore result metadata into %s: %s", record_path, exc)

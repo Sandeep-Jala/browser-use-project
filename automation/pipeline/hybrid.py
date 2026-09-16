@@ -699,7 +699,7 @@ def _read_run_values(hs: Any) -> dict[str, str]:
     try:
         path = Path(getattr(hs, "run_dir", "") or ".") / VALUES_FILE
         if path.exists():
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return {str(k): str(v) for k, v in data.items()}
     except Exception as exc:  # noqa: BLE001 - the in-memory store is the primary
@@ -2082,7 +2082,7 @@ def _recording_ended_on_a_navigation(path: Any) -> bool:
     code and a false pass.
     """
     try:
-        history = json.loads(Path(path).read_text()).get("history") or []
+        history = json.loads(Path(path).read_text(encoding="utf-8")).get("history") or []
     except Exception:  # noqa: BLE001 - never fail the commit path over a diagnosis
         return False
     urls = [str((item.get("state") or {}).get("url") or "") for item in history]
@@ -2108,7 +2108,7 @@ def _recording_closed_its_page(path: Any) -> bool:
     postcondition gate, which is the more dangerous mistake.
     """
     try:
-        history = json.loads(Path(path).read_text()).get("history") or []
+        history = json.loads(Path(path).read_text(encoding="utf-8")).get("history") or []
     except Exception:  # noqa: BLE001 - never fail the commit path over a diagnosis
         return False
     counts = [len((item.get("state") or {}).get("tabs") or []) for item in history]
@@ -2123,7 +2123,7 @@ def _recording_had_page_actions(path: Any) -> bool:
     only through tools the compiler drops (a coverage gap worth a warning). Unreadable
     recordings keep the conservative (coverage-gap) reading."""
     try:
-        history = json.loads(Path(path).read_text()).get("history") or []
+        history = json.loads(Path(path).read_text(encoding="utf-8")).get("history") or []
     except Exception:  # noqa: BLE001 - diagnosis only; never fail the commit path
         return True
     for item in history:

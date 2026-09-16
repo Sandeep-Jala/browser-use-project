@@ -126,7 +126,7 @@ def _instantiated_steps(sid: str, sub: Any,
     values, template = aligned
     if template is None:
         try:
-            return json.loads(sstore.steps_path(sid).read_text())
+            return json.loads(sstore.steps_path(sid).read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001 - unreadable entry -> author
             logger.warning("library entry %s unreadable: %s", sid, exc)
             return None
@@ -182,8 +182,8 @@ def _load_code_skill(sid: str, sub: Any, run_resolver: Any = None) -> Skill | No
     if not cpath.exists() or not apath.exists():
         return None
     try:
-        code = cpath.read_text()
-        anchors = json.loads(apath.read_text())
+        code = cpath.read_text(encoding="utf-8")
+        anchors = json.loads(apath.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 - unreadable code tier -> steps tier
         logger.warning("code skill %s unreadable: %s", sid, exc)
         return None
@@ -289,7 +289,7 @@ def promote_healed_anchors(anchors_path: str | Path,
     path = Path(anchors_path)
     if not path.exists():
         return []
-    anchors: dict[str, Any] = json.loads(path.read_text())
+    anchors: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     promoted: list[str] = []
     for entry in replay_log or []:
         winner, handle = entry.get("healed"), entry.get("handle")
